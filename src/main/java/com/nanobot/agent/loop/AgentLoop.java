@@ -235,6 +235,11 @@ public class AgentLoop implements Runnable {
     // -- processMessage --
 
     public OutboundMessage processMessage(InboundMessage msg) {
+        // System-channel messages (e.g. subagent results) use a dedicated handler
+        if ("system".equals(msg.channel())) {
+            return processSystemMessage(msg, null, null, null, null, null);
+        }
+
         var key = effectiveSessionKey(msg);
         var turnId = UUID.randomUUID().toString();
         var ctx = new TurnContext(msg, key, TurnState.RESTORE, turnId);
@@ -377,9 +382,30 @@ public class AgentLoop implements Runnable {
         var session = ctx.session();
         if (session == null) return "ok";
 
-        var history = buildInitialMessages(ctx.msg(), session);
-        ctx.setHistory(history);
-        ctx.setInitialMessages(history);
+        var history = session.getHistory(0, replayTokenBudget(), true);
+        // Append the current user message to history
+        var initialMessages = context.buildMessages(
+                history,
+                ctx.msg().content(),
+                null,                   // skillNames
+                ctx.msg().media(),
+                ctx.msg().channel(),
+                ctx.msg().chatId(),
+                "user",                 // currentRole
+                ctx.msg().senderId(),
+                ctx.pendingSummary(),   // sessionSummary
+                session.metadata(),
+                null,                   // currentRuntimeLines
+                workspace,
+                this,                   // runtimeState
+                ctx.msg(),              // inboundMessage
+                false,                  // skipRuntimeLines
+                true,                   // includeMemoryRecentHistory
+                ctx.sessionKey(),       // sessionKey
+                false);                 // unifiedSession
+
+        ctx.setHistory(new ArrayList<>(history));
+        ctx.setInitialMessages(initialMessages);
 
         return "ok";
     }
@@ -640,6 +666,208 @@ public class AgentLoop implements Runnable {
         return new OutboundMessage(
                 msg.channel(), msg.chatId(), finalContent,
                 null, null, meta, null);
+    }
+
+    // -- replayTokenBudget (Python _replay_token_budget) --
+
+    int replayTokenBudget() {
+        if (contextWindowTokens <= 0) return 0;
+        int reservedOutput = 4096;
+        int budget = contextWindowTokens - Math.max(1, reservedOutput) - 1024;
+        return budget > 0 ? budget : Math.max(128, contextWindowTokens / 2);
+    }
+
+    // -- persistSubagentFollowup (Python _persist_subagent_followup) --
+
+    boolean persistSubagentFollowup(Session session, InboundMessage msg) {
+        if (msg.content() == null || msg.content().isBlank()) return false;
+        var taskId = msg.metadata() != null ? msg.metadata().get("subagent_task_id") : null;
+        if (taskId != null) {
+            for (var m : session.messages()) {
+                if ("subagent_result".equals(m.get("injected_event"))
+                        && taskId.equals(m.get("subagent_task_id"))) {
+                    return false;
+                }
+            }
+        }
+        var extra = new LinkedHashMap<String, Object>();
+        extra.put("sender_id", msg.senderId());
+        extra.put("injected_event", "subagent_result");
+        if (taskId != null) extra.put("subagent_task_id", taskId);
+        session.addMessage("assistant", msg.content(), extra);
+        return true;
+    }
+
+    // -- restorePendingUserTurn (Python _restore_pending_user_turn) --
+
+    boolean restorePendingUserTurn(Session session) {
+        if (session == null) return false;
+        var flag = session.metadata().get("_pending_user_turn");
+        if (!Boolean.TRUE.equals(flag)) return false;
+
+        var msgs = session.messages();
+        if (!msgs.isEmpty()
+                && "user".equals(msgs.get(msgs.size() - 1).get("role"))) {
+            msgs.add(Map.of(
+                    "role", "assistant",
+                    "content", "Error: Task interrupted before a response was generated.",
+                    "timestamp", java.time.Instant.now().toString()));
+            session.setUpdatedAt(java.time.Instant.now());
+        }
+        clearPendingUserTurn(session);
+        return true;
+    }
+
+    // -- clearRuntimeCheckpoint (Python _clear_runtime_checkpoint) --
+
+    void clearRuntimeCheckpoint(Session session) {
+        if (session != null) session.metadata().remove("runtime_checkpoint");
+    }
+
+    // -- processSystemMessage (Python _process_system_message) --
+
+    OutboundMessage processSystemMessage(
+            InboundMessage msg,
+            @Nullable String sessionKey,
+            @Nullable Runnable onProgress,
+            @Nullable Consumer<String> onStream,
+            @Nullable Runnable onStreamEnd,
+            @Nullable BlockingQueue<InboundMessage> pendingQueue) {
+
+        var channel = msg.channel();
+        var chatId = msg.chatId();
+        // Parse channel:chatId for compound chat IDs (e.g. "slack:thread:ts")
+        if (msg.chatId().contains(":")) {
+            var parts = msg.chatId().split(":", 2);
+            channel = parts[0];
+            chatId = parts[1];
+        }
+
+        var key = msg.sessionKeyOverride() != null ? msg.sessionKeyOverride() : channel + ":" + chatId;
+        var session = sessions.getOrCreate(key);
+
+        if (restoreRuntimeCheckpoint(session)) sessions.save(session);
+        if (restorePendingUserTurn(session)) sessions.save(session);
+
+        try {
+            consolidator.maybeConsolidateByTokens(session, null);
+        } catch (Exception e) {
+            log.warn("Consolidation check failed in system message: {}", e.toString());
+        }
+
+        boolean isSubagent = "subagent".equals(msg.senderId());
+        if (isSubagent && persistSubagentFollowup(session, msg)) {
+            sessions.save(session);
+        }
+
+        setToolContext(channel, chatId,
+                msg.metadata() != null ? (String) msg.metadata().get("message_id") : null,
+                msg.metadata(), key, workspace);
+
+        var history = session.getHistory(0, replayTokenBudget(), true);
+        var currentRole = isSubagent ? "assistant" : "user";
+
+        var messages = context.buildMessages(
+                history,
+                isSubagent ? "" : msg.content(),
+                null,                   // skillNames
+                msg.media(),
+                channel,
+                chatId,
+                currentRole,
+                msg.senderId(),
+                null,                   // sessionSummary
+                session.metadata(),
+                null,                   // currentRuntimeLines
+                workspace,
+                this,                   // runtimeState
+                msg,                    // inboundMessage
+                isSubagent,             // skipRuntimeLines
+                !isSubagent,            // includeMemoryRecentHistory
+                key,                    // sessionKey
+                false);                 // unifiedSession
+
+        long tWall = System.currentTimeMillis();
+        var runCtx = new TurnContext(msg, key, TurnState.RESTORE, key + ":" + System.nanoTime());
+        runCtx.setSession(session);
+        runCtx.setHistory(new ArrayList<>(messages));
+        runCtx.setInitialMessages(new ArrayList<>(messages));
+        if (onProgress != null) runCtx.setOnProgress(m -> onProgress.run());
+        runCtx.setOnStream(onStream);
+        runCtx.setOnStreamEnd(onStreamEnd);
+        runCtx.setPendingQueue(pendingQueue);
+
+        var result = runAgentLoop(runCtx, onProgress, onStream, onStreamEnd, null);
+
+        int latencyMs = (int) Math.max(0, System.currentTimeMillis() - tWall);
+        saveTurn(session, result.messages(), 1 + history.size());
+
+        // enforceFileCap with no-op onArchive (raw_archive not yet ported to MemoryStore)
+        session.enforceFileCap(archive -> {}, Integer.MAX_VALUE);
+
+        clearRuntimeCheckpoint(session);
+        sessions.save(session);
+
+        scheduleBackground(() -> {
+            try {
+                consolidator.maybeConsolidateByTokens(session, null);
+            } catch (Exception e) {
+                log.warn("Background consolidation failed: {}", e.toString());
+            }
+        });
+
+        var content = result.finalContent() != null && !result.finalContent().isBlank()
+                ? result.finalContent() : "Background task completed.";
+
+        var outboundMeta = new LinkedHashMap<String, Object>();
+        if ("slack".equals(channel) && key.startsWith("slack:") && key.split(":").length >= 3) {
+            outboundMeta.put("slack", Map.of("thread_ts", key.split(":", 3)[2]));
+        }
+        var originMsgId = msg.metadata() != null ? msg.metadata().get("origin_message_id") : null;
+        if (originMsgId != null) outboundMeta.put("origin_message_id", originMsgId);
+
+        return new OutboundMessage(channel, chatId, content, null, null, outboundMeta, null);
+    }
+
+    // -- fromConfig (Python from_config classmethod) --
+
+    public static AgentLoop fromConfig(
+            Object config,
+            @Nullable MessageBus bus,
+            java.util.function.Function<Object, Object> providerFactory,
+            java.util.function.Consumer<String> runtimeModelPublisher) {
+        // Simplified factory — the full version reads from NanobotConfig.
+        // Callers should construct AgentLoop directly with resolved parameters.
+        throw new UnsupportedOperationException(
+                "Use the full constructor. fromConfig requires NanobotConfig integration.");
+    }
+
+    // -- applyProviderSnapshot (Python _apply_provider_snapshot) --
+
+    void applyProviderSnapshot(Object snapshot, @Nullable String modelPreset) {
+        // Swap model/provider for future turns without disturbing an active one.
+        // snapshot is expected to be a ProviderSnapshot record with: provider, model, contextWindowTokens, signature.
+        // Full implementation depends on ProviderSnapshot class being defined.
+        log.info("Provider snapshot applied (stub)");
+    }
+
+    // -- refreshProviderSnapshot (Python _refresh_provider_snapshot) --
+
+    void refreshProviderSnapshot() {
+        // Refresh provider config from the snapshot loader.
+        // Full implementation depends on provider_snapshot_loader callback.
+    }
+
+    // -- modelPreset property (Python model_preset) --
+
+    @Nullable
+    public String getModelPreset() {
+        return null; // _active_preset — stub
+    }
+
+    public void setModelPreset(@Nullable String name) {
+        // Resolve preset by name and apply all runtime model dependents.
+        // Full implementation depends on model_presets map and preset_snapshot_loader.
     }
 
     // -- cancelActiveTasks --
