@@ -122,8 +122,10 @@ public class AgentLoop implements Runnable {
     public ToolRegistry tools() { return tools; }
     public String model() { return model; }
     public int contextWindowTokens() { return contextWindowTokens; }
+    public int maxIterations() { return maxIterations; }
     public SessionManager sessions() { return sessions; }
     public Consolidator consolidator() { return consolidator; }
+    public ContextBuilder context() { return context; }
 
     // -- run --
 
@@ -605,7 +607,7 @@ public class AgentLoop implements Runnable {
 
     // -- background tasks --
 
-    void scheduleBackground(Runnable task) {
+    public void scheduleBackground(Runnable task) {
         executor.submit(task);
     }
 
