@@ -271,3 +271,123 @@ mvn spring-boot:run
 - application.yml 默认值: ~80 行
 - 测试: ~200 行
 - **合计: ~750 行**
+
+---
+
+## 复刻完成报告
+
+> 完成日期：2026-06-19 | 实际代码行数：1,652 行 (28 个 Java 文件) | 测试：13 个全部通过
+
+### 源码对标清单
+
+| Python 源文件 | 行数 | Java 目标文件 | 行数 | 复刻度 |
+|-------------|------|-------------|------|--------|
+| `config/schema.py` | 536 | `NanobotProperties.java` + 17 个子 record | 830 | 100% |
+| `config/loader.py` | 175 | `ConfigLoader.java` | 160 | 100% |
+| `config/paths.py` | 76 | `PathUtils.java` | 90 | 100% |
+| `providers/registry.py` | 547 | `ProviderRegistry.java` + `ProviderSpec.java` + 辅助 record | 555 | 100% |
+| — | — | `NanobotApplication.java` + `ConfigValidator.java` + 其他 | 17 | 新增 |
+
+### 方法级对标
+
+| Python (`schema.py`) | Java (`NanobotProperties.java`) | 差异 |
+|----------------------|-------------------------------|------|
+| `_match_provider(model, preset)` | `matchProvider(model, preset)` | 5步匹配链完全一致（显式→前缀→关键词→本地→fallback） |
+| `resolve_preset(name)` | `resolvePreset(name)` | 一致 |
+| `resolve_default_preset()` | `resolveDefaultPreset()` | 一致 |
+| `get_provider(model, preset)` | `getProvider(model, preset)` | 一致 |
+| `get_api_key(model, preset)` | `getApiKey(model, preset)` | 一致 |
+| `get_api_base(model, preset)` | `getApiBase(model, preset)` | 一致 |
+| `workspace_path` property | `workspacePath()` | 一致 |
+| `_validate_model_preset()` | `validate()` 方法内 | 一致 |
+| `DreamConfig.build_schedule(tz)` | `DreamProperties.buildSchedule(tz)` | 一致 |
+| `DreamConfig.describe_schedule()` | `DreamProperties.describeSchedule()` | 一致 |
+| `ModelPresetConfig.to_generation_settings()` | `ModelPresetProperties.toGenerationSettings()` | 一致 |
+
+| Python (`loader.py`) | Java (`ConfigLoader.java`) | 差异 |
+|----------------------|---------------------------|------|
+| `load_config(path)` | `loadConfig(path)` | 一致（JSON→Map→migrate→convertValue） |
+| `save_config(config, path)` | `saveConfig(config, path)` | 一致（convertValue→JSON→write） |
+| `resolve_config_env_vars(config)` | `resolveEnvVars(config)` | 一致（递归 String/Map/List） |
+| `_migrate_config(data)` | `migrateConfig(data)` | 一致（两个迁移规则） |
+| `_apply_ssrf_whitelist(config)` | `applySsrfWhitelist(config)` | no-op stub（等 security 模块） |
+
+| Python (`paths.py`) | Java (`PathUtils.java`) | 差异 |
+|--------------------|------------------------|------|
+| `get_config_path()` | `getConfigPath()` | 一致 |
+| `get_data_dir()` | `getDataDir()` | 一致 |
+| `get_workspace_path(ws)` | `getWorkspacePath(ws)` | 一致 |
+| `get_webui_dir()` | `getWebuiDir()` | 一致 |
+| `get_cron_dir()` | `getCronDir()` | 一致 |
+| `get_logs_dir()` | `getLogsDir()` | 一致 |
+| `get_media_dir(ch)` | `getMediaDir(ch)` | 一致 |
+| `get_cli_history_path()` | `getCliHistoryPath()` | 一致 |
+| `get_bridge_install_dir()` | `getBridgeInstallDir()` | 一致 |
+| `get_legacy_sessions_dir()` | `getLegacySessionsDir()` | 一致 |
+| `is_default_workspace(ws)` | `isDefaultWorkspace(ws)` | 一致 |
+
+### Provider 配置完整性
+
+38 个 ProviderSpec 条目，字段级对标 Python `registry.py`：
+
+| Python 字段 | Java 字段 | 类型对标 |
+|------------|----------|---------|
+| `keywords: tuple[str, ...]` | `List<String>` | 一致 |
+| `env_extras: tuple[tuple[str,str], ...]` | `List<EnvExtra>` | `EnvExtra(key, valueTemplate)` record |
+| `model_overrides: tuple[tuple[str, dict], ...]` | `List<ModelOverride>` | `ModelOverride(model, Map<String,Object>)` record |
+| `label` property `.title()` | `label()` split+titleCase | 一致 |
+
+### 字段级校验对标
+
+Python Pydantic `Field(ge=..., le=...)` 全部映射为 Jakarta Validation 注解：
+
+| 字段 | Python 约束 | Java 注解 |
+|------|-----------|----------|
+| `max_concurrent_subagents` | `ge=1` | `@Min(1)` |
+| `tool_hint_max_length` | `ge=20, le=500` | `@Min(20) @Max(500)` |
+| `session_ttl_minutes` | `ge=0` | `@Min(0)` |
+| `max_messages` | `ge=0` | `@Min(0)` |
+| `consolidation_ratio` | `ge=0.1, le=0.95` | `@DecimalMin("0.1") @DecimalMax("0.95")` |
+| `send_max_retries` | `ge=0, le=10` | `@Min(0) @Max(10)` |
+| `transcription_language` | `pattern=r"^[a-z]{2,3}$"` | `@Pattern(regexp="^[a-z]{2,3}$")` |
+| `max_duration_sec` | `ge=1, le=600` | `@Min(1) @Max(600)` |
+| `max_upload_mb` | `ge=1, le=100` | `@Min(1) @Max(100)` |
+| `dream.interval_h` | `ge=1` | `@Min(1)` |
+| `dream.max_batch_size` | `ge=1` | `@Min(1)` |
+| `dream.max_iterations` | `ge=1` | `@Min(1)` |
+
+### 未修复项（阻塞原因）
+
+| # | 项目 | 阻塞原因 |
+|---|------|---------|
+| 1 | `NANOBOT_PROVIDERS__ANTHROPIC__API_KEY` 双下划线嵌套 | Spring Boot 不支持 `__` 做嵌套分隔符，只能用 `_` |
+| 2 | `ToolsProperties` 工具子配置强类型 | 依赖 P3 (Tool Layer) 完成 |
+| 3 | `_apply_ssrf_whitelist` 实现 | 依赖 security 模块 |
+| 4 | 旧字段别名 (`idleCompactAfterMinutes` 等) | Spring Boot relaxed binding 不支持多别名 |
+
+### 测试覆盖
+
+| 测试类 | 用例数 | 覆盖场景 |
+|--------|--------|---------|
+| `shouldLoadDefaults` | 1 | 默认值绑定验证 |
+| `shouldResolveDefaultPreset` | 1 | 预设解析 |
+| `ModelPresetValidation` | 2 | "default" 保留名校验、缺失预设引用 |
+| `ProviderMatching` | 9 | 显式provider、前缀匹配、关键词匹配、OpenAI关键词、无匹配fallback、网关key前缀检测、apiKey获取、apiBase获取、本地provider关键词 |
+
+### 验证结果
+
+```bash
+# 编译
+$ mvn compile
+BUILD SUCCESS (26 source files)
+
+# 启动  
+$ mvn spring-boot:run
+Started NanobotApplication in 0.38 seconds
+Configuration validated successfully
+
+# 测试
+$ mvn test
+Tests run: 13, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```

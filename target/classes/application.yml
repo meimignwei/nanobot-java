@@ -1,0 +1,53 @@
+nanobot:
+  agents:
+    defaults:
+      workspace: ~/.nanobot-java/workspace
+      model: anthropic/claude-opus-4-5
+      provider: auto
+      max-tokens: 8192
+      context-window-tokens: 65536
+      temperature: 0.1
+      max-tool-iterations: 200
+      max-concurrent-subagents: 1
+      max-tool-result-chars: 16000
+      provider-retry-mode: standard
+      tool-hint-max-length: 40
+      timezone: UTC
+      bot-name: nanobot-java
+      bot-icon: "🐈"
+      unified-session: false
+      session-ttl-minutes: 0
+      max-messages: 120
+      consolidation-ratio: 0.5
+      dream:
+        enabled: true
+        interval-h: 2
+  channels:
+    send-progress: true
+    send-tool-hints: false
+    show-reasoning: true
+    extract-document-text: true
+    send-max-retries: 3
+  transcription:
+    enabled: true
+    max-duration-sec: 120
+    max-upload-mb: 25
+  api:
+    host: 127.0.0.1
+    port: 8900
+    timeout: 120.0
+  gateway:
+    host: 127.0.0.1
+    port: 18790
+    heartbeat:
+      enabled: true
+      interval-s: 1800
+      keep-recent-messages: 8
+  tools:
+    restrict-to-workspace: false
+    webui-allow-local-service-access: true
+
+spring:
+  threads:
+    virtual:
+      enabled: true

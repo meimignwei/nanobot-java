@@ -252,3 +252,76 @@ class MessageBusTest {
 - InboundMessage + OutboundMessage records: ~60 行
 - 测试: ~60 行
 - **合计: ~170 行**
+
+---
+
+## 复刻完成报告
+
+> 完成日期：2026-06-19 | 实际代码行数：196 行 (3 个 Java 文件) | 测试：13 个全部通过
+
+### 源码对标清单
+
+| Python 源文件 | 行数 | Java 目标文件 | 行数 | 复刻度 |
+|-------------|------|-------------|------|--------|
+| `bus/queue.py` | 45 | `MessageBus.java` | 44 | 100% |
+| `bus/events.py` | 54 | `InboundMessage.java` + `OutboundMessage.java` + `BusConstants.java` | 73 | 100% |
+
+### 方法级对标
+
+| Python (`queue.py`) | Java (`MessageBus.java`) | 差异 |
+|--------------------|------------------------|------|
+| `MessageBus.__init__()` | constructor (field initializers) | `asyncio.Queue` → `LinkedBlockingQueue` |
+| `publish_inbound(msg)` | `publishInbound(msg)` | `await q.put()` → `q.put()` (virtual threads) |
+| `consume_inbound()` | `consumeInbound()` | `await q.get()` → `q.take()` (virtual threads) |
+| `publish_outbound(msg)` | `publishOutbound(msg)` | 同上 |
+| `consume_outbound()` | `consumeOutbound()` | 同上 |
+| `inbound_size` property | `inboundSize()` | `q.qsize()` → `q.size()` |
+| `outbound_size` property | `outboundSize()` | `q.qsize()` → `q.size()` |
+
+| Python (`events.py`) | Java | 差异 |
+|---------------------|------|------|
+| `InboundMessage` dataclass (8 fields) | `InboundMessage` record (8 fields) | 字段/类型一一对应 |
+| `InboundMessage.session_key` property | `sessionKey()` | `f"{channel}:{chat_id}"` 一致 |
+| `OutboundMessage` dataclass (7 fields) | `OutboundMessage` record (7 fields) | 字段/类型一一对应 |
+| `timestamp: field(default_factory=datetime.now)` | compact constructor `Instant.now()` | `datetime` → `Instant` |
+| `OUTBOUND_META_AGENT_UI` constant | 推迟到 P4 (Agent Loop) | 需配合 agent loop 使用 |
+| `INBOUND_META_RUNTIME_CONTROL` constants | 推迟到 P4 | 同上 |
+
+### asyncio.Queue → LinkedBlockingQueue 对标
+
+| Python | Java | 说明 |
+|--------|------|------|
+| `await q.put(x)` | `q.put(x)` | 同步阻塞，虚拟线程自动挂起 |
+| `await q.get()` | `q.take()` | 同上 |
+| `q.qsize()` | `q.size()` | 近似值 |
+| `asyncio.Queue()` 无界 | `LinkedBlockingQueue()` 无界 | 默认 Integer.MAX_VALUE |
+
+### 未修复项
+
+无。P1 功能完整复刻。`bus/progress.py` 和 `bus/runtime_events.py` 属于 P4 (Agent Loop) 范围，届时一并实现。
+
+### 测试覆盖
+
+| 测试 | 覆盖场景 |
+|------|---------|
+| `publishAndConsumeInbound` | 入队→出队顺序 |
+| `publishAndConsumeOutbound` | 出站消息入队→出队 |
+| `maintainFifoOrder` | 多条消息 FIFO 顺序 |
+| `inboundSizeTracksPending` | 入站队列 size 跟踪 |
+| `outboundSizeTracksPending` | 出站队列 size 跟踪 |
+| `consumeBlocksUntilMessage` | 虚拟线程阻塞/唤醒 (inbound) |
+| `consumeOutboundBlocks` | 虚拟线程阻塞/唤醒 (outbound) |
+| `sessionKeyDefault` | `channel:chatId` 默认拼接 |
+| `sessionKeyOverride` | override 优先 |
+| `defaultTimestamp` | timestamp 自动生成 |
+| `defaultMediaAndMetadata` | media/metadata 默认空集合 |
+| `defaultReplyTo` | replyTo 默认 null |
+| `defaultCollections` | media/metadata/buttons 默认空 |
+
+### 验证结果
+
+```bash
+$ mvn clean test
+Tests run: 26, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
