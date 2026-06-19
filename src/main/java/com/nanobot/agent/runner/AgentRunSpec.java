@@ -2,6 +2,7 @@ package com.nanobot.agent.runner;
 
 import com.nanobot.agent.hook.AgentHook;
 import com.nanobot.agent.tools.ToolRegistry;
+import com.nanobot.providers.base.ThrowingConsumer;
 import jakarta.annotation.Nullable;
 
 import java.nio.file.Path;
@@ -36,7 +37,7 @@ public record AgentRunSpec(
         String providerRetryMode,
         @Nullable Consumer<String> progressCallback,
         boolean streamProgressDeltas,
-        @Nullable Consumer<String> retryWaitCallback,
+        @Nullable ThrowingConsumer<String> retryWaitCallback,
         @Nullable Consumer<Map<String, Object>> checkpointCallback,
         @Nullable Supplier<List<Map<String, Object>>> injectionCallback,
         @Nullable Double llmTimeoutS,

@@ -28,8 +28,14 @@ public class AgentHookContext {
     public String error;
     public String sessionKey;
 
+    public AgentHookContext() {}
+
     public AgentHookContext(int iteration, List<Map<String, Object>> messages) {
         this.iteration = iteration;
         this.messages = messages;
     }
+
+    public void setIteration(int iteration) { this.iteration = iteration; }
+    public void setMessages(List<Map<String, Object>> messages) { this.messages = messages; }
+    public void setSessionKey(String sessionKey) { this.sessionKey = sessionKey; }
 }

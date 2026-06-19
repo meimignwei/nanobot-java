@@ -21,7 +21,15 @@ public class AgentRunHookContext {
     public boolean hadInjections;
     public Throwable exception;
 
+    public AgentRunHookContext() {}
+
     public AgentRunHookContext(List<Map<String, Object>> messages) {
         this.messages = messages;
     }
+
+    public void setFinalContent(String finalContent) { this.finalContent = finalContent; }
+    public void setStopReason(String stopReason) { this.stopReason = stopReason; }
+    public void setError(String error) { this.error = error; }
+    public void setException(Throwable exception) { this.exception = exception; }
+    public void setHadInjections(boolean hadInjections) { this.hadInjections = hadInjections; }
 }
