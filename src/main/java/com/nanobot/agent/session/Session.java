@@ -38,6 +38,7 @@ public class Session {
     public Map<String, Object> metadata() { return metadata; }
     public Instant createdAt() { return createdAt; }
     public Instant updatedAt() { return updatedAt; }
+    public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
     public int lastConsolidated() { return lastConsolidated; }
 
     public void setLastConsolidated(int value) {
