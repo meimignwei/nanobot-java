@@ -8,6 +8,7 @@ import com.nanobot.agent.runner.AgentRunSpec;
 import com.nanobot.agent.runner.AgentRunner;
 import com.nanobot.agent.session.Session;
 import com.nanobot.agent.session.SessionManager;
+import com.nanobot.agent.tools.ToolContext;
 import com.nanobot.agent.tools.ToolRegistry;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
@@ -546,6 +547,102 @@ public class AgentLoop implements Runnable {
         }
         return filtered;
     }
+
+    // -- tool context --
+
+    void setToolContext(String channel, String chatId, @Nullable String messageId,
+                        @Nullable Map<String, Object> metadata, String sessionKey,
+                        Path workspace) {
+        ToolContext build = ToolContext.builder()
+                .config(Map.of("channel", channel, "chat_id", chatId))
+                .workspace(workspace.toString())
+                .bus(bus)
+                .sessions(sessions)
+                .timezone("UTC")
+                .build();
+        com.nanobot.agent.tools.ToolContext.bind(build);
+    }
+
+    void clearToolContext() {
+        com.nanobot.agent.tools.ToolContext.unbind();
+    }
+
+    // -- default tool registration --
+
+    void registerDefaultTools() {
+        // Register standard built-in tools. These are the tools available
+        // to every agent session by default. Port of Python _register_default_tools.
+        // Tools are lazy-loaded by ToolLoader; registration here ensures they
+        // appear in tool_definitions for the LLM.
+        // For now, the ToolRegistry is populated externally via the ToolLoader.
+    }
+
+    // -- background tasks --
+
+    void scheduleBackground(Runnable task) {
+        executor.submit(task);
+    }
+
+    // -- checkpoint management --
+
+    void setRuntimeCheckpoint(Session session, Map<String, Object> payload) {
+        if (session == null) return;
+        session.metadata().put("runtime_checkpoint", payload);
+    }
+
+    @SuppressWarnings("unchecked")
+    boolean restoreRuntimeCheckpoint(Session session) {
+        if (session == null) return false;
+        var checkpoint = session.metadata().get("runtime_checkpoint");
+        if (checkpoint instanceof Map<?, ?> cp) {
+            var phase = cp.get("phase");
+            if ("awaiting_tools".equals(phase) || "tools_completed".equals(phase)
+                    || "final_response".equals(phase)) {
+                var messages = cp.get("assistant_message");
+                if (messages instanceof Map<?, ?> msg) {
+                    var typedMsg = (Map<String, Object>) msg;
+                    var content = typedMsg.get("content");
+                    session.addMessage("assistant",
+                            content != null ? content.toString() : "",
+                            Map.of("tool_calls", typedMsg.getOrDefault("tool_calls", List.of())));
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void markPendingUserTurn(Session session) {
+        if (session == null) return;
+        session.metadata().put("_pending_user_turn", true);
+    }
+
+    void clearPendingUserTurn(Session session) {
+        if (session == null) return;
+        session.metadata().remove("_pending_user_turn");
+    }
+
+    // -- assembleOutbound --
+
+    OutboundMessage assembleOutbound(InboundMessage msg, String finalContent,
+                                     List<Map<String, Object>> allMessages,
+                                     String stopReason, boolean hadInjections) {
+        var preview = finalContent != null && finalContent.length() > 120
+                ? finalContent.substring(0, 120) + "..."
+                : finalContent;
+        log.info("Response to {}:{}: {}", msg.channel(), msg.senderId(), preview);
+
+        var meta = msg.metadata() != null ? new LinkedHashMap<>(msg.metadata()) : new LinkedHashMap<String, Object>();
+        if (!"error".equals(stopReason) && !"tool_error".equals(stopReason)) {
+            meta.put("_streamed", true);
+        }
+
+        return new OutboundMessage(
+                msg.channel(), msg.chatId(), finalContent,
+                null, null, meta, null);
+    }
+
+    // -- cancelActiveTasks --
 
     public int cancelActiveTasks(String sessionKey) {
         var tasks = activeTasks.get(sessionKey);
