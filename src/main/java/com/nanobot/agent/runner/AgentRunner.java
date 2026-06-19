@@ -25,16 +25,43 @@ public class AgentRunner {
     private static final Logger log = LoggerFactory.getLogger(AgentRunner.class);
 
     static final int MAX_EMPTY_RETRIES = 2;
+    static final int MAX_LENGTH_RECOVERIES = 3;
+    static final int MAX_INJECTIONS_PER_TURN = 3;
     static final int MAX_INJECTION_CYCLES = 5;
     static final int SNIP_SAFETY_BUFFER = 1024;
     static final int MICROCOMPACT_KEEP_RECENT = 10;
+    static final int MICROCOMPACT_MIN_CHARS = 500;
+    static final int MAX_REPEAT_WORKSPACE_VIOLATIONS = 2;
+    static final int MAX_REPEAT_EXTERNAL_LOOKUPS = 2;
     static final String BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]";
+    static final String DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
+    static final String ARREARAGE_ERROR_MESSAGE =
+            "The AI provider rejected the request because the API key is out of quota or the "
+            + "account is in arrears. Please top up / check the billing status of your API key and try again.";
+    static final String PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]";
+    static final String EMPTY_FINAL_RESPONSE_MESSAGE =
+            "I completed the tool steps but couldn't produce a final answer. "
+            + "Please try again or narrow the task.";
+
+    static final String FINALIZATION_RETRY_PROMPT =
+            "Please provide your response to the user based on the conversation above.";
+    static final String BUDGET_EXHAUSTED_FINALIZATION_PROMPT =
+            "The tool-call budget for this turn is exhausted. Based only on the "
+            + "conversation and tool results above, provide a concise final response to "
+            + "the user. Do not call or request tools. Do not claim the task is complete "
+            + "unless the evidence above clearly shows it is complete. State what was "
+            + "done, what remains, and the best next step if anything is incomplete.";
+    static final String LENGTH_RECOVERY_PROMPT =
+            "Output limit reached. Continue exactly where you left off "
+            + "— no recap, no apology. Break remaining work into smaller steps if needed.";
 
     private final LLMProvider provider;
 
     public AgentRunner(LLMProvider provider) {
         this.provider = provider;
     }
+
+    public LLMProvider getProvider() { return provider; }
 
     // -- run --
 
@@ -217,7 +244,12 @@ public class AgentRunner {
 
         // Max iterations reached
         if (spec.finalizeOnMaxIterations()) {
-            return tryFinalizeOnMaxIterations(spec, messages, toolsUsed, usage, runCtx, hadInjections);
+            var finalContent = tryFinalizeOnMaxIterations(spec, messages, usage, runCtx, hadInjections);
+            if (finalContent != null) {
+                appendFinalMessage(messages, finalContent);
+            }
+            return new AgentRunResult(finalContent, messages, toolsUsed, usage,
+                    "max_iterations", null, runCtx.toolEvents, hadInjections);
         }
         return new AgentRunResult(null, messages, toolsUsed, usage,
                 "max_iterations", null, runCtx.toolEvents, hadInjections);
@@ -225,90 +257,413 @@ public class AgentRunner {
 
     // -- requestModel --
 
+    @SuppressWarnings("unchecked")
     LLMResponse requestModel(AgentRunSpec spec, List<Map<String, Object>> messages,
                              AgentHookContext iterCtx) throws Exception {
-        var model = spec.model() != null ? spec.model() : provider.getDefaultModel();
+        var tools = spec.tools().getDefinitions();
         int maxTokens = spec.maxTokens() != null ? spec.maxTokens() : provider.generation.maxTokens();
         double temperature = spec.temperature() != null ? spec.temperature() : provider.generation.temperature();
-        var tools = spec.tools().getDefinitions();
-
         return provider.chatWithRetry(
-                messages, tools, model, maxTokens, temperature,
+                messages, tools, spec.model(), maxTokens, temperature,
                 spec.reasoningEffort(), null,
                 spec.providerRetryMode(), spec.retryWaitCallback());
     }
 
-    // -- executeTools --
+    @SuppressWarnings("unchecked")
+    Map<String, Object> buildRequestKwargs(AgentRunSpec spec, List<Map<String, Object>> messages) {
+        var kwargs = new LinkedHashMap<String, Object>();
+        kwargs.put("messages", messages);
+        kwargs.put("tools", spec.tools().getDefinitions());
+        kwargs.put("model", spec.model());
+        kwargs.put("retry_mode", spec.providerRetryMode());
+        kwargs.put("on_retry_wait", spec.retryWaitCallback());
+        if (spec.temperature() != null) kwargs.put("temperature", spec.temperature());
+        if (spec.maxTokens() != null) kwargs.put("max_tokens", spec.maxTokens());
+        if (spec.reasoningEffort() != null) kwargs.put("reasoning_effort", spec.reasoningEffort());
+        return kwargs;
+    }
 
+    @SuppressWarnings("unchecked")
+    LLMResponse requestNoTools(AgentRunSpec spec, List<Map<String, Object>> messages) throws Exception {
+        int maxTokens = spec.maxTokens() != null ? spec.maxTokens() : provider.generation.maxTokens();
+        double temperature = spec.temperature() != null ? spec.temperature() : provider.generation.temperature();
+        return provider.chatWithRetry(
+                messages, null, spec.model(), maxTokens, temperature,
+                spec.reasoningEffort(), null,
+                spec.providerRetryMode(), spec.retryWaitCallback());
+    }
+
+    // -- injection draining --
+
+    @SuppressWarnings("unchecked")
+    boolean tryDrainInjections(AgentRunSpec spec, List<Map<String, Object>> messages,
+                               Map<String, Object> assistantMessage,
+                               int injectionCycles,
+                               String phase, Integer iteration,
+                               boolean allowGoalContinue) {
+        if (injectionCycles >= MAX_INJECTION_CYCLES && !allowGoalContinue) return false;
+
+        var injections = new ArrayList<Map<String, Object>>();
+        boolean realInjection = false;
+        if (injectionCycles < MAX_INJECTION_CYCLES) {
+            injections.addAll(drainInjections(spec));
+            realInjection = !injections.isEmpty();
+        }
+        if (injections.isEmpty() && allowGoalContinue && assistantMessage != null) {
+            var predicate = spec.goalActivePredicate();
+            if (predicate != null && predicate.getAsBoolean()) {
+                injections.add(Map.of("role", "user", "content",
+                        spec.goalContinueMessage() != null ? spec.goalContinueMessage()
+                                : "You have an active sustained goal. Please continue working toward the "
+                                + "objective using your tools, or call complete_goal if the work is truly finished."));
+            }
+        }
+        if (injections.isEmpty()) return false;
+        if (assistantMessage != null) {
+            messages.add(assistantMessage);
+            if (iteration != null) {
+                emitCheckpoint(spec, Map.of(
+                        "phase", "final_response",
+                        "iteration", iteration,
+                        "model", spec.model(),
+                        "assistant_message", assistantMessage,
+                        "completed_tool_results", List.of(),
+                        "pending_tool_calls", List.of()));
+            }
+        }
+        appendInjectedMessages(messages, injections);
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> drainInjections(AgentRunSpec spec) {
+        var callback = spec.injectionCallback();
+        if (callback == null) return List.of();
+        try {
+            var items = callback.get();
+            if (items == null || items.isEmpty()) return List.of();
+            var result = new ArrayList<Map<String, Object>>();
+            int count = 0;
+            for (var item : items) {
+                if (count >= MAX_INJECTIONS_PER_TURN) break;
+                if (item instanceof Map<?, ?> m) {
+                    result.add((Map<String, Object>) m);
+                    count++;
+                }
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("injection_callback failed", e);
+            return List.of();
+        }
+    }
+
+    // -- finalization --
+
+    LLMResponse requestFinalizationRetry(AgentRunSpec spec,
+                                         List<Map<String, Object>> messages) throws Exception {
+        var retryMessages = buildFinalizationRetryMessages(messages);
+        return requestNoTools(spec, retryMessages);
+    }
+
+    static List<Map<String, Object>> buildFinalizationRetryMessages(List<Map<String, Object>> messages) {
+        var retry = new ArrayList<>(messages);
+        retry.add(Map.of("role", "user", "content", FINALIZATION_RETRY_PROMPT));
+        return retry;
+    }
+
+    static List<Map<String, Object>> buildBudgetExhaustedFinalizationMessages(
+            List<Map<String, Object>> messages) {
+        var retry = new ArrayList<>(messages);
+        retry.add(Map.of("role", "user", "content", BUDGET_EXHAUSTED_FINALIZATION_PROMPT));
+        return retry;
+    }
+
+    static Map<String, Object> buildLengthRecoveryMessage() {
+        return Map.of("role", "user", "content", LENGTH_RECOVERY_PROMPT);
+    }
+
+    String maxIterationsFallback(AgentRunSpec spec) {
+        if (spec.maxIterationsMessage() != null) {
+            return spec.maxIterationsMessage().replace("{max_iterations}",
+                    String.valueOf(spec.maxIterations()));
+        }
+        return "Maximum iterations (" + spec.maxIterations()
+                + ") reached. Task may be incomplete — send another message to continue.";
+    }
+
+    @SuppressWarnings("unchecked")
+    String tryFinalizeOnMaxIterations(AgentRunSpec spec, List<Map<String, Object>> messages,
+                                      Map<String, Integer> usage, AgentRunHookContext runCtx,
+                                      boolean hadInjections) {
+        var retryMessages = buildBudgetExhaustedFinalizationMessages(messages);
+        try {
+            var response = requestNoTools(spec, retryMessages);
+            var rawUsage = usageOrEstimate(spec, retryMessages, response);
+            accumulateUsage(usage, rawUsage);
+            if ("error".equals(response.finishReason()) || response.hasToolCalls()) return null;
+            var hook = spec.hook();
+            if (hook != null) {
+                var ctx = new AgentHookContext();
+                ctx.iteration = spec.maxIterations();
+                ctx.messages = messages;
+                ctx.response = response;
+                ctx.usage = rawUsage;
+                ctx.sessionKey = spec.sessionKey();
+                return hook.finalizeContent(ctx, response.content());
+            }
+            return response.content();
+        } catch (Exception e) {
+            log.warn("Budget-exhausted finalization failed for {}", spec.sessionKey(), e);
+            return null;
+        }
+    }
+
+    // -- usage estimation --
+
+    Map<String, Integer> usageOrEstimate(AgentRunSpec spec, List<Map<String, Object>> messages,
+                                         LLMResponse response) {
+        var usage = usageDict(response.usage());
+        var total = usageTotal(usage);
+        if (total > 0) {
+            usage.put("total_tokens", total);
+            usage.putIfAbsent("provider_tokens", total);
+            return usage;
+        }
+        if ("error".equals(response.finishReason())) return Map.of();
+        return estimateResponseUsage(spec, messages, response);
+    }
+
+    @SuppressWarnings("unchecked")
+    Map<String, Integer> estimateResponseUsage(AgentRunSpec spec, List<Map<String, Object>> messages,
+                                                LLMResponse response) {
+        try {
+            var tools = spec.tools().getDefinitions();
+            // Estimate: chars / 4 ≈ tokens
+            int promptTokens = 0;
+            for (var msg : messages) {
+                var content = msg.get("content");
+                if (content instanceof String s) promptTokens += s.length() / 4;
+                else if (content instanceof List<?> l) {
+                    for (var block : l) {
+                        if (block instanceof Map<?, ?> bm && "text".equals(bm.get("type"))) {
+                            var t = bm.get("text");
+                            if (t instanceof String ts) promptTokens += ts.length() / 4;
+                        }
+                    }
+                }
+            }
+            promptTokens = Math.max(1, promptTokens);
+            var responseContent = response.content() != null ? response.content() : "";
+            int completionTokens = Math.max(1, responseContent.length() / 4);
+            int totalTokens = promptTokens + completionTokens;
+            return Map.of("prompt_tokens", promptTokens, "completion_tokens", completionTokens,
+                    "total_tokens", totalTokens, "estimated_tokens", totalTokens);
+        } catch (Exception e) {
+            return Map.of();
+        }
+    }
+
+    // -- executeTools (enhanced with batching) --
+
+    @SuppressWarnings("unchecked")
     List<Map<String, Object>> executeTools(AgentRunSpec spec, List<ToolCallRequest> toolCalls,
                                            AgentHookContext iterCtx) {
+        var extLookupCounts = new LinkedHashMap<String, Integer>();
+        var wsViolationCounts = new LinkedHashMap<String, Integer>();
+        var batches = partitionToolBatches(spec, toolCalls);
         var results = new ArrayList<Map<String, Object>>();
-        for (var tc : toolCalls) {
-            var result = runTool(spec, tc);
-            results.add(result);
-            iterCtx.toolCalls.add(tc);
-            iterCtx.toolResults.add(result);
+
+        for (var batch : batches) {
+            if (spec.concurrentTools() && batch.size() > 1) {
+                // Concurrent execution via virtual threads
+                var futures = new ArrayList<java.util.concurrent.Future<Map<String, Object>>>();
+                var batchExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+                try {
+                    for (var tc : batch) {
+                        futures.add(batchExecutor.submit(() -> runToolWithClassification(
+                                spec, tc, extLookupCounts, wsViolationCounts)));
+                    }
+                    for (var f : futures) {
+                        try { results.add(f.get()); } catch (Exception e) {
+                            results.add(Map.of("role", "tool", "tool_call_id", "concurrent-error",
+                                    "content", "Tool execution error: " + e.getMessage()));
+                        }
+                    }
+                } finally {
+                    batchExecutor.shutdown();
+                }
+            } else {
+                for (var tc : batch) {
+                    results.add(runToolWithClassification(spec, tc, extLookupCounts, wsViolationCounts));
+                }
+            }
+        }
+
+        for (var r : results) {
+            iterCtx.toolResults.add(r);
         }
         return results;
     }
 
     @SuppressWarnings("unchecked")
-    Map<String, Object> runTool(AgentRunSpec spec, ToolCallRequest toolCall) {
-        var result = new LinkedHashMap<String, Object>();
-        result.put("role", "tool");
-        result.put("tool_call_id", toolCall.id());
-        result.put("name", toolCall.name());
+    Map<String, Object> runToolWithClassification(AgentRunSpec spec, ToolCallRequest toolCall,
+                                                   Map<String, Integer> extLookupCounts,
+                                                   Map<String, Integer> wsViolationCounts) {
+        var hint = "\n\n[Analyze the error above and try a different approach.]";
 
-        var tool = spec.tools().get(toolCall.name());
-        if (tool == null) {
-            result.put("content", "Error: tool '" + toolCall.name() + "' not found");
-            return result;
+        // Check repeated external lookup
+        var lookupSig = externalLookupSignature(toolCall.name(), toolCall.arguments());
+        if (lookupSig != null) {
+            int count = extLookupCounts.getOrDefault(lookupSig, 0) + 1;
+            extLookupCounts.put(lookupSig, count);
+            if (count > MAX_REPEAT_EXTERNAL_LOOKUPS) {
+                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                        "name", toolCall.name(),
+                        "content", "Repeated external lookup blocked for " + lookupSig + hint);
+            }
         }
 
+        // Get tool and params
+        var tool = spec.tools().get(toolCall.name());
+        Map<String, Object> params;
+        if (toolCall.arguments() instanceof Map<?, ?> m) {
+            params = (Map<String, Object>) m;
+        } else {
+            params = Map.of();
+        }
+
+        // Execute
+        String rawText;
         try {
-            Map<String, Object> args;
-            if (toolCall.arguments() instanceof Map<?, ?> m) {
-                args = (Map<String, Object>) m;
-            } else {
-                args = Map.of();
-            }
-            var toolResult = tool.execute(args, ToolContext.create());
-            String output = toolResult != null ? toolResult.toString() : "";
-            if (output.length() > spec.maxToolResultChars()) {
-                output = output.substring(0, spec.maxToolResultChars()) + "\n... (truncated)";
-            }
-            result.put("content", output);
+            var toolResult = tool != null
+                    ? tool.execute(params, ToolContext.create())
+                    : spec.tools().execute(toolCall.name(), params);
+            rawText = toolResult != null ? toolResult.toString() : "";
         } catch (Exception e) {
-            result.put("content", "Tool error: " + e.getMessage());
+            rawText = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+
+        // Check for violations in output
+        if (rawText.startsWith("Error") || isSsrfViolation(rawText) || isWorkspaceViolation(rawText)) {
+            var event = Map.of("name", toolCall.name(), "status", "error",
+                    "detail", rawText.replace("\n", " ").trim().substring(
+                            0, Math.min(120, rawText.replace("\n", " ").trim().length())));
+
+            // Check SSRF
+            if (isSsrfViolation(rawText)) {
+                log.warn("Tool {} blocked by SSRF guard: {}", toolCall.name(),
+                        rawText.replace("\n", " ").trim().substring(0, Math.min(200, rawText.replace("\n", " ").trim().length())));
+                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                        "name", toolCall.name(), "content", ssrfSoftPayload(rawText));
+            }
+
+            // Check workspace violation
+            if (isWorkspaceViolation(rawText)) {
+                var wsSig = workspaceViolationSignature(toolCall.name(), params);
+                if (wsSig != null) {
+                    int wsCount = wsViolationCounts.getOrDefault(wsSig, 0) + 1;
+                    wsViolationCounts.put(wsSig, wsCount);
+                    if (wsCount > MAX_REPEAT_WORKSPACE_VIOLATIONS) {
+                        log.warn("Tool {} hit workspace boundary repeatedly; escalating hint", toolCall.name());
+                        return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                                "name", toolCall.name(),
+                                "content", "Repeated workspace boundary violation for "
+                                        + toolCall.name() + ". Stop retrying with different paths. "
+                                        + "Stay within the configured workspace directory." + hint);
+                    }
+                }
+                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                        "name", toolCall.name(), "content", rawText + hint);
+            }
+
+            return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                    "name", toolCall.name(), "content", rawText + hint);
+        }
+
+        // Success — normalize and truncate
+        var normalized = normalizeToolResult(spec, toolCall.id(), toolCall.name(), rawText);
+        return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                "name", toolCall.name(), "content", normalized);
+    }
+
+    // -- normalizeToolResult --
+
+    Object normalizeToolResult(AgentRunSpec spec, String toolCallId, String toolName, Object result) {
+        if (result == null || (result instanceof String s && s.isBlank())) {
+            return "(" + toolName + " completed with no output)";
+        }
+        // read_file is exempt from offload to prevent persist→read→persist loops
+        if ("read_file".equals(toolName)) return result;
+        if (result instanceof String s && s.length() > spec.maxToolResultChars()) {
+            return s.substring(0, spec.maxToolResultChars()) + "\n... (truncated)";
         }
         return result;
     }
 
-    // -- tryFinalizeOnMaxIterations --
+    // -- partitionToolBatches --
 
-    AgentRunResult tryFinalizeOnMaxIterations(AgentRunSpec spec, List<Map<String, Object>> messages,
-                                             List<String> toolsUsed, Map<String, Integer> usage,
-                                             AgentRunHookContext runCtx, boolean hadInjections) {
-        try {
-            var prompt = "You have reached the maximum number of iterations. "
-                    + "Please provide a final response summarizing what you've done so far. "
-                    + "Do NOT call any tools.";
-            messages.add(Map.of("role", "user", "content", prompt));
-            var model = spec.model() != null ? spec.model() : provider.getDefaultModel();
-            var finalResponse = provider.chat(
-                    messages, null, model,
-                    spec.maxTokens() != null ? spec.maxTokens() : provider.generation.maxTokens(),
-                    spec.temperature() != null ? spec.temperature() : provider.generation.temperature(),
-                    spec.reasoningEffort(), "none");
-            var content = finalResponse.content();
-            messages.add(buildAssistantMessage(content, List.of(), null, null));
-            return new AgentRunResult(content, messages, toolsUsed, usage,
-                    "max_iterations", null, runCtx.toolEvents, hadInjections);
-        } catch (Exception e) {
-            log.warn("Finalization failed: {}", e.getMessage());
-            return new AgentRunResult(null, messages, toolsUsed, usage,
-                    "max_iterations", null, runCtx.toolEvents, hadInjections);
+    List<List<ToolCallRequest>> partitionToolBatches(AgentRunSpec spec,
+                                                      List<ToolCallRequest> toolCalls) {
+        if (!spec.concurrentTools()) {
+            return toolCalls.stream().map(List::of).collect(java.util.stream.Collectors.toList());
         }
+        var batches = new ArrayList<List<ToolCallRequest>>();
+        var current = new ArrayList<ToolCallRequest>();
+        for (var tc : toolCalls) {
+            var tool = spec.tools().get(tc.name());
+            boolean canBatch = tool != null && tool.isConcurrencySafe();
+            if (canBatch) {
+                current.add(tc);
+                continue;
+            }
+            if (!current.isEmpty()) {
+                batches.add(List.copyOf(current));
+                current.clear();
+            }
+            batches.add(List.of(tc));
+        }
+        if (!current.isEmpty()) batches.add(current);
+        return batches;
+    }
+
+    // -- emitCheckpoint --
+
+    void emitCheckpoint(AgentRunSpec spec, Map<String, Object> payload) {
+        var callback = spec.checkpointCallback();
+        if (callback != null) {
+            try { callback.accept(payload); } catch (Exception ignored) {}
+        }
+    }
+
+    // -- external lookup / workspace violation signatures --
+
+    @SuppressWarnings("unchecked")
+    static String externalLookupSignature(String toolName, Object arguments) {
+        if (!(arguments instanceof Map<?, ?> args)) return null;
+        if ("web_fetch".equals(toolName)) {
+            var urlObj = args.get("url");
+            var url = urlObj != null ? urlObj.toString().trim() : "";
+            if (!url.isEmpty()) return "web_fetch:" + url.toLowerCase();
+        }
+        if ("web_search".equals(toolName)) {
+            var queryObj = args.get("query");
+            if (queryObj == null) queryObj = args.get("search_term");
+            var query = queryObj != null ? queryObj.toString().trim() : "";
+            if (!query.isEmpty()) return "web_search:" + query.toLowerCase();
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    static String workspaceViolationSignature(String toolName, Map<String, Object> arguments) {
+        if (arguments == null) return null;
+        var pathObj = arguments.get("file_path");
+        if (pathObj == null) pathObj = arguments.get("path");
+        if (pathObj == null) pathObj = arguments.get("directory");
+        var path = pathObj != null ? pathObj.toString().trim() : "";
+        if (!path.isEmpty()) return toolName + ":" + path;
+        return null;
     }
 
     // -- Context governance --
@@ -499,5 +854,115 @@ public class AgentRunner {
             merged.merge(entry.getKey(), entry.getValue(), Integer::sum);
         }
         return merged;
+    }
+
+    public static void accumulateUsage(Map<String, Integer> target, Map<String, Integer> addition) {
+        for (var entry : addition.entrySet()) {
+            target.merge(entry.getKey(), entry.getValue(), Integer::sum);
+        }
+    }
+
+    public static int usageTotal(Map<String, Integer> usage) {
+        if (usage.containsKey("total_tokens")) {
+            return usage.get("total_tokens");
+        }
+        return usage.getOrDefault("prompt_tokens", 0)
+                + usage.getOrDefault("completion_tokens", 0);
+    }
+
+    public static Map<String, Integer> usageDict(@Nullable Map<String, ?> raw) {
+        if (raw == null || raw.isEmpty()) return Map.of();
+        var result = new LinkedHashMap<String, Integer>();
+        for (var entry : raw.entrySet()) {
+            try {
+                var val = entry.getValue();
+                if (val instanceof Number n) {
+                    result.put(entry.getKey(), n.intValue());
+                } else if (val != null) {
+                    result.put(entry.getKey(), Integer.parseInt(val.toString()));
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return result;
+    }
+
+    // -- security checks --
+
+    private static final List<String> SSRF_MARKERS = List.of(
+            "internal/private url detected",
+            "private/internal address",
+            "private address"
+    );
+
+    private static final String SSRF_BOUNDARY_NOTE =
+            "This is a non-bypassable security boundary. Stop trying to access "
+            + "private/internal URLs. Do not retry with curl, wget, encoded IPs, "
+            + "alternate DNS, redirects, proxies, or another tool. Ask the user for "
+            + "local files, logs, screenshots, or an explicit safe public URL instead. "
+            + "If the user explicitly trusts this private URL, ask them to whitelist "
+            + "the exact IP/CIDR via tools.ssrfWhitelist.";
+
+    private static final List<String> WORKSPACE_VIOLATION_MARKERS = List.of(
+            "outside the configured workspace",
+            "outside allowed directory",
+            "working_dir is outside",
+            "working_dir could not be resolved",
+            "path outside working dir",
+            "path traversal detected"
+    );
+
+    public static boolean isSsrfViolation(@Nullable String text) {
+        if (text == null || text.isEmpty()) return false;
+        var lowered = text.toLowerCase();
+        return SSRF_MARKERS.stream().anyMatch(lowered::contains);
+    }
+
+    public static boolean isWorkspaceViolation(@Nullable String text) {
+        if (text == null || text.isEmpty()) return false;
+        var lowered = text.toLowerCase();
+        if (isSsrfViolation(lowered)) return true;
+        return WORKSPACE_VIOLATION_MARKERS.stream().anyMatch(lowered::contains);
+    }
+
+    public static String ssrfSoftPayload(String rawText) {
+        var text = rawText.strip();
+        if (text.isEmpty()) text = "Error: request blocked by SSRF guard";
+        return text + "\n\n" + SSRF_BOUNDARY_NOTE;
+    }
+
+    public static String eventDetail(String prefix, String text, int limit) {
+        return (prefix + text.replace("\n", " ").strip()).substring(
+                0, Math.min(prefix.length() + text.replace("\n", " ").strip().length(), limit));
+    }
+
+    // -- message helpers --
+
+    public static void appendFinalMessage(List<Map<String, Object>> messages,
+                                          @Nullable String content) {
+        if (content == null || content.isEmpty()) return;
+        if (!messages.isEmpty()
+                && "assistant".equals(messages.get(messages.size() - 1).get("role"))
+                && !messages.get(messages.size() - 1).containsKey("tool_calls")) {
+            if (content.equals(messages.get(messages.size() - 1).get("content"))) return;
+            messages.set(messages.size() - 1, buildAssistantMessage(content, null, null, null));
+            return;
+        }
+        messages.add(buildAssistantMessage(content, null, null, null));
+    }
+
+    public static void appendModelErrorPlaceholder(List<Map<String, Object>> messages) {
+        if (!messages.isEmpty()
+                && "assistant".equals(messages.get(messages.size() - 1).get("role"))
+                && !messages.get(messages.size() - 1).containsKey("tool_calls")) {
+            return;
+        }
+        messages.add(buildAssistantMessage(
+                "[Assistant reply unavailable due to model error.]", null, null, null));
+    }
+
+    /** Exposed for tests; same as package-private mergeMessageContent. */
+    public static Object mergeMessageContentPublic(Object left, Object right) {
+        return mergeMessageContent(left, right);
     }
 }

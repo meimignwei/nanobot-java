@@ -140,6 +140,172 @@ class AgentRunnerTest {
         assertThat(msg.get("tool_calls")).isNotNull();
     }
 
+    // -- security checks --
+
+    @Test
+    void isSsrfViolationDetectsMarkers() {
+        assertThat(AgentRunner.isSsrfViolation("internal/private URL detected")).isTrue();
+        assertThat(AgentRunner.isSsrfViolation("Private/Internal Address blocked")).isTrue();
+        assertThat(AgentRunner.isSsrfViolation("this is a private address issue")).isTrue();
+        assertThat(AgentRunner.isSsrfViolation("normal response")).isFalse();
+        assertThat(AgentRunner.isSsrfViolation("")).isFalse();
+        assertThat(AgentRunner.isSsrfViolation(null)).isFalse();
+    }
+
+    @Test
+    void isWorkspaceViolationDetectsBothSsrfAndWorkspaceMarkers() {
+        assertThat(AgentRunner.isWorkspaceViolation("outside the configured workspace")).isTrue();
+        assertThat(AgentRunner.isWorkspaceViolation("path outside working dir")).isTrue();
+        assertThat(AgentRunner.isWorkspaceViolation("path traversal detected")).isTrue();
+        assertThat(AgentRunner.isWorkspaceViolation("working_dir could not be resolved")).isTrue();
+        // SSRF markers also trigger workspace violation
+        assertThat(AgentRunner.isWorkspaceViolation("internal/private URL detected")).isTrue();
+        assertThat(AgentRunner.isWorkspaceViolation("normal output")).isFalse();
+    }
+
+    @Test
+    void ssrfSoftPayloadAppendsBoundaryNote() {
+        var result = AgentRunner.ssrfSoftPayload("blocked: internal address");
+        assertThat(result).contains("blocked: internal address");
+        assertThat(result).contains("non-bypassable security boundary");
+    }
+
+    @Test
+    void ssrfSoftPayloadHandlesEmptyText() {
+        var result = AgentRunner.ssrfSoftPayload("");
+        assertThat(result).contains("blocked by SSRF guard");
+    }
+
+    @Test
+    void eventDetailTruncatesToLimit() {
+        var result = AgentRunner.eventDetail("prefix: ", "short text", 200);
+        assertThat(result).startsWith("prefix: ");
+        assertThat(result).contains("short text");
+    }
+
+    @Test
+    void eventDetailTruncatesLongText() {
+        var longText = "a".repeat(200);
+        var result = AgentRunner.eventDetail("err: ", longText, 80);
+        assertThat(result.length()).isLessThanOrEqualTo(80);
+        assertThat(result).startsWith("err: ");
+    }
+
+    // -- usage tracking --
+
+    @Test
+    void usageDictConvertsStringValuesToInt() {
+        var usage = Map.of("prompt_tokens", 100, "completion_tokens", "50");
+        var result = AgentRunner.usageDict(usage);
+        assertThat(result).containsEntry("prompt_tokens", 100);
+        assertThat(result).containsEntry("completion_tokens", 50);
+    }
+
+    @Test
+    void usageDictHandlesNullAndInvalid() {
+        assertThat(AgentRunner.usageDict(null)).isEmpty();
+        assertThat(AgentRunner.usageDict(Map.of("bad", "NaN"))).isEmpty();
+    }
+
+    @Test
+    void usageTotalSumsPromptAndCompletion() {
+        var usage = Map.of("prompt_tokens", 100, "completion_tokens", 50);
+        assertThat(AgentRunner.usageTotal(usage)).isEqualTo(150);
+    }
+
+    @Test
+    void usageTotalUsesTotalTokensIfPresent() {
+        var usage = Map.of("total_tokens", 200, "prompt_tokens", 100, "completion_tokens", 50);
+        assertThat(AgentRunner.usageTotal(usage)).isEqualTo(200);
+    }
+
+    @Test
+    void accumulateUsageAddsValues() {
+        var target = new java.util.LinkedHashMap<>(Map.of("prompt_tokens", 100));
+        AgentRunner.accumulateUsage(target, Map.of("prompt_tokens", 50, "completion_tokens", 30));
+        assertThat(target).containsEntry("prompt_tokens", 150);
+        assertThat(target).containsEntry("completion_tokens", 30);
+    }
+
+    @Test
+    void mergeUsageCreatesNewMapWithSummedValues() {
+        var left = Map.of("prompt_tokens", 100);
+        var right = Map.of("completion_tokens", 50);
+        var result = AgentRunner.mergeUsage(left, right);
+        assertThat(result).containsEntry("prompt_tokens", 100);
+        assertThat(result).containsEntry("completion_tokens", 50);
+    }
+
+    // -- message helpers --
+
+    @Test
+    void appendFinalMessageAddsWhenEmpty() {
+        var messages = new ArrayList<Map<String, Object>>();
+        AgentRunner.appendFinalMessage(messages, "hello");
+        assertThat(messages).hasSize(1);
+        assertThat(messages.get(0).get("role")).isEqualTo("assistant");
+        assertThat(messages.get(0).get("content")).isEqualTo("hello");
+    }
+
+    @Test
+    void appendFinalMessageReplacesLastAssistantWithoutToolCalls() {
+        var messages = new ArrayList<Map<String, Object>>();
+        messages.add(Map.of("role", "user", "content", "hi"));
+        messages.add(Map.of("role", "assistant", "content", "old"));
+        AgentRunner.appendFinalMessage(messages, "new");
+        assertThat(messages).hasSize(2);
+        assertThat(messages.get(1).get("content")).isEqualTo("new");
+    }
+
+    @Test
+    void appendFinalMessageSkipsDuplicateContent() {
+        var messages = new ArrayList<Map<String, Object>>();
+        messages.add(Map.of("role", "assistant", "content", "same"));
+        AgentRunner.appendFinalMessage(messages, "same");
+        assertThat(messages).hasSize(1);
+    }
+
+    @Test
+    void appendFinalMessageSkipsNullContent() {
+        var messages = new ArrayList<Map<String, Object>>();
+        AgentRunner.appendFinalMessage(messages, null);
+        AgentRunner.appendFinalMessage(messages, "");
+        assertThat(messages).isEmpty();
+    }
+
+    @Test
+    void appendModelErrorPlaceholderAddsWhenLastIsNotBareAssistant() {
+        var messages = new ArrayList<Map<String, Object>>();
+        messages.add(Map.of("role", "user", "content", "hi"));
+        AgentRunner.appendModelErrorPlaceholder(messages);
+        assertThat(messages).hasSize(2);
+        assertThat(messages.get(1).get("role")).isEqualTo("assistant");
+    }
+
+    @Test
+    void appendModelErrorPlaceholderSkipsWhenAlreadyPlaceholder() {
+        var messages = new ArrayList<Map<String, Object>>();
+        messages.add(Map.of("role", "assistant", "content", "no tool_calls"));
+        AgentRunner.appendModelErrorPlaceholder(messages);
+        assertThat(messages).hasSize(1);
+    }
+
+    @Test
+    void mergeMessageContentConcatenatesStrings() {
+        var result = AgentRunner.mergeMessageContent("hello", "world");
+        assertThat(result).isInstanceOf(String.class);
+        assertThat((String) result).contains("hello").contains("world");
+    }
+
+    @Test
+    void mergeMessageContentConvertsToBlocks() {
+        var result = AgentRunner.mergeMessageContent(
+                List.of(Map.of("type", "text", "text", "a")),
+                List.of(Map.of("type", "text", "text", "b")));
+        assertThat(result).isInstanceOf(List.class);
+        assertThat((List<?>) result).hasSize(2);
+    }
+
     /** Abstract stub that records chat calls. */
     private abstract static class StubProvider extends LLMProvider {
         final List<List<Map<String, Object>>> calls = new ArrayList<>();
