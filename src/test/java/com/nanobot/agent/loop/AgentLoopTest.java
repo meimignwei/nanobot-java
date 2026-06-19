@@ -123,19 +123,16 @@ class AgentLoopTest {
     static class TestMessageBus extends MessageBus {
         OutboundMessage lastPublished;
 
-        TestMessageBus() {
-            super(100, 100, 100);
-        }
-
         void enqueueInbound(InboundMessage msg) {
             try {
-                inbound.put(msg);
+                publishInbound(msg);
             } catch (InterruptedException ignored) {}
         }
 
         @Override
-        public void publish(OutboundMessage msg) {
+        public void publishOutbound(OutboundMessage msg) throws InterruptedException {
             this.lastPublished = msg;
+            super.publishOutbound(msg);
         }
     }
 
