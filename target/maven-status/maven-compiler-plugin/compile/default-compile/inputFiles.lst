@@ -2,6 +2,7 @@
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/tools/ToolLoader.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/ModelOverride.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/OpenAiCompatProvider.java
+/Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/loop/AgentLoop.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/TranscriptionProperties.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/hook/AgentRunHookContext.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/loop/StateTraceEntry.java
@@ -56,6 +57,7 @@
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/ToolsProperties.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/AgentDefaultsProperties.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/context/ContextBuilder.java
+/Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/base/LLMRuntime.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/FallbackProvider.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/session/Session.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/channel/ChannelManager.java

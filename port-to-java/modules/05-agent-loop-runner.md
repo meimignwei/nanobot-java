@@ -635,37 +635,122 @@ src/main/java/com/nanobot/agent/
 
 | 测试类 | 测试数 | 状态 |
 |---|---|---|
-| `CommandRouterTest` | 16 | PASS |
+| `CommandRouterTest` | 26 | PASS |
 | `ConsolidatorTest` | 11 | PASS |
-| `AgentRunnerTest` | 5 | PASS |
-| `AgentLoopTest` | 5 | PASS |
-| 既有 P1/P2/P3 测试 | 272 | PASS (回归无破坏) |
-| **合计** | **309** | **0 失败** |
+| `AgentRunnerTest` | 30 | PASS |
+| `AgentLoopTest` | 29 | PASS |
+| `MemoryStoreTest` | 23 | PASS |
+| `ContextBuilderTest` | 17 | PASS |
+| `SessionManagerTest` | 42 | PASS |
+| 既有 P1/P2/P3 测试 | 190 | PASS (回归无破坏) |
+| **合计** | **368** | **0 失败** |
 
 ### 验证
 
-- [x] `mvn test` 全量 309 测试通过
+- [x] `mvn test` 全量 368 测试通过
 - [x] P1/P2/P3 测试无回归
 - [x] AgentLoop 状态机转换测试通过
-- [x] AgentLoop 消息处理测试通过
-- [x] AgentRunner 完成/迭代上限/错误处理测试通过
-- [x] CommandRouter 三层分发测试通过
+- [x] AgentLoop 消息处理/系统消息/checkpoint/subagent/媒体附件 测试通过
+- [x] AgentRunner 完成/迭代上限/错误处理/安全/usage/injection/snip 测试通过
+- [x] CommandRouter 三层分发 + 全内置命令测试通过
 - [x] Consolidator 压缩/归档测试通过
+
+### Python→Java 对标清单（最新）
+
+| Python (loop.py) | Java (AgentLoop.java) | 状态 |
+|---|---|---|
+| `__init__` 构造器 | 全参构造器 | done |
+| `from_config()` 工厂 | 静态 stub（依赖 NanobotConfig） | stub |
+| `_apply_provider_snapshot()` | `applyProviderSnapshot()` | stub |
+| `_refresh_provider_snapshot()` | `refreshProviderSnapshot()` | stub |
+| `set_model_preset()` / `model_preset` | `setModelPreset()` / `getModelPreset()` | stub |
+| `run()` | `run()` + `dispatch()` | done |
+| `_process_message()` | `processMessage()` | done |
+| `_process_system_message()` | `processSystemMessage()` | done |
+| `_run_agent_loop()` | `runAgentLoop()` | done |
+| TRANSITIONS | TRANSITIONS (LinkedHashMap) | done |
+| TurnContext dataclass | TurnContext class | done |
+| TurnState enum | TurnState enum | done |
+| 8 state handlers | 8 state handlers | done |
+| `_save_turn()` | `saveTurn()` | done |
+| `_sanitize_persisted_blocks()` | `sanitizePersistedBlocks()` | done |
+| `_set_tool_context()` | `setToolContext()` | done |
+| `_replay_token_budget()` | `replayTokenBudget()` | done |
+| `_restore_runtime_checkpoint()` | `restoreRuntimeCheckpointFull()` | done |
+| `_restore_pending_user_turn()` | `restorePendingUserTurn()` | done |
+| `_persist_subagent_followup()` | `persistSubagentFollowup()` | done |
+| `_clear_runtime_checkpoint()` | `clearRuntimeCheckpoint()` | done |
+| `_cancel_active_tasks()` | `cancelActiveTasks()` | done |
+| `_schedule_background()` | `scheduleBackground()` | done |
+| `_register_default_tools()` | `registerDefaultTools()` | stub |
+| `_prepare_message_media()` | `prepareMessageMedia()` | done |
+| `_should_extract_document_text()` | `shouldExtractDocumentText()` | stub |
+| `_checkpoint_message_key()` | `checkpointMessageKey()` | done |
+| `current_iteration` property | `currentIteration()` | done |
+| `tool_names` property | `toolNames()` | done |
+| `llm_runtime()` | `llmRuntime()` | stub |
+| `_runtime_chat_id()` | `runtimeChatId()` | done |
+| `process_direct()` | `processDirect()` | done |
+| `_build_bus_progress_callback()` | `buildBusProgressCallback()` | done |
+| `_build_retry_wait_callback()` | `buildBusRetryWaitCallback()` | done |
+| `_runtime_events()` | `runtimeEvents()` | stub |
+
+| Python (runner.py) | Java (AgentRunner.java) | 状态 |
+|---|---|---|
+| `run()` | `run()` | done |
+| `run_turn()` | `runTurn()` (inline in run) | done |
+| `_request_model()` | `requestModel()` | done |
+| `_execute_tools()` | `executeTools()` | done |
+| `_classify_and_run_tool()` | `runToolWithClassification()` | done |
+| `_normalize_tool_result()` | `normalizeToolResult()` | done |
+| `is_ssrf_violation()` | `isSsrfViolation()` | done |
+| `is_workspace_violation()` | `isWorkspaceViolation()` | done |
+| `ssrf_soft_payload()` | `ssrfSoftPayload()` | done |
+| `try_drain_injections()` | `tryDrainInjections()` | done |
+| Usage tracking (6 functions) | 6 static methods | done |
+| `request_finalization_retry()` | `requestFinalizationRetry()` | done |
+| `try_finalize_on_max_iterations()` | `tryFinalizeOnMaxIterations()` | done |
+| `_partition_tool_batches()` | `partitionToolBatches()` | done |
+| `_drop_orphan_tool_results()` | `dropOrphanToolResults()` | done |
+| `_backfill_missing_tool_results()` | `backfillMissingToolResults()` | done (enhanced) |
+| `_microcompact()` | `microcompact()` | done (enhanced) |
+| `_apply_tool_result_budget()` | `applyToolResultBudget()` | done (fixed) |
+| `_snip_history()` | `snipHistory()` | done (enhanced) |
+| `find_legal_message_start()` | `findLegalMessageStart()` | done |
+| Streaming (`_stream`, `_thinking`, ...) | 待 P5/P6 channel 集成 | pending |
+
+| Python (builtin.py) | Java (BuiltinCommands.java) | 状态 |
+|---|---|---|
+| 13 built-in command handlers | 13 handlers | done |
+| `cmd_stop` → cancel tasks | `cmdStop` → `cancelActiveTasks()` | done |
+| `cmd_new` → clear session | `cmdNew` → `session.clear()` | done |
+| `cmd_status` → runtime info | `cmdStatus` → model/tokens/session info | done |
+| `cmd_model` → switch preset | `cmdModel` → `setModelPreset()` | done |
+| `cmd_history` → read session | `cmdHistory` → `session.messages()` | done |
+| `cmd_dream` → trigger consolidation | `cmdDream` → `scheduleBackground(consolidate)` | done |
+| `cmd_skill` → list tools | `cmdSkill` → `tools().toolNames()` | done |
 
 ### 已知待补项
 
-- AgentRunner 并发工具调用时的 race condition 保护（Python 用 asyncio.gather, Java 用虚拟线程并行）
-- ContextBuilder 图片/文档处理完整路径（basic 测试已覆盖，高级特性待 P5+ 补充）
-- 集成测试需真实 API key（手动验证场景）
-- `microcompact()` 和 `snipHistory()` 的边界条件覆盖（当前 basic 路径已测）
+- `from_config` / provider snapshot — 需要 NanobotConfig 完整 port（P1 级任务）
+- Streaming support (`_stream`, `_thinking`, `_stream_progress`) — 需要 channel 层 WebSocket 集成（P6）
+- `_register_default_tools` — 需要 ToolLoader plugin 机制
+- MCP 连接 (`_connect_mcp`) — 需要 MCP client 库
+- `AutoCompact` / `WorkspaceScopeResolver` — 辅助类尚未独立 port
+- Dream raw_archive — MemoryStore git 版本控制尚未 port
+- `shouldExtractDocumentText` — 需要 channels_config 集成
+- `llmRuntime` — 需要 provider_snapshot 机制
+- `runtimeEvents` — 需要 RuntimeEventBus 完整 port
 
-### Commits
+### Commits（最新）
 
 ```
+95f46fa test: add AgentLoop method tests and expand CommandRouter coverage
+5be1b7b feat: enhance BuiltinCommands with loop integration and add AgentLoop accessors
+e247de2 feat: add processSystemMessage, replayTokenBudget, and stateBuild integration
+1782dd1 feat: add AgentLoop helper methods — tool context, checkpoint, outbound
+1dd06cb feat: enhance AgentLoop dispatch and state machine with runAgentLoop
+f579f02 feat: add security checks, usage tracking, injection draining, and finalization to AgentRunner
+c8b4eb9 docs: add P4 completeness report to module-05 doc
 fa40f73 feat: add AgentLoop state machine with turn processing
-e3d0be5 feat: add AgentRunner core execution loop
-a3f50cd feat: add TurnState, StateTraceEntry, and TurnContext
-bbbb0e3 feat: add AgentRunSpec and AgentRunResult records
-0181fba feat: add Consolidator for LLM-based memory summarization
-fc1ac0e feat: add CommandRouter with three-tier dispatch and 13 built-in commands
 ```

@@ -306,6 +306,94 @@ class AgentRunnerTest {
         assertThat((List<?>) result).hasSize(2);
     }
 
+    // -- findLegalMessageStart --
+
+    @Test
+    void findLegalMessageStartReturnsZeroForValidSequence() {
+        var messages = List.<Map<String, Object>>of(
+                Map.of("role", "assistant", "tool_calls",
+                        List.of(Map.of("id", "call-1", "function", Map.of("name", "grep")))),
+                Map.of("role", "tool", "tool_call_id", "call-1", "content", "result"));
+        assertThat(AgentRunner.findLegalMessageStart(messages)).isEqualTo(0);
+    }
+
+    @Test
+    void findLegalMessageStartSkipsOrphanToolResult() {
+        var messages = List.<Map<String, Object>>of(
+                Map.of("role", "tool", "tool_call_id", "orphan-1", "content", "orphan"),
+                Map.of("role", "assistant", "tool_calls",
+                        List.of(Map.of("id", "call-2", "function", Map.of("name", "grep")))),
+                Map.of("role", "tool", "tool_call_id", "call-2", "content", "result"));
+        assertThat(AgentRunner.findLegalMessageStart(messages)).isEqualTo(1);
+    }
+
+    @Test
+    void findLegalMessageStartHandlesEmptyList() {
+        assertThat(AgentRunner.findLegalMessageStart(List.of())).isEqualTo(0);
+    }
+
+    // -- snipHistory --
+
+    @Test
+    void snipHistoryPreservesSystemMessages() {
+        var provider = new StubProvider() {
+            @Override
+            public LLMResponse chat(List<Map<String, Object>> messages,
+                                    List<Map<String, Object>> tools, String model,
+                                    int maxTokens, double temperature,
+                                    String reasoningEffort, Object toolChoice) {
+                calls.add(messages);
+                return new LLMResponse("ok", List.of(), "stop", Map.of(), null, null, null, null, null, null, null, null, null);
+            }
+        };
+        var runner = new AgentRunner(provider);
+        var tools = new com.nanobot.agent.tools.ToolRegistry();
+        var spec = new com.nanobot.agent.runner.AgentRunSpec(
+                new ArrayList<>(List.of(
+                        Map.<String, Object>of("role", "system", "content", "You are helpful."),
+                        Map.<String, Object>of("role", "user", "content", "hi"))),
+                tools, "test", 5, 16_000,
+                null, null, null, null, null, null,
+                false, false, null, "test",
+                500,  // Small window to force snip
+                null, "standard",
+                null, false, null,
+                null, null, null, null, null, false);
+
+        runner.snipHistory(spec, spec.initialMessages());
+        // System message should be preserved
+        assertThat(spec.initialMessages().stream()
+                .anyMatch(m -> "system".equals(m.get("role")))).isTrue();
+    }
+
+    @Test
+    void snipHistoryNoopForLargeBudget() {
+        var runner = new AgentRunner(new StubProvider() {
+            @Override
+            public LLMResponse chat(List<Map<String, Object>> messages,
+                                    List<Map<String, Object>> tools, String model,
+                                    int maxTokens, double temperature,
+                                    String reasoningEffort, Object toolChoice) {
+                return new LLMResponse("ok", List.of(), "stop", Map.of(), null, null, null, null, null, null, null, null, null);
+            }
+        });
+        var messages = new ArrayList<>(List.<Map<String, Object>>of(
+                Map.of("role", "system", "content", "sys"),
+                Map.of("role", "user", "content", "hi")));
+        var spec = new com.nanobot.agent.runner.AgentRunSpec(
+                messages, new com.nanobot.agent.tools.ToolRegistry(),
+                "test", 5, 128_000,
+                null, null, null, null, null, null,
+                false, false, null, "test",
+                128_000, null, "standard",
+                null, false, null,
+                null, null, null, null, null, false);
+
+        runner.snipHistory(spec, messages);
+        // Should not snip — message list intact
+        assertThat(messages).hasSize(2);
+    }
+
     /** Abstract stub that records chat calls. */
     private abstract static class StubProvider extends LLMProvider {
         final List<List<Map<String, Object>>> calls = new ArrayList<>();

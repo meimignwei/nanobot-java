@@ -512,16 +512,11 @@ public class AgentRunner {
                                                    Map<String, Integer> wsViolationCounts) {
         var hint = "\n\n[Analyze the error above and try a different approach.]";
 
-        // Check repeated external lookup
-        var lookupSig = externalLookupSignature(toolCall.name(), toolCall.arguments());
-        if (lookupSig != null) {
-            int count = extLookupCounts.getOrDefault(lookupSig, 0) + 1;
-            extLookupCounts.put(lookupSig, count);
-            if (count > MAX_REPEAT_EXTERNAL_LOOKUPS) {
-                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
-                        "name", toolCall.name(),
-                        "content", "Repeated external lookup blocked for " + lookupSig + hint);
-            }
+        // Check repeated external lookup (Python _run_tool lines 1036-1049)
+        var lookupErr = repeatedExternalLookupError(toolCall.name(), toolCall.arguments(), extLookupCounts);
+        if (lookupErr != null) {
+            return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                    "name", toolCall.name(), "content", lookupErr + hint);
         }
 
         // Get tool and params
@@ -533,7 +528,7 @@ public class AgentRunner {
             params = Map.of();
         }
 
-        // Execute
+        // Execute (Python _run_tool lines 1099-1103)
         String rawText;
         try {
             var toolResult = tool != null
@@ -544,39 +539,22 @@ public class AgentRunner {
             rawText = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
         }
 
-        // Check for violations in output
+        // Classify violations (Python _run_tool lines 1135-1160, using _classify_violation)
         if (rawText.startsWith("Error") || isSsrfViolation(rawText) || isWorkspaceViolation(rawText)) {
-            var event = Map.of("name", toolCall.name(), "status", "error",
-                    "detail", rawText.replace("\n", " ").trim().substring(
-                            0, Math.min(120, rawText.replace("\n", " ").trim().length())));
+            var event = new LinkedHashMap<String, Object>();
+            event.put("name", toolCall.name());
+            event.put("status", "error");
+            event.put("detail", rawText.replace("\n", " ").trim().substring(
+                    0, Math.min(120, rawText.replace("\n", " ").trim().length())));
 
-            // Check SSRF
-            if (isSsrfViolation(rawText)) {
-                log.warn("Tool {} blocked by SSRF guard: {}", toolCall.name(),
-                        rawText.replace("\n", " ").trim().substring(0, Math.min(200, rawText.replace("\n", " ").trim().length())));
-                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
-                        "name", toolCall.name(), "content", ssrfSoftPayload(rawText));
+            var classified = classifyViolation(rawText,
+                    isSsrfViolation(rawText) ? ssrfSoftPayload(rawText) : rawText + hint,
+                    event, toolCall, wsViolationCounts);
+            if (classified != null) {
+                return classified;
             }
 
-            // Check workspace violation
-            if (isWorkspaceViolation(rawText)) {
-                var wsSig = workspaceViolationSignature(toolCall.name(), params);
-                if (wsSig != null) {
-                    int wsCount = wsViolationCounts.getOrDefault(wsSig, 0) + 1;
-                    wsViolationCounts.put(wsSig, wsCount);
-                    if (wsCount > MAX_REPEAT_WORKSPACE_VIOLATIONS) {
-                        log.warn("Tool {} hit workspace boundary repeatedly; escalating hint", toolCall.name());
-                        return Map.of("role", "tool", "tool_call_id", toolCall.id(),
-                                "name", toolCall.name(),
-                                "content", "Repeated workspace boundary violation for "
-                                        + toolCall.name() + ". Stop retrying with different paths. "
-                                        + "Stay within the configured workspace directory." + hint);
-                    }
-                }
-                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
-                        "name", toolCall.name(), "content", rawText + hint);
-            }
-
+            // Unclassified error → return with hint
             return Map.of("role", "tool", "tool_call_id", toolCall.id(),
                     "name", toolCall.name(), "content", rawText + hint);
         }
@@ -585,6 +563,84 @@ public class AgentRunner {
         var normalized = normalizeToolResult(spec, toolCall.id(), toolCall.name(), rawText);
         return Map.of("role", "tool", "tool_call_id", toolCall.id(),
                 "name", toolCall.name(), "content", normalized);
+    }
+
+    // -- classifyViolation (Python _classify_violation, runner.py:1222-1260) --
+
+    @SuppressWarnings("unchecked")
+    @Nullable
+    Map<String, Object> classifyViolation(
+            String rawText,
+            String softPayload,
+            Map<String, Object> event,
+            ToolCallRequest toolCall,
+            Map<String, Integer> wsViolationCounts) {
+
+        // SSRF is a hard security block (Python lines 1232-1239)
+        if (isSsrfViolation(rawText)) {
+            log.warn("Tool {} blocked by SSRF guard: {}", toolCall.name(),
+                    rawText.replace("\n", " ").trim().substring(
+                            0, Math.min(200, rawText.replace("\n", " ").trim().length())));
+            event.put("detail", eventDetail("ssrf_violation: ", rawText, 160));
+            return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                    "name", toolCall.name(), "content", ssrfSoftPayload(rawText));
+        }
+
+        // Workspace violation — may escalate on repeated attempts (Python lines 1241-1258)
+        if (isWorkspaceViolation(rawText)) {
+            var escalation = repeatedWorkspaceViolationError(
+                    toolCall.name(), toolCall.arguments(), wsViolationCounts);
+            event.put("detail", eventDetail("workspace_violation: ", rawText, 160));
+            if (escalation != null) {
+                log.warn("Tool {} hit workspace boundary repeatedly; escalating hint", toolCall.name());
+                event.put("detail", eventDetail("workspace_violation_escalated: ", rawText, 160));
+                return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                        "name", toolCall.name(), "content", escalation);
+            }
+            return Map.of("role", "tool", "tool_call_id", toolCall.id(),
+                    "name", toolCall.name(), "content", softPayload);
+        }
+
+        return null; // pass through
+    }
+
+    // -- repeatedExternalLookupError (Python repeated_external_lookup_error) --
+
+    @SuppressWarnings("unchecked")
+    @Nullable
+    static String repeatedExternalLookupError(String toolName, Object arguments,
+                                               Map<String, Integer> extLookupCounts) {
+        var sig = externalLookupSignature(toolName, arguments);
+        if (sig == null) return null;
+        int count = extLookupCounts.getOrDefault(sig, 0) + 1;
+        extLookupCounts.put(sig, count);
+        if (count > MAX_REPEAT_EXTERNAL_LOOKUPS) {
+            return "Repeated external lookup blocked for " + sig;
+        }
+        return null;
+    }
+
+    // -- repeatedWorkspaceViolationError (Python repeated_workspace_violation_error) --
+
+    @SuppressWarnings("unchecked")
+    @Nullable
+    static String repeatedWorkspaceViolationError(String toolName, Object arguments,
+                                                   Map<String, Integer> wsViolationCounts) {
+        var sig = workspaceViolationSignature(toolName,
+                arguments instanceof Map<?, ?> m ? (Map<String, Object>) m : null);
+        if (sig == null) return null;
+        int count = wsViolationCounts.getOrDefault(sig, 0) + 1;
+        wsViolationCounts.put(sig, count);
+        if (count <= MAX_REPEAT_WORKSPACE_VIOLATIONS) return null;
+        log.warn("Escalating repeated workspace bypass attempt {} (attempt {})",
+                sig.length() > 160 ? sig.substring(0, 160) : sig, count);
+        var target = sig.contains(":") ? sig.substring(sig.indexOf(":") + 1) : sig;
+        return "Error: refusing repeated workspace-bypass attempts.\n"
+                + "You have tried to access '" + target + "' (or an equivalent path) "
+                + count + " times in this turn. This is a hard policy boundary -- "
+                + "switching tools, shell tricks, working_dir overrides, symlinks, "
+                + "or base64 piping will NOT change the answer. Stop retrying. "
+                + "Stay within the configured workspace directory.";
     }
 
     // -- normalizeToolResult --
@@ -693,84 +749,213 @@ public class AgentRunner {
 
     @SuppressWarnings("unchecked")
     public static void backfillMissingToolResults(List<Map<String, Object>> messages) {
-        var declared = new LinkedHashMap<String, Integer>();
-        for (var msg : messages) {
-            if ("assistant".equals(msg.get("role"))) {
-                var toolCalls = msg.get("tool_calls");
-                if (toolCalls instanceof List<?> tcList) {
+        record Declared(int assistantIdx, String callId, String name) {}
+        var declared = new ArrayList<Declared>();
+        var fulfilled = new java.util.HashSet<String>();
+
+        for (int idx = 0; idx < messages.size(); idx++) {
+            var msg = messages.get(idx);
+            var role = msg.get("role");
+            if ("assistant".equals(role)) {
+                var tcs = msg.get("tool_calls");
+                if (tcs instanceof List<?> tcList) {
                     for (var tc : tcList) {
                         if (tc instanceof Map<?, ?> tcm) {
                             var id = tcm.get("id");
-                            if (id != null) declared.put(String.valueOf(id), 0);
+                            if (id != null) {
+                                var func = tcm.get("function");
+                                var name = "";
+                                if (func instanceof Map<?, ?> fm) {
+                                    var n = fm.get("name");
+                                    name = n != null ? String.valueOf(n) : "";
+                                }
+                                declared.add(new Declared(idx, String.valueOf(id), name));
+                            }
                         }
                     }
                 }
-            }
-        }
-        var hasResult = new java.util.HashSet<String>();
-        for (var msg : messages) {
-            if ("tool".equals(msg.get("role"))) {
+            } else if ("tool".equals(role)) {
                 var tid = msg.get("tool_call_id");
-                if (tid != null) hasResult.add(String.valueOf(tid));
+                if (tid != null) fulfilled.add(String.valueOf(tid));
             }
         }
-        for (var id : declared.keySet()) {
-            if (!hasResult.contains(id)) {
-                var backfill = new LinkedHashMap<String, Object>();
-                backfill.put("role", "tool");
-                backfill.put("tool_call_id", id);
-                backfill.put("content", BACKFILL_CONTENT);
-                messages.add(backfill);
+
+        // Insert synthetic results in reverse order (earliest first) after
+        // their assistant message, skipping past any existing tool results.
+        int offset = 0;
+        for (var d : declared) {
+            if (fulfilled.contains(d.callId)) continue;
+            int insertAt = d.assistantIdx + 1 + offset;
+            while (insertAt < messages.size()
+                    && "tool".equals(messages.get(insertAt).get("role"))) {
+                insertAt++;
             }
+            var synthetic = new LinkedHashMap<String, Object>();
+            synthetic.put("role", "tool");
+            synthetic.put("tool_call_id", d.callId);
+            synthetic.put("name", d.name);
+            synthetic.put("content", BACKFILL_CONTENT);
+            messages.add(insertAt, synthetic);
+            offset++;
         }
     }
 
-    public static void microcompact(List<Map<String, Object>> messages) {
-        int compactTarget = messages.size() - MICROCOMPACT_KEEP_RECENT;
-        if (compactTarget <= 0) return;
+    static final java.util.Set<String> COMPACTABLE_TOOLS = java.util.Set.of(
+            "read_file", "exec", "grep", "find_files",
+            "web_search", "web_fetch", "list_dir", "list_exec_sessions");
 
-        int idx = 0;
-        var iter = messages.listIterator();
-        while (iter.hasNext() && idx < compactTarget) {
-            var msg = iter.next();
-            if ("tool".equals(msg.get("role"))) {
-                iter.remove();
+    public static void microcompact(List<Map<String, Object>> messages) {
+        // Collect indices of compactable tool results
+        var compactableIndices = new ArrayList<Integer>();
+        for (int i = 0; i < messages.size(); i++) {
+            var msg = messages.get(i);
+            if ("tool".equals(msg.get("role"))
+                    && COMPACTABLE_TOOLS.contains(msg.get("name"))) {
+                compactableIndices.add(i);
             }
-            idx++;
         }
-        int legalStart = com.nanobot.agent.session.Session.findLegalMessageStart(messages);
-        if (legalStart > 0) {
-            messages.subList(0, legalStart).clear();
+        if (compactableIndices.size() <= MICROCOMPACT_KEEP_RECENT) return;
+
+        // Keep the most recent, compact the stale ones
+        int staleCount = compactableIndices.size() - MICROCOMPACT_KEEP_RECENT;
+        for (int i = 0; i < staleCount; i++) {
+            int idx = compactableIndices.get(i);
+            var msg = messages.get(idx);
+            var content = msg.get("content");
+            if (content instanceof String s && s.length() >= MICROCOMPACT_MIN_CHARS) {
+                var name = String.valueOf(msg.getOrDefault("name", "tool"));
+                msg.put("content", "[" + name + " result omitted from context]");
+            }
         }
     }
 
     @SuppressWarnings("unchecked")
-    public static void applyToolResultBudget(AgentRunSpec spec, List<Map<String, Object>> messages) {
-        int limit = spec.maxToolResultChars();
-        if (limit <= 0) return;
-        for (var msg : messages) {
+    public void applyToolResultBudget(AgentRunSpec spec, List<Map<String, Object>> messages) {
+        for (int idx = 0; idx < messages.size(); idx++) {
+            var msg = messages.get(idx);
             if (!"tool".equals(msg.get("role"))) continue;
+            var toolCallId = String.valueOf(msg.getOrDefault("tool_call_id", "tool_" + idx));
+            var toolName = String.valueOf(msg.getOrDefault("name", "tool"));
             var content = msg.get("content");
-            if (content instanceof String s && s.length() > limit) {
-                msg.put("content", s.substring(0, limit) + "\n... (truncated)");
+            // normalizeToolResult applies maxToolResultChars and offload logic
+            var normalized = normalizeToolResult(spec, toolCallId, toolName, content);
+            if (!normalized.equals(content)) {
+                msg.put("content", normalized);
             }
         }
     }
 
-    public static void snipHistory(AgentRunSpec spec, List<Map<String, Object>> messages) {
-        if (spec.contextWindowTokens() == null || spec.contextWindowTokens() <= 0) return;
-        int budget = spec.contextWindowTokens() - SNIP_SAFETY_BUFFER;
+    @SuppressWarnings("unchecked")
+    public void snipHistory(AgentRunSpec spec, List<Map<String, Object>> messages) {
+        if (messages.isEmpty() || spec.contextWindowTokens() == null || spec.contextWindowTokens() <= 0) return;
+
+        int maxOutput = spec.maxTokens() != null ? spec.maxTokens() : 4096;
+        int budget = spec.contextBlockLimit() != null ? spec.contextBlockLimit()
+                : spec.contextWindowTokens() - maxOutput - SNIP_SAFETY_BUFFER;
         if (budget <= 0) return;
+
+        int estimate = estimatePromptTokens(messages, spec.tools().getDefinitions());
+        if (estimate <= budget) return;
+
+        // Separate system messages (always preserved)
+        var systemMessages = new ArrayList<Map<String, Object>>();
+        var nonSystem = new ArrayList<Map<String, Object>>();
+        for (var msg : messages) {
+            if ("system".equals(msg.get("role"))) {
+                systemMessages.add(msg);
+            } else {
+                nonSystem.add(msg);
+            }
+        }
+        if (nonSystem.isEmpty()) return;
+
+        int systemTokens = 0;
+        for (var sm : systemMessages) {
+            systemTokens += com.nanobot.agent.session.Session.estimateMessageTokens(sm);
+        }
+        int remainingBudget = Math.max(0, budget - systemTokens);
+
+        // Collect from tail within budget
+        var kept = new ArrayList<Map<String, Object>>();
+        int keptTokens = 0;
+        for (int i = nonSystem.size() - 1; i >= 0; i--) {
+            var msg = nonSystem.get(i);
+            int msgTokens = com.nanobot.agent.session.Session.estimateMessageTokens(msg);
+            if (!kept.isEmpty() && keptTokens + msgTokens > remainingBudget) break;
+            kept.add(msg);
+            keptTokens += msgTokens;
+        }
+        java.util.Collections.reverse(kept);
+
+        // Align to user turn
+        if (!kept.isEmpty()) {
+            boolean foundUser = false;
+            for (int i = 0; i < kept.size(); i++) {
+                if ("user".equals(kept.get(i).get("role"))) {
+                    kept = new ArrayList<>(kept.subList(i, kept.size()));
+                    foundUser = true;
+                    break;
+                }
+            }
+            if (!foundUser) {
+                // Recover nearest user from outside window
+                for (int i = nonSystem.size() - 1; i >= 0; i--) {
+                    if ("user".equals(nonSystem.get(i).get("role"))) {
+                        kept = new ArrayList<>(nonSystem.subList(i, nonSystem.size()));
+                        break;
+                    }
+                }
+            }
+            // Find legal message start (tool results with matching calls)
+            int start = findLegalMessageStart(kept);
+            if (start > 0) kept = new ArrayList<>(kept.subList(start, kept.size()));
+        }
+        if (kept.isEmpty()) {
+            kept = new ArrayList<>(nonSystem.subList(
+                    Math.max(0, nonSystem.size() - 4), nonSystem.size()));
+            int start = findLegalMessageStart(kept);
+            if (start > 0) kept = new ArrayList<>(kept.subList(start, kept.size()));
+        }
+
+        messages.clear();
+        messages.addAll(systemMessages);
+        messages.addAll(kept);
+    }
+
+    @SuppressWarnings("unchecked")
+    static int findLegalMessageStart(List<Map<String, Object>> messages) {
+        var declared = new java.util.HashSet<String>();
+        int start = 0;
+        for (int i = 0; i < messages.size(); i++) {
+            var msg = messages.get(i);
+            var role = msg.get("role");
+            if ("assistant".equals(role)) {
+                var tcs = msg.get("tool_calls");
+                if (tcs instanceof List<?> tcList) {
+                    for (var tc : tcList) {
+                        if (tc instanceof Map<?, ?> tcm) {
+                            var id = tcm.get("id");
+                            if (id != null) declared.add(String.valueOf(id));
+                        }
+                    }
+                }
+            } else if ("tool".equals(role)) {
+                var tid = msg.get("tool_call_id");
+                if (tid != null && !declared.contains(String.valueOf(tid))) {
+                    start = i + 1;
+                    declared.clear();
+                }
+            }
+        }
+        return start;
+    }
+
+    int estimatePromptTokens(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         int total = 0;
         for (var msg : messages) {
             total += com.nanobot.agent.session.Session.estimateMessageTokens(msg);
         }
-        if (total <= budget) return;
-
-        while (messages.size() > 2 && total > budget) {
-            var removed = messages.remove(0);
-            total -= com.nanobot.agent.session.Session.estimateMessageTokens(removed);
-        }
+        return total;
     }
 
     // -- helpers --

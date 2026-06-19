@@ -14,10 +14,12 @@ com/nanobot/agent/runner/AgentRunnerTest.class
 com/nanobot/providers/base/MessageSanitizerTest.class
 com/nanobot/agent/runner/AgentRunnerTest$3.class
 com/nanobot/providers/BedrockProviderTest$ContentBlocks.class
+com/nanobot/agent/loop/AgentLoopTest$TestMessageBus.class
 com/nanobot/agent/context/ConsolidatorTest$2.class
 com/nanobot/providers/AnthropicProviderTest$ConvertTools.class
 com/nanobot/agent/tools/ToolRegistryTest$TestTool.class
 com/nanobot/providers/BedrockProviderTest.class
+com/nanobot/agent/loop/AgentLoopTest$1.class
 com/nanobot/providers/base/ErrorClassificationTest$IsTransientResponse.class
 com/nanobot/providers/base/ErrorClassificationTest$NormalizeErrorToken.class
 com/nanobot/agent/tools/SchemaValidatorTest$StringConstraints.class
@@ -49,6 +51,8 @@ com/nanobot/agent/command/CommandRouterTest.class
 com/nanobot/providers/base/LLMResponseTest$ParseToolArguments.class
 com/nanobot/providers/base/LLMResponseTest$ToOpenAiToolCall.class
 com/nanobot/agent/tools/FileReadToolTest.class
+com/nanobot/agent/runner/AgentRunnerTest$5.class
+com/nanobot/agent/loop/AgentLoopTest.class
 com/nanobot/bus/MessageBusTest$OutboundMessageTests.class
 com/nanobot/agent/context/ConsolidatorTest.class
 com/nanobot/agent/tools/FileWriteToolTest.class
@@ -59,6 +63,8 @@ com/nanobot/agent/tools/SchemaValidatorTest$NumericConstraints.class
 com/nanobot/agent/tools/ToolRegistryTest$ExecuteTests$1.class
 com/nanobot/providers/AnthropicProviderTest$ConvertToolChoice.class
 com/nanobot/agent/tools/SchemaValidatorTest.class
+com/nanobot/agent/runner/AgentRunnerTest$4.class
+com/nanobot/agent/loop/AgentLoopTest$StubProvider.class
 com/nanobot/bus/MessageBusTest.class
 com/nanobot/providers/base/MessageSanitizerTest$SanitizeEmptyContent.class
 com/nanobot/providers/AnthropicProviderTest$ConvertImageBlock.class

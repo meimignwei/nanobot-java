@@ -236,6 +236,163 @@ class AgentLoopTest {
         assertThat(result.content()).isNotNull();
     }
 
+    // -- checkpointMessageKey --
+
+    @Test
+    void checkpointMessageKeyReturnsExpectedFields() {
+        var msg = Map.<String, Object>of(
+                "role", "assistant",
+                "content", "Hello",
+                "tool_call_id", "call-1",
+                "name", "read_file",
+                "tool_calls", List.of(),
+                "reasoning_content", "thinking...",
+                "thinking_blocks", List.of());
+        var key = AgentLoop.checkpointMessageKey(msg);
+        assertThat(key).hasSize(7);
+        assertThat(key.get(0)).isEqualTo("assistant");
+        assertThat(key.get(1)).isEqualTo("Hello");
+        assertThat(key.get(2)).isEqualTo("call-1");
+        assertThat(key.get(3)).isEqualTo("read_file");
+    }
+
+    @Test
+    void checkpointMessageKeyHandlesNullValues() {
+        var msg = Map.<String, Object>of("role", "user");
+        var key = AgentLoop.checkpointMessageKey(msg);
+        assertThat(key).hasSize(7);
+        assertThat(key.get(0)).isEqualTo("user");
+        assertThat(key.get(1)).isNull();
+    }
+
+    @Test
+    void checkpointMessageKeysEqualForEqualMessages() {
+        var msg1 = Map.<String, Object>of("role", "tool", "content", "result",
+                "tool_call_id", "id-1", "name", "grep");
+        var msg2 = Map.<String, Object>of("role", "tool", "content", "result",
+                "tool_call_id", "id-1", "name", "grep");
+        assertThat(AgentLoop.checkpointMessageKey(msg1))
+                .isEqualTo(AgentLoop.checkpointMessageKey(msg2));
+    }
+
+    // -- referenceNonImageAttachments --
+
+    @Test
+    void referenceNonImageAttachmentsAppendsNonImageRefs() {
+        var result = AgentLoop.referenceNonImageAttachments("hello",
+                List.of("file.pdf", "photo.png", "data.csv"));
+        assertThat(result).contains("[Attachment: file.pdf]");
+        assertThat(result).contains("[Attachment: data.csv]");
+        assertThat(result).doesNotContain("[Attachment: photo.png]");
+    }
+
+    @Test
+    void referenceNonImageAttachmentsHandlesEmptyMedia() {
+        var result = AgentLoop.referenceNonImageAttachments("hello", List.of());
+        assertThat(result).isEqualTo("hello");
+    }
+
+    @Test
+    void referenceNonImageAttachmentsHandlesNullMedia() {
+        var result = AgentLoop.referenceNonImageAttachments("hello", null);
+        assertThat(result).isEqualTo("hello");
+    }
+
+    @Test
+    void referenceNonImageAttachmentsOnlyImagesReturnsOriginal() {
+        var result = AgentLoop.referenceNonImageAttachments("test",
+                List.of("a.png", "b.jpg", "c.webp"));
+        assertThat(result).isEqualTo("test");
+    }
+
+    // -- isImageFile --
+
+    @Test
+    void isImageFileRecognizesCommonFormats() {
+        assertThat(AgentLoop.isImageFile("photo.png")).isTrue();
+        assertThat(AgentLoop.isImageFile("photo.jpg")).isTrue();
+        assertThat(AgentLoop.isImageFile("photo.jpeg")).isTrue();
+        assertThat(AgentLoop.isImageFile("photo.gif")).isTrue();
+        assertThat(AgentLoop.isImageFile("photo.webp")).isTrue();
+        assertThat(AgentLoop.isImageFile("photo.svg")).isTrue();
+    }
+
+    @Test
+    void isImageFileRejectsNonImageFiles() {
+        assertThat(AgentLoop.isImageFile("doc.pdf")).isFalse();
+        assertThat(AgentLoop.isImageFile("data.csv")).isFalse();
+        assertThat(AgentLoop.isImageFile("script.py")).isFalse();
+    }
+
+    // -- runtimeChatId --
+
+    @Test
+    void runtimeChatIdUsesContextChatIdWhenPresent() {
+        var msg = new InboundMessage("slack", "user-1", "chat-1", "hi",
+                null, List.of(), Map.of("context_chat_id", "thread-42"), null);
+        assertThat(AgentLoop.runtimeChatId(msg)).isEqualTo("thread-42");
+    }
+
+    @Test
+    void runtimeChatIdFallsBackToChatId() {
+        var msg = new InboundMessage("discord", "user-1", "chat-99", "hi",
+                null, List.of(), null, null);
+        assertThat(AgentLoop.runtimeChatId(msg)).isEqualTo("chat-99");
+    }
+
+    // -- restoreRuntimeCheckpointFull --
+
+    @Test
+    void restoreRuntimeCheckpointFullMaterializesPendingToolCalls() {
+        var session = sessions.getOrCreate("test:chat");
+        session.metadata().put("runtime_checkpoint", Map.of(
+                "assistant_message", Map.of("role", "assistant", "content", "Let me check"),
+                "completed_tool_results", List.of(),
+                "pending_tool_calls", List.of(Map.of(
+                        "id", "call-1",
+                        "function", Map.of("name", "grep")))));
+
+        loop.restoreRuntimeCheckpointFull(session);
+
+        var msgs = session.messages();
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(0).get("content")).isEqualTo("Let me check");
+        assertThat(msgs.get(1).get("role")).isEqualTo("tool");
+        assertThat(msgs.get(1).get("content")).isEqualTo(
+                "Error: Task interrupted before this tool finished.");
+    }
+
+    @Test
+    void restoreRuntimeCheckpointFullNoopForMissingCheckpoint() {
+        var session = sessions.getOrCreate("test:chat");
+        assertThat(loop.restoreRuntimeCheckpointFull(session)).isFalse();
+    }
+
+    @Test
+    void restoreRuntimeCheckpointFullDetectsOverlap() {
+        var session = sessions.getOrCreate("test:chat");
+        // Pre-populate with one message that matches the checkpoint
+        session.addMessage("assistant", "Let me check",
+                Map.of("tool_calls", List.of(Map.of("id", "call-1",
+                        "function", Map.of("name", "grep")))));
+
+        session.metadata().put("runtime_checkpoint", Map.of(
+                "assistant_message", Map.of("role", "assistant", "content", "Let me check",
+                        "tool_calls", List.of(Map.of("id", "call-1",
+                                "function", Map.of("name", "grep")))),
+                "completed_tool_results", List.of(),
+                "pending_tool_calls", List.of(Map.of(
+                        "id", "call-1",
+                        "function", Map.of("name", "grep")))));
+
+        loop.restoreRuntimeCheckpointFull(session);
+
+        // Only the pending tool call should be added (assistant message overlaps)
+        var msgs = session.messages();
+        assertThat(msgs).hasSize(2);
+        assertThat(msgs.get(1).get("role")).isEqualTo("tool");
+    }
+
     // -- helpers --
 
     static class TestMessageBus extends MessageBus {

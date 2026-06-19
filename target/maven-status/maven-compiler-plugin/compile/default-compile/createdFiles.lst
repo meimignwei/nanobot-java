@@ -1,3 +1,4 @@
+com/nanobot/providers/base/LLMRuntime.class
 com/nanobot/providers/OpenAiCompatProvider$2.class
 com/nanobot/agent/tools/ToolRegistry$PreparedCall.class
 com/nanobot/config/NanobotProperties.class
@@ -12,6 +13,7 @@ com/nanobot/config/PathUtils.class
 com/nanobot/agent/hook/AgentHook.class
 com/nanobot/config/ConfigValidator.class
 com/nanobot/agent/loop/StateTraceEntry.class
+com/nanobot/agent/loop/AgentLoop$RunLoopResult.class
 com/nanobot/providers/AzureOpenAiProvider$1.class
 com/nanobot/providers/BedrockProvider$3.class
 com/nanobot/providers/ProviderSpec$Builder.class
@@ -25,6 +27,7 @@ com/nanobot/providers/openai_responses/OpenAiResponsesHelper$1.class
 com/nanobot/providers/GitHubCopilotProvider$2.class
 com/nanobot/providers/AnthropicProvider$2.class
 com/nanobot/agent/session/SessionManager.class
+com/nanobot/agent/loop/AgentLoop.class
 com/nanobot/providers/EnvExtra.class
 com/nanobot/agent/tools/Schema$ObjectSchema.class
 com/nanobot/providers/GitHubCopilotProvider$1.class
@@ -65,6 +68,7 @@ com/nanobot/agent/channel/ChannelManager.class
 com/nanobot/agent/tools/ToolContext$Builder.class
 com/nanobot/agent/channel/Channel.class
 com/nanobot/agent/command/CommandContext.class
+com/nanobot/agent/loop/AgentLoop$1.class
 com/nanobot/agent/tools/ToolRegistry.class
 com/nanobot/bus/BusConstants.class
 com/nanobot/providers/OpenAiCompatProvider$3.class
@@ -89,6 +93,7 @@ com/nanobot/providers/OpenAICodexProvider.class
 com/nanobot/config/ConfigLoader$2.class
 com/nanobot/config/GenerationSettings.class
 com/nanobot/agent/tools/ToolContext.class
+com/nanobot/agent/runner/AgentRunner$1Declared.class
 com/nanobot/agent/tools/Schema$BooleanSchema.class
 com/nanobot/agent/command/BuiltinCommands.class
 com/nanobot/agent/tools/ToolResult.class

@@ -234,6 +234,19 @@ public class AgentLoop implements Runnable {
         }
     }
 
+    // -- dispatchCommandInline (Python _dispatch_command_inline, loop.py:619-632) --
+
+    void dispatchCommandInline(InboundMessage msg, String key, String raw,
+                               java.util.function.Function<CommandContext, OutboundMessage> dispatchFn) {
+        var ctx = new CommandContext(msg, null, key, raw, "", this);
+        var result = dispatchFn.apply(ctx);
+        if (result != null) {
+            try { bus.publishOutbound(result); } catch (InterruptedException ignored) {}
+        } else {
+            log.warn("Command '{}' matched but dispatch returned null", raw);
+        }
+    }
+
     // -- processMessage --
 
     public OutboundMessage processMessage(InboundMessage msg) {
@@ -748,7 +761,7 @@ public class AgentLoop implements Runnable {
         var key = msg.sessionKeyOverride() != null ? msg.sessionKeyOverride() : channel + ":" + chatId;
         var session = sessions.getOrCreate(key);
 
-        if (restoreRuntimeCheckpoint(session)) sessions.save(session);
+        if (restoreRuntimeCheckpointFull(session)) sessions.save(session);
         if (restorePendingUserTurn(session)) sessions.save(session);
 
         try {
@@ -886,5 +899,230 @@ public class AgentLoop implements Runnable {
         }
         tasks.clear();
         return count;
+    }
+
+    // ================================================================
+    // Runtime introspection methods (Python AgentLoop properties/helpers)
+    // ================================================================
+
+    private volatile int currentIteration;
+
+    public int currentIteration() { return currentIteration; }
+    public void setCurrentIteration(int iteration) { this.currentIteration = iteration; }
+
+    public Set<String> toolNames() { return tools.toolNames(); }
+
+    public com.nanobot.providers.base.LLMRuntime llmRuntime() {
+        refreshProviderSnapshot();
+        return new com.nanobot.providers.base.LLMRuntime(runner.getProvider(), model);
+    }
+
+    static String runtimeChatId(InboundMessage msg) {
+        return String.valueOf(
+                msg.metadata() != null && msg.metadata().get("context_chat_id") != null
+                        ? msg.metadata().get("context_chat_id") : msg.chatId());
+    }
+
+    // -- prepareMessageMedia (Python _prepare_message_media) --
+
+    String prepareMessageMedia(String content, List<String> media) {
+        if (shouldExtractDocumentText()) {
+            return content; // Document extraction stub — requires PDF/DOCX parsing
+        }
+        return referenceNonImageAttachments(content, media);
+    }
+
+    boolean shouldExtractDocumentText() {
+        return true; // Default: extract. Full impl checks channels_config.extract_document_text
+    }
+
+    static String referenceNonImageAttachments(String content, List<String> media) {
+        if (media == null || media.isEmpty()) return content;
+        var imagePaths = new ArrayList<String>();
+        var attachmentRefs = new ArrayList<String>();
+        for (var path : media) {
+            if (isImageFile(path)) {
+                imagePaths.add(path);
+            } else {
+                attachmentRefs.add("[Attachment: " + path + "]");
+            }
+        }
+        if (attachmentRefs.isEmpty()) return content;
+        var suffix = String.join("\n", attachmentRefs);
+        return (content != null && !content.isEmpty()) ? content + "\n\n" + suffix : suffix;
+    }
+
+    static boolean isImageFile(String path) {
+        var lower = path.toLowerCase();
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp")
+                || lower.endsWith(".svg") || lower.endsWith(".ico");
+    }
+
+    // -- checkpointMessageKey (Python _checkpoint_message_key) --
+
+    static List<Object> checkpointMessageKey(Map<String, Object> message) {
+        return java.util.Arrays.asList(
+                message.get("role"),
+                message.get("content"),
+                message.get("tool_call_id"),
+                message.get("name"),
+                message.get("tool_calls"),
+                message.get("reasoning_content"),
+                message.get("thinking_blocks"));
+    }
+
+    // -- restoreRuntimeCheckpoint (enhanced to full Python behavior) --
+
+    @SuppressWarnings("unchecked")
+    boolean restoreRuntimeCheckpointFull(Session session) {
+        var checkpoint = session.metadata().get("runtime_checkpoint");
+        if (!(checkpoint instanceof Map<?, ?> cp)) return false;
+
+        var assistantMessage = cp.get("assistant_message");
+        var completedToolResults = cp.get("completed_tool_results");
+        var pendingToolCalls = cp.get("pending_tool_calls");
+
+        var restoredMessages = new ArrayList<Map<String, Object>>();
+        var now = java.time.Instant.now().toString();
+
+        if (assistantMessage instanceof Map<?, ?> am) {
+            var restored = new LinkedHashMap<>((Map<String, Object>) am);
+            restored.putIfAbsent("timestamp", now);
+            restoredMessages.add(restored);
+        }
+        if (completedToolResults instanceof List<?> ctr) {
+            for (var item : ctr) {
+                if (item instanceof Map<?, ?> m) {
+                    var restored = new LinkedHashMap<>((Map<String, Object>) m);
+                    restored.putIfAbsent("timestamp", now);
+                    restoredMessages.add(restored);
+                }
+            }
+        }
+        if (pendingToolCalls instanceof List<?> ptc) {
+            for (var item : ptc) {
+                if (!(item instanceof Map<?, ?> tc)) continue;
+                var id = tc.get("id");
+                var func = tc.get("function");
+                var name = "";
+                if (func instanceof Map<?, ?> fm) {
+                    var n = fm.get("name");
+                    name = n != null ? String.valueOf(n) : "tool";
+                }
+                restoredMessages.add(Map.of(
+                        "role", "tool",
+                        "tool_call_id", id != null ? id : "",
+                        "name", name,
+                        "content", "Error: Task interrupted before this tool finished.",
+                        "timestamp", now));
+            }
+        }
+
+        // Detect overlap with existing session messages
+        int overlap = 0;
+        int maxOverlap = Math.min(session.messages().size(), restoredMessages.size());
+        for (int size = maxOverlap; size > 0; size--) {
+            var existing = session.messages().subList(
+                    session.messages().size() - size, session.messages().size());
+            var restored = restoredMessages.subList(0, size);
+            boolean match = true;
+            for (int i = 0; i < size; i++) {
+                if (!checkpointMessageKey(existing.get(i)).equals(
+                        checkpointMessageKey(restored.get(i)))) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                overlap = size;
+                break;
+            }
+        }
+        session.messages().addAll(restoredMessages.subList(overlap, restoredMessages.size()));
+
+        clearPendingUserTurn(session);
+        clearRuntimeCheckpoint(session);
+        return true;
+    }
+
+    // -- processDirect (Python process_direct) --
+
+    public OutboundMessage processDirect(
+            String content,
+            String sessionKey,
+            String channel,
+            String chatId,
+            @Nullable List<String> media,
+            @Nullable Consumer<String> onProgress,
+            @Nullable Consumer<String> onStream,
+            @Nullable Runnable onStreamEnd,
+            boolean ephemeral,
+            @Nullable ToolRegistry overrideTools) {
+
+        var msg = new InboundMessage(channel, "user", chatId, content,
+                null, media, null, sessionKey);
+
+        var lock = sessionLocks.computeIfAbsent(sessionKey, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            concurrencyGate.acquire();
+        } catch (InterruptedException e) {
+            lock.unlock();
+            Thread.currentThread().interrupt();
+            return null;
+        }
+
+        try {
+            // Use override tools if provided
+            var savedTools = this.tools;
+            // TODO: swap tools if overrideTools != null
+            return processSystemMessage(msg, sessionKey,
+                    onProgress != null ? () -> onProgress.accept("") : null,
+                    onStream, onStreamEnd, null);
+        } finally {
+            concurrencyGate.release();
+            lock.unlock();
+        }
+    }
+
+    // -- buildBusProgressCallback (Python _build_bus_progress_callback) --
+
+    Consumer<String> buildBusProgressCallback(InboundMessage msg) {
+        return progress -> {
+            var meta = msg.metadata() != null
+                    ? new LinkedHashMap<>(msg.metadata()) : new LinkedHashMap<String, Object>();
+            try {
+                bus.publishOutbound(new OutboundMessage(
+                        msg.channel(), msg.chatId(), progress, null, null, meta, null));
+            } catch (InterruptedException ignored) {}
+        };
+    }
+
+    // -- buildBusRetryWaitCallback (Python _build_retry_wait_callback) --
+
+    Consumer<String> buildBusRetryWaitCallback(InboundMessage msg) {
+        return content -> {
+            var meta = msg.metadata() != null
+                    ? new LinkedHashMap<>(msg.metadata()) : new LinkedHashMap<String, Object>();
+            meta.put("_retry_wait", true);
+            try {
+                bus.publishOutbound(new OutboundMessage(
+                        msg.channel(), msg.chatId(), content, null, null, meta, null));
+            } catch (InterruptedException ignored) {}
+        };
+    }
+
+    // -- runtimeEvents (Python _runtime_events) --
+
+    Object runtimeEvents() {
+        return null; // Stub — RuntimeEventBus not yet ported
+    }
+
+    // -- syncSubagentRuntimeLimits --
+
+    void syncSubagentRuntimeLimits() {
+        // Stub — Full implementation syncs runtime limits from subagent configuration.
+        // When subagent config changes, this updates maxConcurrentSubagents, token budgets, etc.
     }
 }
