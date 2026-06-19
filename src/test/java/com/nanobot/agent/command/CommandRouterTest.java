@@ -14,7 +14,10 @@ class CommandRouterTest {
             "discord", "user-1", "chat-1", "content", null, List.of(), null, null);
 
     private CommandContext makeCtx(String raw) {
-        return new CommandContext(sampleMsg, session, "test-session", raw, "");
+        // Extract args: everything after the first space
+        var spaceIdx = raw.indexOf(' ');
+        var args = spaceIdx >= 0 ? raw.substring(spaceIdx + 1) : "";
+        return new CommandContext(sampleMsg, session, "test-session", raw, args);
     }
 
     // -- priority tier --
@@ -165,5 +168,102 @@ class CommandRouterTest {
         assertThat(router.isDispatchableCommand("/dream")).isTrue();
         assertThat(router.isDispatchableCommand("/skill")).isTrue();
         assertThat(router.isDispatchableCommand("/model gpt5")).isTrue();
+    }
+
+    // -- cmdStatus --
+
+    @Test
+    void cmdStatusReturnsContent() {
+        var ctx = makeCtx("/status");
+        var result = BuiltinCommands.cmdStatus(ctx);
+        assertThat(result).isNotNull();
+        // Without a loop, status shows fallback message
+        assertThat(result.content()).isNotNull();
+    }
+
+    // -- cmdModel --
+
+    @Test
+    void cmdModelWithoutArgsShowsCurrentModel() {
+        var ctx = makeCtx("/model");
+        var result = BuiltinCommands.cmdModel(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("## Model", "Current model");
+    }
+
+    @Test
+    void cmdModelWithArgsShowsSwitchMessage() {
+        var ctx = makeCtx("/model gpt5");
+        var result = BuiltinCommands.cmdModel(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("Switched");
+    }
+
+    @Test
+    void cmdModelWithMultipleArgsShowsUsage() {
+        var ctx = makeCtx("/model a b");
+        var result = BuiltinCommands.cmdModel(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("Usage");
+    }
+
+    // -- cmdHistory --
+
+    @Test
+    void cmdHistoryReturnsContent() {
+        var ctx = makeCtx("/history");
+        var result = BuiltinCommands.cmdHistory(ctx);
+        assertThat(result).isNotNull();
+        // Empty session shows "no history" message
+        assertThat(result.content()).containsIgnoringCase("no conversation history");
+    }
+
+    @Test
+    void cmdHistoryWithSessionShowsMessages() {
+        var session = new Session("test-session");
+        session.addMessage("user", "hello");
+        session.addMessage("assistant", "hi there");
+        var msg = new InboundMessage("discord", "user-1", "chat-1", "/history",
+                null, List.of(), null, null);
+        var ctx = new CommandContext(msg, session, "test-session", "/history", "");
+        var result = BuiltinCommands.cmdHistory(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("user", "hello");
+    }
+
+    // -- cmdDream --
+
+    @Test
+    void cmdDreamReturnsDreamingMessage() {
+        var ctx = makeCtx("/dream");
+        var result = BuiltinCommands.cmdDream(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("Dreaming");
+    }
+
+    // -- cmdSkill --
+
+    @Test
+    void cmdSkillReturnsContent() {
+        var ctx = makeCtx("/skill");
+        var result = BuiltinCommands.cmdSkill(ctx);
+        assertThat(result).isNotNull();
+    }
+
+    // -- cmdGoal --
+
+    @Test
+    void cmdGoalWithoutArgsShowsUsage() {
+        var ctx = makeCtx("/goal");
+        var result = BuiltinCommands.cmdGoal(ctx);
+        assertThat(result).isNotNull();
+        assertThat(result.content()).contains("Usage");
+    }
+
+    @Test
+    void cmdGoalWithArgsReturnsNull() {
+        var ctx = makeCtx("/goal build something");
+        var result = BuiltinCommands.cmdGoal(ctx);
+        assertThat(result).isNull(); // rewrites into normal agent turn
     }
 }

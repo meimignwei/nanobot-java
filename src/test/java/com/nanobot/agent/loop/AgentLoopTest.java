@@ -118,6 +118,124 @@ class AgentLoopTest {
         assertThat(loop.commands().isDispatchableCommand("/help")).isTrue();
     }
 
+    // -- replayTokenBudget --
+
+    @Test
+    void replayTokenBudgetReturnsPositiveBudget() {
+        int budget = loop.replayTokenBudget();
+        assertThat(budget).isPositive();
+        assertThat(budget).isLessThan(loop.contextWindowTokens());
+    }
+
+    @Test
+    void replayTokenBudgetUsesHalfWindowAsFloor() {
+        // With a small context window, should fall back to half
+        var smallLoop = new AgentLoop(bus, new AgentRunner(new StubProvider()),
+                new ContextBuilder(workspace, null),
+                new CommandRouter(), null, sessions, workspace,
+                "test", 10, 100, 16_000, "standard",
+                new ConcurrentHashMap<>(), new Semaphore(10),
+                new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+        int budget = smallLoop.replayTokenBudget();
+        // 100 - 1 - 1024 = -925, so floor should be max(128, 100/2) = 128
+        assertThat(budget).isEqualTo(128);
+    }
+
+    // -- persistSubagentFollowup --
+
+    @Test
+    void persistSubagentFollowupAddsMessage() {
+        var session = sessions.getOrCreate("test:chat");
+        var msg = new InboundMessage("system", "subagent", "test:chat",
+                "Subagent result: done", null, List.of(),
+                Map.of("subagent_task_id", "task-1"), null);
+
+        boolean added = loop.persistSubagentFollowup(session, msg);
+        assertThat(added).isTrue();
+        assertThat(session.messages()).hasSize(1);
+        assertThat(session.messages().get(0).get("injected_event")).isEqualTo("subagent_result");
+    }
+
+    @Test
+    void persistSubagentFollowupDedupesByTaskId() {
+        var session = sessions.getOrCreate("test:chat");
+        var msg = new InboundMessage("system", "subagent", "test:chat",
+                "result", null, List.of(),
+                Map.of("subagent_task_id", "task-1"), null);
+
+        loop.persistSubagentFollowup(session, msg);
+        boolean second = loop.persistSubagentFollowup(session, msg);
+        assertThat(second).isFalse();
+        assertThat(session.messages()).hasSize(1);
+    }
+
+    @Test
+    void persistSubagentFollowupSkipsEmptyContent() {
+        var session = sessions.getOrCreate("test:chat");
+        var msg = new InboundMessage("system", "subagent", "test:chat",
+                "", null, List.of(),
+                Map.of("subagent_task_id", "task-1"), null);
+
+        boolean added = loop.persistSubagentFollowup(session, msg);
+        assertThat(added).isFalse();
+        assertThat(session.messages()).isEmpty();
+    }
+
+    // -- restorePendingUserTurn --
+
+    @Test
+    void restorePendingUserTurnAppendsErrorForIncompleteTurn() {
+        var session = sessions.getOrCreate("test:chat");
+        session.addMessage("user", "hello");
+        session.metadata().put("_pending_user_turn", true);
+
+        boolean restored = loop.restorePendingUserTurn(session);
+        assertThat(restored).isTrue();
+        assertThat(session.messages()).hasSize(2);
+        assertThat(session.messages().get(1).get("role")).isEqualTo("assistant");
+        assertThat((String) session.messages().get(1).get("content")).contains("interrupted");
+        assertThat(session.metadata().get("_pending_user_turn")).isNull();
+    }
+
+    @Test
+    void restorePendingUserTurnSkipsWhenNoFlag() {
+        var session = sessions.getOrCreate("test:chat");
+        session.addMessage("user", "hello");
+
+        boolean restored = loop.restorePendingUserTurn(session);
+        assertThat(restored).isFalse();
+        assertThat(session.messages()).hasSize(1);
+    }
+
+    // -- clearRuntimeCheckpoint --
+
+    @Test
+    void clearRuntimeCheckpointRemovesKey() {
+        var session = sessions.getOrCreate("test:chat");
+        session.metadata().put("runtime_checkpoint", Map.of("phase", "awaiting_tools"));
+
+        loop.clearRuntimeCheckpoint(session);
+        assertThat(session.metadata().get("runtime_checkpoint")).isNull();
+    }
+
+    @Test
+    void clearRuntimeCheckpointHandlesNull() {
+        loop.clearRuntimeCheckpoint(null); // should not throw
+    }
+
+    // -- processMessage routes system channel --
+
+    @Test
+    void processMessageRoutesSystemChannelToSystemHandler() {
+        var msg = new InboundMessage("system", "subagent", "test:chat",
+                "Subagent done", null, List.of(), Map.of(), null);
+
+        var result = loop.processMessage(msg);
+        assertThat(result).isNotNull();
+        assertThat(result.channel()).isEqualTo("test");
+        assertThat(result.content()).isNotNull();
+    }
+
     // -- helpers --
 
     static class TestMessageBus extends MessageBus {
