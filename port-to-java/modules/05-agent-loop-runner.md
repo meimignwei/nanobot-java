@@ -582,3 +582,90 @@ NANOBOT_PROVIDERS_ANTHROPIC_API_KEY=sk-ant-xxx mvn test \
 - ContextBuilder: ~80 行
 - 测试: ~300 行
 - **合计: ~905 行**
+
+---
+
+## 复刻完成度报告 (2026-06-19)
+
+### 对标清单
+
+| Python 源文件 | Java 实现 | 状态 |
+|---|---|---|
+| `agent/loop.py` (1780行) | `AgentLoop.java` (414行) + `TurnState.java` + `TurnContext.java` | 核心完成 |
+| `agent/runner.py` (1544行) | `AgentRunner.java` (450行) + `AgentRunSpec.java` + `AgentRunResult.java` | 核心完成 |
+| `command/router.py` (89行) | `CommandRouter.java` (80行) | 完整 |
+| `command/builtin.py` (720行) | `BuiltinCommands.java` (250行) | 完整（13条命令） |
+| `agent/memory.py` (Consolidator部分) | `Consolidator.java` (400行) + `ConsolidatorProvider.java` | 完整 |
+| `agent/context.py` (ContextBuilder) | `ContextBuilder.java` (200行) | 完整 |
+| `session/manager.py` (Session/SessionManager) | `Session.java` + `SessionManager.java` | 核心完成 |
+| `channel/manager.py` | `Channel.java` + `ChannelManager.java` | 接口层 |
+
+### 新增文件清单
+
+```
+src/main/java/com/nanobot/agent/
+├── session/Session.java (追加 setUpdatedAt)
+├── hook/AgentHookContext.java (追加 no-arg 构造器 + setter)
+├── hook/AgentRunHookContext.java (追加 no-arg 构造器 + setter)
+├── tools/ToolContext.java (追加 create() 工厂方法)
+├── command/CommandContext.java
+├── command/CommandRouter.java
+├── command/BuiltinCommands.java
+├── context/ConsolidatorProvider.java
+├── context/Consolidator.java
+├── runner/AgentRunSpec.java
+├── runner/AgentRunResult.java
+├── runner/AgentRunner.java
+├── loop/TurnState.java
+├── loop/TurnContext.java
+└── loop/AgentLoop.java
+```
+
+### Python→Java 差异
+
+| 差异点 | 原因 |
+|---|---|
+| TRANSITIONS 表用 LinkedHashMap + static block | Java `Map.ofEntries` 不支持混合类型 varargs |
+| `Consumer<String>` → `ThrowingConsumer<String>` | Java checked exceptions; 自定义函数式接口 |
+| Consolidator 依赖通过 `ConsolidatorProvider` 接口注入 | 解耦 LLMProvider 具体类 |
+| `ToolContext.create()` 静态工厂 | 测试用便捷方法 |
+| Hook context 从 public fields 改为 setter | 保持与既有 getter/setter 模式一致 |
+
+### 测试
+
+| 测试类 | 测试数 | 状态 |
+|---|---|---|
+| `CommandRouterTest` | 16 | PASS |
+| `ConsolidatorTest` | 11 | PASS |
+| `AgentRunnerTest` | 5 | PASS |
+| `AgentLoopTest` | 5 | PASS |
+| 既有 P1/P2/P3 测试 | 272 | PASS (回归无破坏) |
+| **合计** | **309** | **0 失败** |
+
+### 验证
+
+- [x] `mvn test` 全量 309 测试通过
+- [x] P1/P2/P3 测试无回归
+- [x] AgentLoop 状态机转换测试通过
+- [x] AgentLoop 消息处理测试通过
+- [x] AgentRunner 完成/迭代上限/错误处理测试通过
+- [x] CommandRouter 三层分发测试通过
+- [x] Consolidator 压缩/归档测试通过
+
+### 已知待补项
+
+- AgentRunner 并发工具调用时的 race condition 保护（Python 用 asyncio.gather, Java 用虚拟线程并行）
+- ContextBuilder 图片/文档处理完整路径（basic 测试已覆盖，高级特性待 P5+ 补充）
+- 集成测试需真实 API key（手动验证场景）
+- `microcompact()` 和 `snipHistory()` 的边界条件覆盖（当前 basic 路径已测）
+
+### Commits
+
+```
+fa40f73 feat: add AgentLoop state machine with turn processing
+e3d0be5 feat: add AgentRunner core execution loop
+a3f50cd feat: add TurnState, StateTraceEntry, and TurnContext
+bbbb0e3 feat: add AgentRunSpec and AgentRunResult records
+0181fba feat: add Consolidator for LLM-based memory summarization
+fc1ac0e feat: add CommandRouter with three-tier dispatch and 13 built-in commands
+```
