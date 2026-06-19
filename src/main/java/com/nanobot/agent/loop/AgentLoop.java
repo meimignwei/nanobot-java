@@ -12,6 +12,7 @@ import com.nanobot.agent.tools.ToolRegistry;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
 import com.nanobot.bus.OutboundMessage;
+import com.nanobot.providers.base.ThrowingConsumer;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +21,7 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 /**
  * Core agent processing engine with turn state machine.
@@ -154,6 +156,9 @@ public class AgentLoop implements Runnable {
 
     void dispatch(InboundMessage msg) {
         var key = effectiveSessionKey(msg);
+        if (!key.equals(msg.sessionKey())) {
+            msg = msg.withSessionKey(key);
+        }
 
         // Check priority commands — dispatched without session lock
         if (commands.isPriority(msg.content())) {
@@ -167,6 +172,7 @@ public class AgentLoop implements Runnable {
 
         // Acquire session lock + concurrency gate
         var lock = sessionLocks.computeIfAbsent(key, k -> new ReentrantLock());
+        BlockingQueue<InboundMessage> pending = null;
         lock.lock();
         try {
             concurrencyGate.acquire();
@@ -177,15 +183,49 @@ public class AgentLoop implements Runnable {
         }
 
         try {
-            processMessage(msg);
-        } catch (Exception e) {
-            log.error("Error processing message for session {}", key, e);
+            // Only the task that owns the session lock may publish the
+            // active mid-turn injection queue for this session.
+            pending = new LinkedBlockingQueue<>(20);
+            pendingQueues.put(key, pending);
+
+            OutboundMessage response = null;
             try {
-                bus.publishOutbound(new OutboundMessage(
-                        msg.channel(), msg.chatId(), "Error processing message: " + e.getMessage(),
-                        null, null, null, null));
-            } catch (InterruptedException ignored) {}
+                response = processMessage(msg);
+            } catch (Exception e) {
+                log.error("Error processing message for session {}", key, e);
+                try {
+                    bus.publishOutbound(new OutboundMessage(
+                            msg.channel(), msg.chatId(),
+                            "Sorry, I encountered an error.",
+                            null, null, null, null));
+                } catch (InterruptedException ignored) {}
+            }
+
+            if (response != null) {
+                try { bus.publishOutbound(response); } catch (InterruptedException ignored) {}
+            } else if ("cli".equals(msg.channel())) {
+                try {
+                    bus.publishOutbound(new OutboundMessage(
+                            msg.channel(), msg.chatId(), "",
+                            null, null, null, null));
+                } catch (InterruptedException ignored) {}
+            }
         } finally {
+            // Drain pending queue and re-publish leftovers
+            if (pendingQueues.get(key) == pending) {
+                pendingQueues.remove(key);
+            }
+            if (pending != null) {
+                var leftover = new ArrayList<InboundMessage>();
+                pending.drainTo(leftover);
+                for (var item : leftover) {
+                    try { bus.publishInbound(item); } catch (InterruptedException ignored) {}
+                }
+                if (!leftover.isEmpty()) {
+                    log.info("Re-published {} leftover message(s) to bus for session {}",
+                            leftover.size(), key);
+                }
+            }
             concurrencyGate.release();
             lock.unlock();
         }
@@ -193,7 +233,7 @@ public class AgentLoop implements Runnable {
 
     // -- processMessage --
 
-    public void processMessage(InboundMessage msg) {
+    public OutboundMessage processMessage(InboundMessage msg) {
         var key = effectiveSessionKey(msg);
         var turnId = UUID.randomUUID().toString();
         var ctx = new TurnContext(msg, key, TurnState.RESTORE, turnId);
@@ -217,7 +257,62 @@ public class AgentLoop implements Runnable {
             };
             if (event == null) break;
         }
+
+        return ctx.outbound();
     }
+
+    // -- runAgentLoop (Python _run_agent_loop) --
+
+    RunLoopResult runAgentLoop(
+            TurnContext ctx,
+            Runnable progressCallback,
+            java.util.function.Consumer<String> streamCallback,
+            Runnable streamEndCallback,
+            java.util.function.Consumer<String> retryWaitCallback) {
+
+        var session = ctx.session();
+        var channel = ctx.msg().channel();
+        var chatId = ctx.msg().chatId();
+        var metadata = ctx.msg().metadata();
+        var sessionKey = ctx.sessionKey();
+        ThrowingConsumer<String> retryCb = retryWaitCallback != null
+                ? s -> retryWaitCallback.accept(s) : null;
+        Consumer<String> progressCb = progressCallback != null
+                ? s -> progressCallback.run() : null;
+
+        var spec = new AgentRunSpec(
+                ctx.initialMessages(), tools, model, maxIterations, maxToolResultChars,
+                null, null, null, null, null, null,
+                true, false, workspace, sessionKey,
+                contextWindowTokens, null, providerRetryMode,
+                progressCb, streamCallback != null, retryCb,
+                null, null, null, null, null, true);
+
+        try {
+            var result = runner.run(spec);
+            ctx.setFinalContent(result.finalContent());
+            ctx.setToolsUsed(new ArrayList<>(result.toolsUsed()));
+            ctx.setAllMessages(result.messages());
+            ctx.setStopReason(result.stopReason());
+            ctx.setHadInjections(result.hadInjections());
+            if (result.usage() != null) {
+                lastUsage.putAll(result.usage());
+            }
+            return new RunLoopResult(result.finalContent(), result.toolsUsed(),
+                    result.messages(), result.stopReason(), result.hadInjections());
+        } catch (Exception e) {
+            log.error("Agent run failed for {}", sessionKey, e);
+            ctx.setFinalContent("An error occurred during processing.");
+            ctx.setStopReason("error");
+            return new RunLoopResult("An error occurred during processing.",
+                    List.of(), ctx.allMessages() != null ? ctx.allMessages() : List.of(),
+                    "error", false);
+        }
+    }
+
+    record RunLoopResult(String finalContent, List<String> toolsUsed,
+                         List<Map<String, Object>> messages, String stopReason,
+                         boolean hadInjections) {}
 
     // -- state handlers --
 
@@ -292,29 +387,19 @@ public class AgentLoop implements Runnable {
         var session = ctx.session();
         if (session == null) return "ok";
 
-        var spec = new AgentRunSpec(
-                ctx.initialMessages(), tools, model, maxIterations, maxToolResultChars,
-                null, null, null, null, null, null,
-                false, false, workspace, ctx.sessionKey(),
-                contextWindowTokens, null, providerRetryMode,
-                null, true, null, null, null, null, null,
-                null, true);
+        var result = runAgentLoop(ctx, null, null, null, null);
+        ctx.setFinalContent(result.finalContent());
+        ctx.setToolsUsed(new ArrayList<>(result.toolsUsed()));
+        ctx.setAllMessages(new ArrayList<>(result.messages()));
+        ctx.setStopReason(result.stopReason());
+        ctx.setHadInjections(result.hadInjections());
 
-        var runCtx = new com.nanobot.agent.hook.AgentRunHookContext();
-        try {
-            var result = runner.run(spec);
-            ctx.setFinalContent(result.finalContent());
-            ctx.setToolsUsed(new ArrayList<>(result.toolsUsed()));
-            ctx.setAllMessages(result.messages());
-            ctx.setStopReason(result.stopReason());
-            ctx.setHadInjections(result.hadInjections());
-            if (result.usage() != null) {
-                lastUsage.putAll(result.usage());
-            }
-        } catch (Exception e) {
-            log.error("Agent run failed for {}", ctx.sessionKey(), e);
-            ctx.setFinalContent("An error occurred during processing.");
-            ctx.setStopReason("error");
+        if ("max_iterations".equals(result.stopReason())) {
+            log.warn("Max iterations ({}) reached", maxIterations);
+        } else if ("error".equals(result.stopReason())) {
+            log.error("LLM returned error: {}",
+                    (result.finalContent() != null ? result.finalContent() : "").substring(
+                            0, Math.min(200, result.finalContent() != null ? result.finalContent().length() : 0)));
         }
 
         return "ok";
@@ -329,7 +414,10 @@ public class AgentLoop implements Runnable {
     }
 
     String stateRespond(TurnContext ctx) {
-        if (ctx.suppressResponse()) return "ok";
+        if (ctx.suppressResponse()) {
+            ctx.setOutbound(null);
+            return "ok";
+        }
 
         var msg = ctx.msg();
         var content = ctx.finalContent();
@@ -337,11 +425,14 @@ public class AgentLoop implements Runnable {
             content = "[No response generated]";
         }
 
+        var meta = msg.metadata() != null ? new LinkedHashMap<>(msg.metadata()) : new LinkedHashMap<String, Object>();
+        if (!"error".equals(ctx.stopReason()) && !"tool_error".equals(ctx.stopReason())) {
+            meta.put("_streamed", true);
+        }
+
         var outbound = new OutboundMessage(
                 msg.channel(), msg.chatId(), content,
-                null, null,
-                msg.metadata() != null ? new LinkedHashMap<>(msg.metadata()) : Map.of(),
-                null);
+                null, null, meta, null);
         ctx.setOutbound(outbound);
 
         try {
@@ -380,25 +471,80 @@ public class AgentLoop implements Runnable {
     void saveTurn(Session session, List<Map<String, Object>> allMessages, int saveSkip) {
         if (allMessages == null || allMessages.isEmpty()) return;
 
-        // Append new messages to session
-        int existingCount = session.messages().size();
-        for (int i = existingCount; i < allMessages.size(); i++) {
+        // Append new-turn messages with truncation for large tool results
+        for (int i = saveSkip; i < allMessages.size(); i++) {
             var msg = allMessages.get(i);
             var role = msg.get("role");
             var content = msg.get("content");
-            if (role != null) {
-                var extra = new LinkedHashMap<String, Object>();
-                for (var entry : msg.entrySet()) {
-                    if (!"role".equals(entry.getKey()) && !"content".equals(entry.getKey())) {
-                        extra.put(entry.getKey(), entry.getValue());
-                    }
-                }
-                session.addMessage(role.toString(),
-                        content != null ? content.toString() : "",
-                        extra.isEmpty() ? null : extra);
+            if (role == null) continue;
+
+            // Skip empty assistant messages without tool_calls — they poison session context
+            if ("assistant".equals(role) && (content == null || "".equals(content))
+                    && !msg.containsKey("tool_calls")) {
+                continue;
             }
+
+            var entry = new LinkedHashMap<>(msg);
+
+            // Truncate large tool results
+            if ("tool".equals(role)) {
+                if (content instanceof String s && s.length() > maxToolResultChars) {
+                    entry.put("content", s.substring(0, maxToolResultChars) + "\n... (truncated)");
+                } else if (content instanceof List<?> blocks) {
+                    var filtered = sanitizePersistedBlocks(blocks, true);
+                    entry.put("content", filtered);
+                }
+            }
+
+            var extra = new LinkedHashMap<String, Object>();
+            for (var e : entry.entrySet()) {
+                if (!"role".equals(e.getKey()) && !"content".equals(e.getKey())) {
+                    extra.put(e.getKey(), e.getValue());
+                }
+            }
+            session.addMessage(role.toString(),
+                    entry.get("content") != null ? entry.get("content").toString() : "",
+                    extra.isEmpty() ? null : extra);
         }
         sessions.save(session);
+    }
+
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> sanitizePersistedBlocks(List<?> blocks, boolean shouldTruncate) {
+        var filtered = new ArrayList<Map<String, Object>>();
+        for (var block : blocks) {
+            if (!(block instanceof Map<?, ?> bm)) {
+                if (block instanceof Map) filtered.add((Map<String, Object>) block);
+                continue;
+            }
+            var b = (Map<String, Object>) bm;
+
+            // Strip inline image data URIs
+            if ("image_url".equals(b.get("type"))) {
+                var imageUrl = b.get("image_url");
+                if (imageUrl instanceof Map<?, ?> ium) {
+                    var urlObj = ium.get("url");
+                    var url = urlObj != null ? urlObj.toString() : "";
+                    if (url.startsWith("data:image/")) {
+                        filtered.add(Map.of("type", "text", "text", "[image]"));
+                        continue;
+                    }
+                }
+            }
+
+            // Truncate long text blocks
+            if ("text".equals(b.get("type")) && b.get("text") instanceof String text) {
+                if (shouldTruncate && text.length() > maxToolResultChars) {
+                    var truncated = new LinkedHashMap<>(b);
+                    truncated.put("text", text.substring(0, maxToolResultChars) + "\n... (truncated)");
+                    filtered.add(truncated);
+                    continue;
+                }
+            }
+
+            filtered.add(b);
+        }
+        return filtered;
     }
 
     public int cancelActiveTasks(String sessionKey) {

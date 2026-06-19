@@ -28,4 +28,10 @@ public record InboundMessage(
     public String sessionKey() {
         return sessionKeyOverride != null ? sessionKeyOverride : channel + ":" + chatId;
     }
+
+    /** Return a copy with the given session key override. */
+    public InboundMessage withSessionKey(String key) {
+        return new InboundMessage(channel, senderId, chatId, content,
+                timestamp, media, metadata, key);
+    }
 }
