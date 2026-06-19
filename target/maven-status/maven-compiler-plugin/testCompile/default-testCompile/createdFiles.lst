@@ -46,6 +46,7 @@ com/nanobot/agent/tools/SchemaValidatorTest$RequiredFields.class
 com/nanobot/providers/base/MessageSanitizerTest$EnforceRoleAlternation.class
 com/nanobot/agent/context/MemoryStoreTest.class
 com/nanobot/agent/runner/AgentRunnerTest$StubProvider.class
+com/nanobot/agent/runner/AgentRunnerTest$ConcreteStub.class
 com/nanobot/agent/session/SessionManagerTest$1.class
 com/nanobot/agent/command/CommandRouterTest.class
 com/nanobot/providers/base/LLMResponseTest$ParseToolArguments.class

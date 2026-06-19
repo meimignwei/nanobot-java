@@ -14,6 +14,7 @@ import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
 import com.nanobot.bus.OutboundMessage;
 import com.nanobot.providers.base.ThrowingConsumer;
+import com.nanobot.trace.TraceObservation;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -157,6 +158,7 @@ public class AgentLoop implements Runnable {
 
     // -- dispatch --
 
+        // 对应 Python _dispatch() (loop.py:928)
     void dispatch(InboundMessage msg) {
         var key = effectiveSessionKey(msg);
         if (!key.equals(msg.sessionKey())) {
@@ -236,6 +238,7 @@ public class AgentLoop implements Runnable {
 
     // -- dispatchCommandInline (Python _dispatch_command_inline, loop.py:619-632) --
 
+        // 对应 Python _dispatch_command_inline() (loop.py:619)
     void dispatchCommandInline(InboundMessage msg, String key, String raw,
                                java.util.function.Function<CommandContext, OutboundMessage> dispatchFn) {
         var ctx = new CommandContext(msg, null, key, raw, "", this);
@@ -259,31 +262,42 @@ public class AgentLoop implements Runnable {
         var turnId = UUID.randomUUID().toString();
         var ctx = new TurnContext(msg, key, TurnState.RESTORE, turnId);
 
-        String event = "start";
+        // -- 追踪开始（turn 边界），对应 Python RuntimeEventBus.session_turn_started --
+        TraceObservation.startTrace("turn", Map.of(
+                "turnId", turnId,
+                "sessionKey", key,
+                "channel", msg.channel()));
 
-        while (ctx.state() != TurnState.DONE) {
-            var next = TRANSITIONS.get(Map.entry(ctx.state(), event));
-            if (next != null) {
-                ctx.setState(next);
+        try {
+            String event = "start";
+
+            while (ctx.state() != TurnState.DONE) {
+                var next = TRANSITIONS.get(Map.entry(ctx.state(), event));
+                if (next != null) {
+                    ctx.setState(next);
+                }
+                event = switch (ctx.state()) {
+                    case RESTORE -> stateRestore(ctx);
+                    case COMPACT -> stateCompact(ctx);
+                    case COMMAND -> stateCommand(ctx);
+                    case BUILD -> stateBuild(ctx);
+                    case RUN -> stateRun(ctx);
+                    case SAVE -> stateSave(ctx);
+                    case RESPOND -> stateRespond(ctx);
+                    default -> "ok";
+                };
+                if (event == null) break;
             }
-            event = switch (ctx.state()) {
-                case RESTORE -> stateRestore(ctx);
-                case COMPACT -> stateCompact(ctx);
-                case COMMAND -> stateCommand(ctx);
-                case BUILD -> stateBuild(ctx);
-                case RUN -> stateRun(ctx);
-                case SAVE -> stateSave(ctx);
-                case RESPOND -> stateRespond(ctx);
-                default -> "ok";
-            };
-            if (event == null) break;
-        }
 
-        return ctx.outbound();
+            return ctx.outbound();
+        } finally {
+            TraceObservation.endTrace();
+        }
     }
 
     // -- runAgentLoop (Python _run_agent_loop) --
 
+        // 对应 Python _run_agent_loop() (loop.py:665)
     RunLoopResult runAgentLoop(
             TurnContext ctx,
             Runnable progressCallback,
@@ -337,6 +351,7 @@ public class AgentLoop implements Runnable {
 
     // -- state handlers --
 
+        // 对应 Python _state_restore() (loop.py:1327)
     String stateRestore(TurnContext ctx) {
         var session = sessions.getOrCreate(ctx.sessionKey());
         ctx.setSession(session);
@@ -357,6 +372,7 @@ public class AgentLoop implements Runnable {
         return "ok";
     }
 
+        // 对应 Python _state_compact() (loop.py:1363)
     String stateCompact(TurnContext ctx) {
         var session = ctx.session();
         if (session == null) return "ok";
@@ -369,6 +385,7 @@ public class AgentLoop implements Runnable {
         return "ok";
     }
 
+        // 对应 Python _state_command() (loop.py:1368)
     String stateCommand(TurnContext ctx) {
         var msg = ctx.msg();
         var session = ctx.session();
@@ -393,6 +410,7 @@ public class AgentLoop implements Runnable {
         return "dispatch";
     }
 
+        // 对应 Python _state_build() (loop.py:1393)
     String stateBuild(TurnContext ctx) {
         var session = ctx.session();
         if (session == null) return "ok";
@@ -425,6 +443,7 @@ public class AgentLoop implements Runnable {
         return "ok";
     }
 
+        // 对应 Python _state_run() (loop.py:1439)
     String stateRun(TurnContext ctx) {
         var session = ctx.session();
         if (session == null) return "ok";
@@ -447,6 +466,7 @@ public class AgentLoop implements Runnable {
         return "ok";
     }
 
+        // 对应 Python _state_save() (loop.py:1473)
     String stateSave(TurnContext ctx) {
         var session = ctx.session();
         if (session == null) return "ok";
@@ -455,6 +475,7 @@ public class AgentLoop implements Runnable {
         return "ok";
     }
 
+        // 对应 Python _state_respond() (loop.py:1512)
     String stateRespond(TurnContext ctx) {
         if (ctx.suppressResponse()) {
             ctx.setOutbound(null);
@@ -486,10 +507,12 @@ public class AgentLoop implements Runnable {
 
     // -- helpers --
 
+        // 对应 Python _effective_session_key() (loop.py:647)
     String effectiveSessionKey(InboundMessage msg) {
         return msg.sessionKey();
     }
 
+        // 对应 Python _persist_user_message_early() (loop.py:568)
     void persistUserMessageEarly(InboundMessage msg, Session session) {
         if (msg.content() == null || msg.content().isBlank()) return;
         if (msg.content().startsWith("/")) return; // commands are not persisted early
@@ -501,6 +524,7 @@ public class AgentLoop implements Runnable {
         sessions.save(session);
     }
 
+        // 对应 Python _build_initial_messages() (loop.py:592)
     List<Map<String, Object>> buildInitialMessages(InboundMessage msg, Session session) {
         var history = session.getHistory(maxIterations * 4, 0, false);
         // Add current user message
@@ -510,6 +534,7 @@ public class AgentLoop implements Runnable {
         return history;
     }
 
+        // 对应 Python _save_turn() (loop.py:1569)
     void saveTurn(Session session, List<Map<String, Object>> allMessages, int saveSkip) {
         if (allMessages == null || allMessages.isEmpty()) return;
 
@@ -552,6 +577,7 @@ public class AgentLoop implements Runnable {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _sanitize_persisted_blocks() (loop.py:1529)
     List<Map<String, Object>> sanitizePersistedBlocks(List<?> blocks, boolean shouldTruncate) {
         var filtered = new ArrayList<Map<String, Object>>();
         for (var block : blocks) {
@@ -591,6 +617,7 @@ public class AgentLoop implements Runnable {
 
     // -- tool context --
 
+        // 对应 Python _set_tool_context() (loop.py:507)
     void setToolContext(String channel, String chatId, @Nullable String messageId,
                         @Nullable Map<String, Object> metadata, String sessionKey,
                         Path workspace) {
@@ -604,12 +631,14 @@ public class AgentLoop implements Runnable {
         com.nanobot.agent.tools.ToolContext.bind(build);
     }
 
+        // 对应 Python _clear_tool_context (loop.py) — cleanup after turn
     void clearToolContext() {
         com.nanobot.agent.tools.ToolContext.unbind();
     }
 
     // -- default tool registration --
 
+        // 对应 Python _register_default_tools() (loop.py:473)
     void registerDefaultTools() {
         // Register standard built-in tools. These are the tools available
         // to every agent session by default. Port of Python _register_default_tools.
@@ -626,12 +655,14 @@ public class AgentLoop implements Runnable {
 
     // -- checkpoint management --
 
+        // 对应 Python _set_runtime_checkpoint() (loop.py:1640)
     void setRuntimeCheckpoint(Session session, Map<String, Object> payload) {
         if (session == null) return;
         session.metadata().put("runtime_checkpoint", payload);
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _restore_runtime_checkpoint() (loop.py:1667)
     boolean restoreRuntimeCheckpoint(Session session) {
         if (session == null) return false;
         var checkpoint = session.metadata().get("runtime_checkpoint");
@@ -653,11 +684,13 @@ public class AgentLoop implements Runnable {
         return false;
     }
 
+        // 对应 Python _mark_pending_user_turn() (loop.py:1645)
     void markPendingUserTurn(Session session) {
         if (session == null) return;
         session.metadata().put("_pending_user_turn", true);
     }
 
+        // 对应 Python _clear_pending_user_turn() (loop.py:1648)
     void clearPendingUserTurn(Session session) {
         if (session == null) return;
         session.metadata().remove("_pending_user_turn");
@@ -665,6 +698,7 @@ public class AgentLoop implements Runnable {
 
     // -- assembleOutbound --
 
+        // 对应 Python _assemble_outbound() (loop.py:1294)
     OutboundMessage assembleOutbound(InboundMessage msg, String finalContent,
                                      List<Map<String, Object>> allMessages,
                                      String stopReason, boolean hadInjections) {
@@ -685,6 +719,7 @@ public class AgentLoop implements Runnable {
 
     // -- replayTokenBudget (Python _replay_token_budget) --
 
+        // 对应 Python _replay_token_budget() (loop.py:653)
     int replayTokenBudget() {
         if (contextWindowTokens <= 0) return 0;
         int reservedOutput = 4096;
@@ -694,6 +729,7 @@ public class AgentLoop implements Runnable {
 
     // -- persistSubagentFollowup (Python _persist_subagent_followup) --
 
+        // 对应 Python _persist_subagent_followup() (loop.py:1616)
     boolean persistSubagentFollowup(Session session, InboundMessage msg) {
         if (msg.content() == null || msg.content().isBlank()) return false;
         var taskId = msg.metadata() != null ? msg.metadata().get("subagent_task_id") : null;
@@ -715,6 +751,7 @@ public class AgentLoop implements Runnable {
 
     // -- restorePendingUserTurn (Python _restore_pending_user_turn) --
 
+        // 对应 Python _restore_pending_user_turn() (loop.py:1721)
     boolean restorePendingUserTurn(Session session) {
         if (session == null) return false;
         var flag = session.metadata().get("_pending_user_turn");
@@ -735,12 +772,14 @@ public class AgentLoop implements Runnable {
 
     // -- clearRuntimeCheckpoint (Python _clear_runtime_checkpoint) --
 
+        // 对应 Python _clear_runtime_checkpoint() (loop.py:1651)
     void clearRuntimeCheckpoint(Session session) {
         if (session != null) session.metadata().remove("runtime_checkpoint");
     }
 
     // -- processSystemMessage (Python _process_system_message) --
 
+        // 对应 Python _process_system_message() (loop.py:1098)
     OutboundMessage processSystemMessage(
             InboundMessage msg,
             @Nullable String sessionKey,
@@ -751,12 +790,20 @@ public class AgentLoop implements Runnable {
 
         var channel = msg.channel();
         var chatId = msg.chatId();
-        // Parse channel:chatId for compound chat IDs (e.g. "slack:thread:ts")
-        if (msg.chatId().contains(":")) {
-            var parts = msg.chatId().split(":", 2);
-            channel = parts[0];
-            chatId = parts[1];
-        }
+
+        // -- 追踪开始（system/background turn） --
+        TraceObservation.startTrace("turn.system", Map.of(
+                "channel", channel,
+                "chatId", chatId,
+                "senderId", msg.senderId()));
+
+        try {
+            // Parse channel:chatId for compound chat IDs (e.g. "slack:thread:ts")
+            if (msg.chatId().contains(":")) {
+                var parts = msg.chatId().split(":", 2);
+                channel = parts[0];
+                chatId = parts[1];
+            }
 
         var key = msg.sessionKeyOverride() != null ? msg.sessionKeyOverride() : channel + ":" + chatId;
         var session = sessions.getOrCreate(key);
@@ -841,11 +888,16 @@ public class AgentLoop implements Runnable {
         var originMsgId = msg.metadata() != null ? msg.metadata().get("origin_message_id") : null;
         if (originMsgId != null) outboundMeta.put("origin_message_id", originMsgId);
 
-        return new OutboundMessage(channel, chatId, content, null, null, outboundMeta, null);
+            return new OutboundMessage(channel, chatId, content, null, null, outboundMeta, null);
+        } finally {
+            TraceObservation.endTrace();
+        }
     }
 
     // -- fromConfig (Python from_config classmethod) --
 
+        // 对应 Python from_config() classmethod (loop.py:336)
+    // 对应 Python from_config() 类方法 (loop.py:336)
     public static AgentLoop fromConfig(
             Object config,
             @Nullable MessageBus bus,
@@ -859,6 +911,7 @@ public class AgentLoop implements Runnable {
 
     // -- applyProviderSnapshot (Python _apply_provider_snapshot) --
 
+        // 对应 Python _apply_provider_snapshot() (loop.py:395)
     void applyProviderSnapshot(Object snapshot, @Nullable String modelPreset) {
         // Swap model/provider for future turns without disturbing an active one.
         // snapshot is expected to be a ProviderSnapshot record with: provider, model, contextWindowTokens, signature.
@@ -868,6 +921,7 @@ public class AgentLoop implements Runnable {
 
     // -- refreshProviderSnapshot (Python _refresh_provider_snapshot) --
 
+        // 对应 Python _refresh_provider_snapshot() (loop.py:426)
     void refreshProviderSnapshot() {
         // Refresh provider config from the snapshot loader.
         // Full implementation depends on provider_snapshot_loader callback.
@@ -876,10 +930,12 @@ public class AgentLoop implements Runnable {
     // -- modelPreset property (Python model_preset) --
 
     @Nullable
+        // 对应 Python model_preset getter (loop.py:451)
     public String getModelPreset() {
         return null; // _active_preset — stub
     }
 
+        // 对应 Python model_preset setter (loop.py:455)
     public void setModelPreset(@Nullable String name) {
         // Resolve preset by name and apply all runtime model dependents.
         // Full implementation depends on model_presets map and preset_snapshot_loader.
@@ -887,6 +943,7 @@ public class AgentLoop implements Runnable {
 
     // -- cancelActiveTasks --
 
+        // 对应 Python _cancel_active_tasks() (loop.py:634)
     public int cancelActiveTasks(String sessionKey) {
         var tasks = activeTasks.get(sessionKey);
         if (tasks == null) return 0;
@@ -907,16 +964,23 @@ public class AgentLoop implements Runnable {
 
     private volatile int currentIteration;
 
+        // 对应 Python current_iteration property (loop.py:151)
+    // 对应 Python current_iteration 属性 (loop.py:151)
     public int currentIteration() { return currentIteration; }
     public void setCurrentIteration(int iteration) { this.currentIteration = iteration; }
 
+        // 对应 Python tool_names property (loop.py:155)
+    // 对应 Python tool_names 属性 (loop.py:155)
     public Set<String> toolNames() { return tools.toolNames(); }
 
+        // 对应 Python llm_runtime property (loop.py:158)
+    // 对应 Python llm_runtime 属性 (loop.py:158)
     public com.nanobot.providers.base.LLMRuntime llmRuntime() {
         refreshProviderSnapshot();
         return new com.nanobot.providers.base.LLMRuntime(runner.getProvider(), model);
     }
 
+        // 对应 Python _runtime_chat_id() (loop.py:536)
     static String runtimeChatId(InboundMessage msg) {
         return String.valueOf(
                 msg.metadata() != null && msg.metadata().get("context_chat_id") != null
@@ -925,6 +989,7 @@ public class AgentLoop implements Runnable {
 
     // -- prepareMessageMedia (Python _prepare_message_media) --
 
+        // 对应 Python _prepare_message_media() (loop.py:1353)
     String prepareMessageMedia(String content, List<String> media) {
         if (shouldExtractDocumentText()) {
             return content; // Document extraction stub — requires PDF/DOCX parsing
@@ -932,10 +997,13 @@ public class AgentLoop implements Runnable {
         return referenceNonImageAttachments(content, media);
     }
 
+        // 对应 Python _should_extract_document_text() (loop.py:1358)
     boolean shouldExtractDocumentText() {
         return true; // Default: extract. Full impl checks channels_config.extract_document_text
     }
 
+        // 对应 Python reference logic in _prepare_message_media() (loop.py:1353)
+    // 对应 Python _prepare_message_media() 中的附件引用逻辑 (loop.py:1353)
     static String referenceNonImageAttachments(String content, List<String> media) {
         if (media == null || media.isEmpty()) return content;
         var imagePaths = new ArrayList<String>();
@@ -952,6 +1020,8 @@ public class AgentLoop implements Runnable {
         return (content != null && !content.isEmpty()) ? content + "\n\n" + suffix : suffix;
     }
 
+        // 对应 Python is_image_file helper (loop.py:1353)
+    // 对应 Python _prepare_message_media() 中的 is_image_file 判断 (loop.py:1353)
     static boolean isImageFile(String path) {
         var lower = path.toLowerCase();
         return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
@@ -961,6 +1031,7 @@ public class AgentLoop implements Runnable {
 
     // -- checkpointMessageKey (Python _checkpoint_message_key) --
 
+        // 对应 Python _checkpoint_message_key() (loop.py:1656)
     static List<Object> checkpointMessageKey(Map<String, Object> message) {
         return java.util.Arrays.asList(
                 message.get("role"),
@@ -975,6 +1046,8 @@ public class AgentLoop implements Runnable {
     // -- restoreRuntimeCheckpoint (enhanced to full Python behavior) --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _restore_runtime_checkpoint() full version (loop.py:1667)
+    // 对应 Python _restore_runtime_checkpoint() 完整版 (loop.py:1667)
     boolean restoreRuntimeCheckpointFull(Session session) {
         var checkpoint = session.metadata().get("runtime_checkpoint");
         if (!(checkpoint instanceof Map<?, ?> cp)) return false;
@@ -1048,6 +1121,7 @@ public class AgentLoop implements Runnable {
 
     // -- processDirect (Python process_direct) --
 
+        // 对应 Python process_direct() (loop.py:1741)
     public OutboundMessage processDirect(
             String content,
             String sessionKey,
@@ -1088,6 +1162,7 @@ public class AgentLoop implements Runnable {
 
     // -- buildBusProgressCallback (Python _build_bus_progress_callback) --
 
+        // 对应 Python _build_bus_progress_callback() (loop.py:540)
     Consumer<String> buildBusProgressCallback(InboundMessage msg) {
         return progress -> {
             var meta = msg.metadata() != null
@@ -1101,6 +1176,7 @@ public class AgentLoop implements Runnable {
 
     // -- buildBusRetryWaitCallback (Python _build_retry_wait_callback) --
 
+        // 对应 Python _build_retry_wait_callback() (loop.py:546)
     Consumer<String> buildBusRetryWaitCallback(InboundMessage msg) {
         return content -> {
             var meta = msg.metadata() != null
@@ -1115,12 +1191,14 @@ public class AgentLoop implements Runnable {
 
     // -- runtimeEvents (Python _runtime_events) --
 
+        // 对应 Python _runtime_events property (loop.py:565)
     Object runtimeEvents() {
         return null; // Stub — RuntimeEventBus not yet ported
     }
 
     // -- syncSubagentRuntimeLimits --
 
+        // 对应 Python _sync_subagent_runtime_limits() (loop.py:391)
     void syncSubagentRuntimeLimits() {
         // Stub — Full implementation syncs runtime limits from subagent configuration.
         // When subagent config changes, this updates maxConcurrentSubagents, token budgets, etc.

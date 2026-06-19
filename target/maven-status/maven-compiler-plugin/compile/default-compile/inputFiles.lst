@@ -18,6 +18,7 @@
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/hook/AgentHookContext.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/hook/AgentHook.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/base/LLMProvider.java
+/Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/trace/TraceObservation.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/context/ConsolidatorProvider.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/ModelPresetProperties.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/ProviderMatch.java
@@ -28,6 +29,7 @@
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/ConfigValidator.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/AgentProperties.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/CronSchedule.java
+/Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/config/OpenTelemetryConfig.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/agent/command/BuiltinCommands.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/OpenAICodexProvider.java
 /Users/mmw/IdeaProjects/nanobot-java/src/main/java/com/nanobot/providers/base/LLMResponse.java

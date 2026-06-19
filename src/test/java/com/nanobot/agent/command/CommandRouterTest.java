@@ -5,6 +5,7 @@ import com.nanobot.bus.OutboundMessage;
 import com.nanobot.agent.session.Session;
 import org.junit.jupiter.api.Test;
 import java.util.List;
+import java.util.Map;
 import static org.assertj.core.api.Assertions.*;
 
 class CommandRouterTest {
@@ -228,7 +229,7 @@ class CommandRouterTest {
         var ctx = new CommandContext(msg, session, "test-session", "/history", "");
         var result = BuiltinCommands.cmdHistory(ctx);
         assertThat(result).isNotNull();
-        assertThat(result.content()).contains("user", "hello");
+        assertThat(result.content()).contains("You: hello", "Bot: hi there");
     }
 
     // -- cmdDream --
@@ -265,5 +266,92 @@ class CommandRouterTest {
         var ctx = makeCtx("/goal build something");
         var result = BuiltinCommands.cmdGoal(ctx);
         assertThat(result).isNull(); // rewrites into normal agent turn
+    }
+
+    // -- helper: formatPresetNames --
+
+    @Test
+    void formatPresetNamesReturnsFormattedList() {
+        var result = BuiltinCommands.formatPresetNames(List.of("default", "gpt5"));
+        assertThat(result).isEqualTo("`default`, `gpt5`");
+    }
+
+    @Test
+    void formatPresetNamesHandlesEmpty() {
+        assertThat(BuiltinCommands.formatPresetNames(List.of())).isEqualTo("(none configured)");
+    }
+
+    // -- helper: formatHistoryMessage --
+
+    @Test
+    void formatHistoryMessageFormatsUserMessage() {
+        var result = BuiltinCommands.formatHistoryMessage(
+                Map.of("role", "user", "content", "hello"));
+        assertThat(result).isEqualTo("You: hello");
+    }
+
+    @Test
+    void formatHistoryMessageFormatsAssistantMessage() {
+        var result = BuiltinCommands.formatHistoryMessage(
+                Map.of("role", "assistant", "content", "hi there"));
+        assertThat(result).isEqualTo("Bot: hi there");
+    }
+
+    @Test
+    void formatHistoryMessageSkipsSystemRole() {
+        var result = BuiltinCommands.formatHistoryMessage(
+                Map.of("role", "system", "content", "sys"));
+        assertThat(result).isNull();
+    }
+
+    @Test
+    void formatHistoryMessageTruncatesLongContent() {
+        var longText = "x".repeat(250);
+        var result = BuiltinCommands.formatHistoryMessage(
+                Map.of("role", "user", "content", longText));
+        assertThat(result).startsWith("You: ");
+        assertThat(result.length()).isLessThan(210); // "You: " (5) + 200 + "..."
+    }
+
+    // -- helper: extractChangedFiles --
+
+    @Test
+    void extractChangedFilesParsesDiff() {
+        var diff = "diff --git a/file1.py b/file1.py\n+new line\n"
+                + "diff --git a/sub/file2.md b/sub/file2.md\n-old\n"
+                + "diff --git a/file1.py b/file1.py\n";
+        var files = BuiltinCommands.extractChangedFiles(diff);
+        assertThat(files).containsExactly("file1.py", "sub/file2.md");
+    }
+
+    @Test
+    void extractChangedFilesHandlesEmptyDiff() {
+        assertThat(BuiltinCommands.extractChangedFiles("")).isEmpty();
+    }
+
+    // -- helper: modelCommandStatus --
+
+    @Test
+    void modelCommandStatusShowsInfo() {
+        var result = BuiltinCommands.modelCommandStatus(null);
+        assertThat(result).contains("## Model", "Current model", "default");
+    }
+
+    // -- helper: formatDreamLogContent --
+
+    @Test
+    void formatDreamLogContentIncludesCommitInfo() {
+        var diff = "diff --git a/memory.json b/memory.json\n+test";
+        var result = BuiltinCommands.formatDreamLogContent(
+                "abc123", "2024-01-01", "dream update", diff, null);
+        assertThat(result).contains("## Dream Update", "`abc123`", "memory.json");
+    }
+
+    // -- helper: formatDreamRestoreList --
+
+    @Test
+    void formatDreamRestoreListShowsHeader() {
+        var result = BuiltinCommands.formatDreamRestoreList(List.of());
+        assertThat(result).contains("## Dream Restore", "Choose a Dream memory version");
     }
 }

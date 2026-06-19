@@ -3,15 +3,20 @@ package com.nanobot.agent.loop;
 import jakarta.annotation.Nullable;
 
 /**
- * A single entry in the state machine trace.
- * Mirrors Python StateTraceEntry dataclass (loop.py lines 89-94).
+ * 状态机追踪记录，记录每个状态的耗时和事件。
+ * 对应 Python StateTraceEntry dataclass（loop.py 行 89-94）。
  */
 public class StateTraceEntry {
 
+    /** 当前状态 */
     private final TurnState state;
+    /** 状态进入时间（epoch 秒） */
     private final double startedAt;
+    /** 状态持续时间（毫秒） */
     private final double durationMs;
+    /** 事件描述 */
     private final String event;
+    /** 错误信息（可选） */
     @Nullable
     private final String error;
 

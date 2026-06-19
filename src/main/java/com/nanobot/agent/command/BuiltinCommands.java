@@ -39,6 +39,7 @@ public final class BuiltinCommands {
         return m;
     }
 
+    // 对应 Python builtin_command_palette() (builtin.py:123)
     public static List<Map<String, String>> builtinSpecs() {
         return List.of(
                 spec("/new", "New chat",
@@ -73,6 +74,7 @@ public final class BuiltinCommands {
 
     // -- buildHelpText --
 
+    // 对应 Python build_help_text() (builtin.py:687)
     static String buildHelpText() {
         var sb = new StringBuilder("nanobot commands:");
         for (var spec : builtinSpecs()) {
@@ -124,12 +126,14 @@ public final class BuiltinCommands {
 
     // -- /help --
 
+    // 对应 Python cmd_help() (builtin.py:677)
     public static OutboundMessage cmdHelp(CommandContext ctx) {
         return replyText(ctx, buildHelpText());
     }
 
     // -- /stop --
 
+    // 对应 Python cmd_stop() (builtin.py:128)
     public static OutboundMessage cmdStop(CommandContext ctx) {
         var al = loop(ctx);
         int total = al != null ? al.cancelActiveTasks(ctx.key()) : 0;
@@ -139,12 +143,14 @@ public final class BuiltinCommands {
 
     // -- /restart --
 
+    // 对应 Python cmd_restart() (builtin.py:140)
     public static OutboundMessage cmdRestart(CommandContext ctx) {
         return reply(ctx, "Restarting...");
     }
 
     // -- /status --
 
+    // 对应 Python cmd_status() (builtin.py:160)
     public static OutboundMessage cmdStatus(CommandContext ctx) {
         var al = loop(ctx);
         if (al == null) {
@@ -194,6 +200,7 @@ public final class BuiltinCommands {
 
     // -- /new --
 
+    // 对应 Python cmd_new() (builtin.py:205)
     public static OutboundMessage cmdNew(CommandContext ctx) {
         var al = loop(ctx);
         if (al != null) al.cancelActiveTasks(ctx.key());
@@ -214,6 +221,7 @@ public final class BuiltinCommands {
 
     // -- /model --
 
+    // 对应 Python cmd_model() (builtin.py:252)
     public static OutboundMessage cmdModel(CommandContext ctx) {
         var al = loop(ctx);
         var args = ctx.args().strip();
@@ -221,20 +229,8 @@ public final class BuiltinCommands {
 
         // Show current model status
         if (args.isEmpty()) {
-            var sb = new StringBuilder("## Model\n");
-            if (al != null) {
-                sb.append("- **Current model:** `").append(al.model()).append("`\n");
-                sb.append("- **Context window:** ").append(al.contextWindowTokens()).append(" tokens\n");
-                var preset = al.getModelPreset();
-                sb.append("- **Current preset:** `").append(preset != null ? preset : "default").append("`\n");
-                sb.append("- **Available presets:** `default`\n");
-            } else {
-                sb.append("- **Current model:** `default`\n");
-                sb.append("- **Current preset:** `default`\n");
-                sb.append("- **Available presets:** `default`\n");
-            }
             return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                    sb.toString(), null, null, meta, null);
+                    modelCommandStatus(al), null, null, meta, null);
         }
 
         // Switch preset
@@ -249,7 +245,7 @@ public final class BuiltinCommands {
                 al.setModelPreset(parts[0]);
             } catch (Exception e) {
                 return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                        "Could not switch model preset: " + e.getMessage()
+                        "Could not switch model preset: " + commandErrorMessage(e)
                                 + "\n\nAvailable presets: `default`",
                         null, null, meta, null);
             }
@@ -269,6 +265,7 @@ public final class BuiltinCommands {
 
     // -- /history --
 
+    // 对应 Python cmd_history() (builtin.py:568)
     public static OutboundMessage cmdHistory(CommandContext ctx) {
         var session = ctx.session();
         if (session == null) {
@@ -297,20 +294,12 @@ public final class BuiltinCommands {
 
         for (int i = from; i < msgs.size(); i++) {
             var msg = msgs.get(i);
-            var role = String.valueOf(msg.getOrDefault("role", "?"));
-            var content = msg.get("content");
-            String contentStr;
-            if (content instanceof String s) {
-                contentStr = s.length() > 200 ? s.substring(0, 200) + "..." : s;
-            } else if (content instanceof List<?> blocks) {
-                contentStr = "[content blocks: " + blocks.size() + " parts]";
-            } else {
-                contentStr = String.valueOf(content);
-            }
+            var formatted = formatHistoryMessage(msg);
+            if (formatted == null) continue;
             var ts = msg.get("timestamp");
             var time = ts != null ? String.valueOf(ts).substring(11, 19) : "??:??:??";
-            sb.append("[").append(i + 1).append("] **").append(role).append("** (").append(time)
-                    .append(")\n  ").append(contentStr.replace("\n", "\n  ")).append("\n\n");
+            sb.append("[").append(i + 1).append("] (").append(time)
+                    .append(")\n  ").append(formatted).append("\n\n");
         }
 
         return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
@@ -319,6 +308,7 @@ public final class BuiltinCommands {
 
     // -- /goal --
 
+    // 对应 Python cmd_goal() (builtin.py:614)
     public static OutboundMessage cmdGoal(CommandContext ctx) {
         var goal = ctx.args().strip();
         if (goal.isEmpty()) {
@@ -330,6 +320,7 @@ public final class BuiltinCommands {
 
     // -- /dream --
 
+    // 对应 Python cmd_dream() (builtin.py:306)
     public static OutboundMessage cmdDream(CommandContext ctx) {
         var al = loop(ctx);
         if (al != null && al.consolidator() != null && ctx.session() != null) {
@@ -344,12 +335,22 @@ public final class BuiltinCommands {
 
     // -- /dream-log --
 
+    // 对应 Python cmd_dream_log() (builtin.py:449)
     public static OutboundMessage cmdDreamLog(CommandContext ctx) {
         var al = loop(ctx);
+        var args = ctx.args().strip();
         if (al != null && al.context() != null && al.context().getMemory() != null) {
             var mem = al.context().getMemory();
             if (mem.getLastDreamCursor() > 0) {
-                return replyText(ctx, "Dream has run. Cursor: " + mem.getLastDreamCursor());
+                // Full implementation requires MemoryStore git raw_archive.
+                // For now, show the cursor with the dream-log format.
+                var sb = new StringBuilder("## Dream Log\n\n");
+                sb.append("- **Last Dream cursor:** ").append(mem.getLastDreamCursor()).append("\n");
+                if (!args.isEmpty()) {
+                    sb.append("- **Requested SHA:** `").append(args).append("`\n");
+                }
+                sb.append("\nFull Dream log requires git raw_archive — not yet ported.\n");
+                return replyText(ctx, sb.toString());
             }
         }
         return replyText(ctx, "Dream has not run yet.");
@@ -357,12 +358,21 @@ public final class BuiltinCommands {
 
     // -- /dream-restore --
 
+    // 对应 Python cmd_dream_restore() (builtin.py:499)
     public static OutboundMessage cmdDreamRestore(CommandContext ctx) {
-        return replyText(ctx, "Dream memory has no saved versions to restore yet.");
+        var args = ctx.args().strip();
+        if (!args.isEmpty()) {
+            // Specific SHA restore — requires git raw_archive
+            return replyText(ctx, "Dream restore to `" + args
+                    + "` requires git raw_archive — not yet ported.");
+        }
+        // List versions — uses formatDreamRestoreList
+        return replyText(ctx, formatDreamRestoreList(java.util.List.of()));
     }
 
     // -- /skill --
 
+    // 对应 Python cmd_skill() (builtin.py:658)
     public static OutboundMessage cmdSkill(CommandContext ctx) {
         var al = loop(ctx);
         if (al != null && al.tools() != null) {
@@ -395,8 +405,185 @@ public final class BuiltinCommands {
         return replyText(ctx, "No pairing requests to manage.");
     }
 
+    // ================================================================
+    // Formatting helpers (Python builtin.py private helpers)
+    // ================================================================
+
+    private static final int HISTORY_DEFAULT_COUNT = 10;
+    private static final int HISTORY_MAX_COUNT = 50;
+    private static final int HISTORY_MAX_CONTENT_CHARS = 200;
+
+    // -- _format_preset_names (builtin.py:223-224) --
+
+    static String formatPresetNames(java.util.Collection<String> names) {
+        if (names == null || names.isEmpty()) return "(none configured)";
+        var sb = new StringBuilder();
+        boolean first = true;
+        for (var name : names) {
+            if (!first) sb.append(", ");
+            sb.append("`").append(name).append("`");
+            first = false;
+        }
+        return sb.toString();
+    }
+
+    // -- _model_preset_names (builtin.py:227-230) --
+
+    static java.util.List<String> modelPresetNames(AgentLoop loop) {
+        var names = new java.util.LinkedHashSet<String>();
+        names.add("default");
+        // model_presets not yet ported — falls back to default only
+        var result = new java.util.ArrayList<>(names);
+        java.util.Collections.sort(result);
+        return result;
+    }
+
+    // -- _active_model_preset_name (builtin.py:233-234) --
+
+    static String activeModelPresetName(AgentLoop loop) {
+        if (loop == null) return "default";
+        var preset = loop.getModelPreset();
+        return preset != null ? preset : "default";
+    }
+
+    // -- _command_error_message (builtin.py:237-238) --
+
+    // 对应 Python _command_error_message() (builtin.py:237)
+    static String commandErrorMessage(Exception exc) {
+        if (exc.getMessage() != null) return exc.getMessage();
+        return exc.toString();
+    }
+
+    // -- _model_command_status (builtin.py:241-249) --
+
+    static String modelCommandStatus(AgentLoop loop) {
+        var names = modelPresetNames(loop);
+        var active = activeModelPresetName(loop);
+        var sb = new StringBuilder("## Model\n");
+        if (loop != null) {
+            sb.append("- **Current model:** `").append(loop.model()).append("`\n");
+            sb.append("- **Context window:** ").append(loop.contextWindowTokens()).append(" tokens\n");
+        } else {
+            sb.append("- **Current model:** `default`\n");
+        }
+        sb.append("- **Current preset:** `").append(active).append("`\n");
+        sb.append("- **Available presets:** ").append(formatPresetNames(names)).append("\n");
+        return sb.toString();
+    }
+
+    // -- _format_history_message (builtin.py:550-565) --
+
+    @SuppressWarnings("unchecked")
+    // 对应 Python _format_history_message() (builtin.py:550)
+    static String formatHistoryMessage(Map<String, Object> msg) {
+        var role = msg.get("role");
+        if (!"user".equals(role) && !"assistant".equals(role)) return null;
+        var content = msg.get("content");
+        String contentStr;
+        if (content instanceof List<?> blocks) {
+            var parts = new java.util.ArrayList<String>();
+            for (var b : blocks) {
+                if (b instanceof Map<?, ?> bm && "text".equals(bm.get("type"))) {
+                    var t = bm.get("text");
+                    if (t != null) parts.add(t.toString());
+                }
+            }
+            contentStr = String.join(" ", parts);
+        } else {
+            contentStr = content != null ? content.toString() : "";
+        }
+        contentStr = contentStr.strip();
+        if (contentStr.isEmpty()) return null;
+        if (contentStr.length() > HISTORY_MAX_CONTENT_CHARS) {
+            contentStr = contentStr.substring(0, HISTORY_MAX_CONTENT_CHARS) + "...";
+        }
+        var label = "user".equals(role) ? "You" : "Bot";
+        return label + ": " + contentStr;
+    }
+
+    // -- _extract_changed_files (builtin.py:377-394) --
+
+    static java.util.List<String> extractChangedFiles(String diff) {
+        var files = new java.util.ArrayList<String>();
+        var seen = new java.util.HashSet<String>();
+        for (var line : diff.split("\n")) {
+            if (!line.startsWith("diff --git ")) continue;
+            var parts = line.split(" ");
+            if (parts.length < 4) continue;
+            var path = parts[3];
+            if (path.startsWith("b/")) path = path.substring(2);
+            if (seen.contains(path)) continue;
+            seen.add(path);
+            files.add(path);
+        }
+        return files;
+    }
+
+    // -- _format_changed_files (builtin.py:397-401) --
+
+    // 对应 Python _format_changed_files() (builtin.py:397)
+    static String formatChangedFiles(String diff) {
+        var files = extractChangedFiles(diff);
+        if (files.isEmpty()) return "No tracked memory files changed.";
+        var sb = new StringBuilder();
+        boolean first = true;
+        for (var f : files) {
+            if (!first) sb.append(", ");
+            sb.append("`").append(f).append("`");
+            first = false;
+        }
+        return sb.toString();
+    }
+
+    // -- _format_dream_log_content (builtin.py:404-429) --
+
+    static String formatDreamLogContent(String commitSha, String commitTimestamp,
+                                         String commitMessage, String diff,
+                                         String requestedSha) {
+        var filesLine = formatChangedFiles(diff);
+        var sb = new StringBuilder();
+        sb.append("## Dream Update\n\n");
+        sb.append(requestedSha != null
+                ? "Here is the selected Dream memory change.\n\n"
+                : "Here is the latest Dream memory change.\n\n");
+        sb.append("- **Commit:** `").append(commitSha).append("`\n");
+        sb.append("- **Time:** ").append(commitTimestamp).append("\n");
+        sb.append("- **Changed files:** ").append(filesLine).append("\n");
+        if (diff != null && !diff.isEmpty()) {
+            sb.append("\nUse `/dream-restore ").append(commitSha)
+                    .append("` to undo this change.\n\n");
+            sb.append("```diff\n").append(diff.strip()).append("\n```\n");
+        } else {
+            sb.append("\nDream recorded this version, but there is no file diff to display.\n");
+        }
+        return sb.toString();
+    }
+
+    // -- _format_dream_restore_list (builtin.py:432-446) --
+
+    static String formatDreamRestoreList(java.util.List<?> commits) {
+        var sb = new StringBuilder();
+        sb.append("## Dream Restore\n\n");
+        sb.append("Choose a Dream memory version to restore. Latest first:\n\n");
+        for (var c : commits) {
+            String sha = "", timestamp = "", message = "";
+            if (c instanceof Map<?, ?> cm) {
+                var s = cm.get("sha"); sha = s != null ? String.valueOf(s) : "?";
+                var t = cm.get("timestamp"); timestamp = t != null ? String.valueOf(t) : "?";
+                var m = cm.get("message"); message = m != null ? String.valueOf(m) : "";
+            }
+            var firstLine = message.split("\n")[0];
+            sb.append("- `").append(sha).append("` ").append(timestamp)
+                    .append(" - ").append(firstLine).append("\n");
+        }
+        sb.append("\nPreview a version with `/dream-log <sha>` before restoring it.\n");
+        sb.append("Restore a version with `/dream-restore <sha>`.\n");
+        return sb.toString();
+    }
+
     // -- translateAndDispatch (Python register_builtin_commands) --
 
+    // 对应 Python register_builtin_commands() (builtin.py:698)
     public static void registerAll(CommandRouter router) {
         // Priority tier — dispatched WITHOUT session lock
         router.priority("/stop", BuiltinCommands::cmdStop);

@@ -5,45 +5,59 @@ import jakarta.annotation.Nullable;
 import java.util.*;
 
 /**
- * Agent capability: read files, run commands, etc.
- * Port of Python Tool (base.py lines 124-297).
+ * Agent 能力抽象基类：读写文件、执行命令等。
+ * 对应 Python Tool（base.py 行 124-297）。
+ *
+ * <p>子类需实现 name()、description()、parameters()、execute()。
+ * 内置参数类型转换（castParams）和 JSON Schema 校验（validateParams）。</p>
  */
 public abstract class Tool {
 
     private static final Set<String> BOOL_TRUE = Set.of("true", "1", "yes");
     private static final Set<String> BOOL_FALSE = Set.of("false", "0", "no");
 
+    /** 解析 JSON Schema type 字段（支持数组形式如 ["string","null"]）。
+     *  对应 Python resolve_type()。 */
     @Nullable
     public static String resolveType(Object t) {
         return Schema.resolveJsonSchemaType(t);
     }
 
-    // ---- Abstract properties ----
+    // ---- 抽象属性 ----
 
+    /** 工具名称。对应 Python Tool.name property。 */
     public abstract String name();
+    /** 工具描述。对应 Python Tool.description property。 */
     public abstract String description();
+    /** 工具参数 JSON Schema。对应 Python Tool.parameters property。 */
     public abstract Map<String, Object> parameters();
 
-    // ---- Overridable ----
+    // ---- 可覆盖属性 ----
 
+    /** 是否只读工具。对应 Python Tool.is_read_only()。 */
     public boolean isReadOnly() { return false; }
 
+    /** 是否并发安全。对应 Python Tool.is_concurrency_safe()。 */
     public boolean isConcurrencySafe() {
         return isReadOnly() && !isExclusive();
     }
 
+    /** 是否独占（不允许并发执行）。对应 Python Tool.is_exclusive()。 */
     public boolean isExclusive() { return false; }
 
+    /** 配置键名。对应 Python Tool.config_key()。 */
     public String configKey() { return ""; }
 
+    /** 配置类。对应 Python Tool.config_class()。 */
     @Nullable
     @SuppressWarnings("rawtypes")
     public Class configClass() { return null; }
 
+    /** 是否启用。对应 Python Tool.is_enabled()。 */
     public boolean isEnabled(ToolContext ctx) { return true; }
 
-    /** Port of Python Tool.enabled classmethod / create classmethod.
-     * In Java, factory logic lives in ToolLoader. */
+    /** 工厂方法：创建工具实例。对应 Python Tool.create() classmethod。
+     *  在 Java 中，工厂逻辑位于 ToolLoader。 */
     public static Tool create(ToolContext ctx, Class<? extends Tool> toolClass) {
         try {
             return toolClass.getDeclaredConstructor().newInstance();
@@ -52,16 +66,18 @@ public abstract class Tool {
         }
     }
 
-    // ---- Core abstract ----
+    // ---- 核心抽象 ----
 
     /**
-     * Execute the tool. Returns String or List&lt;Map&lt;String, Object&gt;&gt;.
-     * Port of Python Tool.execute(self, **kwargs) -> Any.
+     * 执行工具，返回 String 或 List&lt;Map&lt;String, Object&gt;&gt;。
+     * 对应 Python Tool.execute(self, **kwargs) -> Any。
      */
     public abstract Object execute(Map<String, Object> params, ToolContext ctx) throws Exception;
 
-    // ---- Cast / Validate ----
+    // ---- 参数类型转换 / 校验 ----
 
+    /** 按 schema 转换参数类型（字符串→数字/布尔等）。
+     *  对应 Python Tool.cast_params()。 */
     @SuppressWarnings("unchecked")
     public Map<String, Object> castParams(Map<String, Object> params) {
         Map<String, Object> schema = parameters();
@@ -138,6 +154,8 @@ public abstract class Tool {
         return val;
     }
 
+    /** 校验参数是否符合 schema。
+     *  对应 Python Tool.validate_params()。 */
     public List<String> validateParams(Map<String, Object> params) {
         if (!(params instanceof Map)) {
             return List.of("parameters must be an object, got " + params.getClass().getSimpleName());
@@ -152,8 +170,10 @@ public abstract class Tool {
         return Schema.validateJsonSchemaValue(params, objSchema, "");
     }
 
-    // ---- Schema output ----
+    // ---- Schema 输出 ----
 
+    /** 输出 OpenAI 格式的工具 schema。
+     *  对应 Python Tool.to_schema()。 */
     public Map<String, Object> toSchema() {
         Map<String, Object> fn = new LinkedHashMap<>();
         fn.put("name", name());

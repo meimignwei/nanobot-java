@@ -47,6 +47,14 @@ nanobot:
     restrict-to-workspace: false
     webui-allow-local-service-access: true
 
+  # 可观测性 — 对应 Python langfuse.openai wrapper 的 LangFuse 集成
+  # 设置 LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY 环境变量即启用追踪
+  observability:
+    langfuse:
+      enabled: true
+      # otel-endpoint 留空则默认使用 LangFuse Cloud EU 端点
+      # 自托管示例: http://localhost:3000/api/public/otel
+
 spring:
   threads:
     virtual:

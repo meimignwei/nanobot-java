@@ -6,17 +6,17 @@ import org.slf4j.LoggerFactory;
 import java.util.*;
 
 /**
- * Tool discovery and registration.
- * Port of Python ToolLoader (loader.py, 117 lines).
+ * 工具发现与注册。
+ * 对应 Python ToolLoader（loader.py，117 行）。
  *
- * Java adaptation: Spring {@code @Component} scanning replaces
- * {@code pkgutil.iter_modules}; {@code ServiceLoader<Tool>} replaces
- * {@code entry_points(group="nanobot.tools")}.
+ * <p>Java 适配：Spring {@code @Component} 扫描替代 {@code pkgutil.iter_modules}；
+ * {@code ServiceLoader<Tool>} 替代 {@code entry_points(group="nanobot.tools")}。</p>
  */
 public class ToolLoader {
 
     private static final Logger log = LoggerFactory.getLogger(ToolLoader.class);
 
+    /** 跳过的基础模块名 */
     private static final Set<String> SKIP_MODULES = Set.of(
             "base", "schema", "registry", "context", "loader", "config",
             "file_state", "sandbox", "mcp", "__init__", "runtime_state"
@@ -35,25 +35,26 @@ public class ToolLoader {
     }
 
     /**
-     * Port of Python discover() — finds Tool subclasses via Spring bean scanning.
-     * When Spring context is available, beans are injected directly; this method
-     * provides programmatic discovery for non-Spring contexts (tests, plugins).
+     * 发现 Tool 子类（通过 Spring bean 扫描）。
+     * 对应 Python discover()。
+     *
+     * <p>Spring 环境下通过 @Component 扫描自动注入；此方法提供非 Spring 环境的
+     * 编程式发现（测试、插件）。</p>
      */
     @SuppressWarnings("unchecked")
     public List<Class<? extends Tool>> discover() {
         if (testClasses != null) return List.copyOf(testClasses);
         if (discovered != null) return discovered;
 
-        // In Spring Boot, tools are discovered via @Component scanning.
-        // This method handles non-Spring programmatic discovery.
-        // Tools are typically registered via load(toolBeans, ctx, registry).
+        // Spring Boot 下工具通过 @Component 扫描发现。
+        // 此方法处理非 Spring 编程式发现。
         discovered = List.of();
         return discovered;
     }
 
     /**
-     * Port of Python _discover_plugins() — discovers external tool plugins
-     * registered via Java ServiceLoader.
+     * 发现通过 Java ServiceLoader 注册的外部工具插件。
+     * 对应 Python _discover_plugins()。
      */
     public Map<String, Class<? extends Tool>> discoverPlugins() {
         if (plugins != null) return plugins;
@@ -74,13 +75,14 @@ public class ToolLoader {
     }
 
     /**
-     * Port of Python load() — instantiates and registers tools into the registry.
+     * 实例化并注册工具到注册表。
+     * 对应 Python load()。
      *
-     * @param toolBeans Spring-injected tool beans (or manually created list)
-     * @param ctx       the tool context for enabled/config checks
-     * @param registry  the target registry
-     * @param scope     scope filter (default "core")
-     * @return list of registered tool names
+     * @param toolBeans Spring 注入的工具 bean 列表（或手动创建的列表）
+     * @param ctx       工具上下文（用于 enabled/config 检查）
+     * @param registry  目标注册表
+     * @param scope     作用域过滤（默认 "core"）
+     * @return 已注册的工具名称列表
      */
     public List<String> load(
             Collection<Tool> toolBeans,
@@ -91,7 +93,7 @@ public class ToolLoader {
         List<String> registered = new ArrayList<>();
         Set<String> builtinNames = new HashSet<>();
 
-        // Phase 1: built-in tools (from Spring beans)
+        // Phase 1: 内置工具（来自 Spring beans）
         for (Tool tool : toolBeans) {
             String clsLabel = tool.getClass().getSimpleName();
             try {
@@ -103,7 +105,7 @@ public class ToolLoader {
             }
         }
 
-        // Phase 2: plugin tools (from ServiceLoader)
+        // Phase 2: 插件工具（来自 ServiceLoader）
         for (var entry : discoverPlugins().entrySet()) {
             String pluginName = entry.getKey();
             Class<? extends Tool> pluginClass = entry.getValue();
@@ -120,6 +122,7 @@ public class ToolLoader {
         return registered;
     }
 
+    /** 注册单个工具，处理名称冲突 */
     private static void registerTool(
             ToolRegistry registry,
             Tool tool,
@@ -144,14 +147,15 @@ public class ToolLoader {
         }
     }
 
-    // ---- helpers ----
+    // ---- 辅助方法 ----
 
+    /** 检查工具是否在指定 scope 内 */
     private static boolean isInScope(Tool tool, String scope) {
-        // _scopes field — default to {"core"} if not specified
         Set<String> scopes = getToolScopes(tool);
         return scopes.contains(scope);
     }
 
+    /** 通过反射获取工具的 _scopes 字段 */
     @SuppressWarnings("unchecked")
     private static Set<String> getToolScopes(Tool tool) {
         try {
@@ -169,6 +173,7 @@ public class ToolLoader {
         return java.lang.reflect.Modifier.isAbstract(cls.getModifiers());
     }
 
+    /** 检查插件类是否标记为可发现（默认 true） */
     private static boolean isPluginDiscoverable(Class<? extends Tool> cls) {
         try {
             var field = cls.getDeclaredField("_plugin_discoverable");

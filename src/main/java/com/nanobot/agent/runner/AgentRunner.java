@@ -7,6 +7,7 @@ import com.nanobot.agent.tools.ToolRegistry;
 import com.nanobot.providers.base.LLMProvider;
 import com.nanobot.providers.base.LLMResponse;
 import com.nanobot.providers.base.ToolCallRequest;
+import com.nanobot.trace.TraceObservation;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,7 +64,7 @@ public class AgentRunner {
 
     public LLMProvider getProvider() { return provider; }
 
-    // -- run --
+    // -- run (mirrors Python AgentRunner.run, runner.py:275) --
 
     public AgentRunResult run(AgentRunSpec spec) {
         var runCtx = new AgentRunHookContext();
@@ -108,8 +109,7 @@ public class AgentRunner {
                 rctx.error, rctx.toolEvents, rctx.hadInjections);
     }
 
-    // -- runCore --
-
+    // 对应 Python _run_core() (runner.py:323)
     AgentRunResult runCore(AgentRunSpec spec, AgentRunHookContext runCtx) throws InterruptedException {
         var messages = new ArrayList<>(spec.initialMessages());
         var toolsUsed = new ArrayList<String>();
@@ -136,7 +136,10 @@ public class AgentRunner {
             }
 
             // Request model
-            LLMResponse response;
+            LLMResponse response = LLMResponse.error("unreachable");
+            // -- LLM 调用追踪，对应 Python langfuse.openai 自动埋点 --
+            var llmSpan = TraceObservation.startSpan("llm.call", Map.of(
+                    "iteration", iteration, "model", spec.model() != null ? spec.model() : "default"));
             try {
                 response = requestModel(spec, messages, iterCtx);
             } catch (InterruptedException e) {
@@ -144,6 +147,22 @@ public class AgentRunner {
             } catch (Exception e) {
                 log.error("Model request failed at iteration {}", iteration, e);
                 response = LLMResponse.error("Error calling LLM: " + e.getMessage());
+            } finally {
+                if (llmSpan != null) {
+                    // GenAI 语义属性 — LangFuse 原生解析，显示模型名、token 数、延迟
+                    var respUsage = response.usage();
+                    int promptTokens = respUsage.containsKey("prompt_tokens")
+                            ? ((Number) respUsage.get("prompt_tokens")).intValue() : 0;
+                    int completionTokens = respUsage.containsKey("completion_tokens")
+                            ? ((Number) respUsage.get("completion_tokens")).intValue() : 0;
+                    TraceObservation.recordLLMUsage(
+                            spec.model() != null ? spec.model() : "default",
+                            guessSystemFromModel(spec.model()),
+                            promptTokens,
+                            completionTokens,
+                            response.finishReason());
+                    TraceObservation.endSpan(llmSpan);
+                }
             }
 
             // Accumulate usage
@@ -258,6 +277,7 @@ public class AgentRunner {
     // -- requestModel --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _request_model() (runner.py:692)
     LLMResponse requestModel(AgentRunSpec spec, List<Map<String, Object>> messages,
                              AgentHookContext iterCtx) throws Exception {
         var tools = spec.tools().getDefinitions();
@@ -270,6 +290,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _build_request_kwargs() (runner.py:670)
     Map<String, Object> buildRequestKwargs(AgentRunSpec spec, List<Map<String, Object>> messages) {
         var kwargs = new LinkedHashMap<String, Object>();
         kwargs.put("messages", messages);
@@ -284,6 +305,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _request_no_tools() (runner.py:889)
     LLMResponse requestNoTools(AgentRunSpec spec, List<Map<String, Object>> messages) throws Exception {
         int maxTokens = spec.maxTokens() != null ? spec.maxTokens() : provider.generation.maxTokens();
         double temperature = spec.temperature() != null ? spec.temperature() : provider.generation.temperature();
@@ -296,6 +318,7 @@ public class AgentRunner {
     // -- injection draining --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _try_drain_injections() (runner.py:175)
     boolean tryDrainInjections(AgentRunSpec spec, List<Map<String, Object>> messages,
                                Map<String, Object> assistantMessage,
                                int injectionCycles,
@@ -336,6 +359,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _drain_injections() (runner.py:230)
     List<Map<String, Object>> drainInjections(AgentRunSpec spec) {
         var callback = spec.injectionCallback();
         if (callback == null) return List.of();
@@ -360,18 +384,21 @@ public class AgentRunner {
 
     // -- finalization --
 
+        // 对应 Python _request_finalization_retry() (runner.py:834)
     LLMResponse requestFinalizationRetry(AgentRunSpec spec,
                                          List<Map<String, Object>> messages) throws Exception {
         var retryMessages = buildFinalizationRetryMessages(messages);
         return requestNoTools(spec, retryMessages);
     }
 
+        // 对应 Python _finalization_retry_messages() (runner.py:843)
     static List<Map<String, Object>> buildFinalizationRetryMessages(List<Map<String, Object>> messages) {
         var retry = new ArrayList<>(messages);
         retry.add(Map.of("role", "user", "content", FINALIZATION_RETRY_PROMPT));
         return retry;
     }
 
+        // 对应 Python _budget_exhausted_finalization_messages() (runner.py:898)
     static List<Map<String, Object>> buildBudgetExhaustedFinalizationMessages(
             List<Map<String, Object>> messages) {
         var retry = new ArrayList<>(messages);
@@ -379,10 +406,12 @@ public class AgentRunner {
         return retry;
     }
 
+        // 对应 Python _length_recovery_prompt — 构建长度恢复用户消息 (runner.py 内部)
     static Map<String, Object> buildLengthRecoveryMessage() {
         return Map.of("role", "user", "content", LENGTH_RECOVERY_PROMPT);
     }
 
+        // 对应 Python _max_iterations_fallback() (runner.py:906)
     String maxIterationsFallback(AgentRunSpec spec) {
         if (spec.maxIterationsMessage() != null) {
             return spec.maxIterationsMessage().replace("{max_iterations}",
@@ -393,6 +422,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _try_finalize_after_max_iterations() (runner.py:848)
     String tryFinalizeOnMaxIterations(AgentRunSpec spec, List<Map<String, Object>> messages,
                                       Map<String, Integer> usage, AgentRunHookContext runCtx,
                                       boolean hadInjections) {
@@ -421,6 +451,7 @@ public class AgentRunner {
 
     // -- usage estimation --
 
+        // 对应 Python _usage_or_estimate() (runner.py:917)
     Map<String, Integer> usageOrEstimate(AgentRunSpec spec, List<Map<String, Object>> messages,
                                          LLMResponse response) {
         var usage = usageDict(response.usage());
@@ -435,6 +466,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _estimate_response_usage() (runner.py:933)
     Map<String, Integer> estimateResponseUsage(AgentRunSpec spec, List<Map<String, Object>> messages,
                                                 LLMResponse response) {
         try {
@@ -467,6 +499,7 @@ public class AgentRunner {
     // -- executeTools (enhanced with batching) --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _execute_tools() (runner.py:991)
     List<Map<String, Object>> executeTools(AgentRunSpec spec, List<ToolCallRequest> toolCalls,
                                            AgentHookContext iterCtx) {
         var extLookupCounts = new LinkedHashMap<String, Integer>();
@@ -507,6 +540,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _run_tool() (runner.py:1028)
     Map<String, Object> runToolWithClassification(AgentRunSpec spec, ToolCallRequest toolCall,
                                                    Map<String, Integer> extLookupCounts,
                                                    Map<String, Integer> wsViolationCounts) {
@@ -528,8 +562,13 @@ public class AgentRunner {
             params = Map.of();
         }
 
+        // -- 工具执行追踪 --
+        var toolSpan = TraceObservation.startSpan("tool.execute", Map.of(
+                "tool", toolCall.name(),
+                "callId", toolCall.id()));
+
         // Execute (Python _run_tool lines 1099-1103)
-        String rawText;
+        String rawText = "";
         try {
             var toolResult = tool != null
                     ? tool.execute(params, ToolContext.create())
@@ -537,6 +576,12 @@ public class AgentRunner {
             rawText = toolResult != null ? toolResult.toString() : "";
         } catch (Exception e) {
             rawText = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        } finally {
+            if (toolSpan != null) {
+                toolSpan.setAttribute("status",
+                        rawText.startsWith("Error") ? "error" : "ok");
+                TraceObservation.endSpan(toolSpan);
+            }
         }
 
         // Classify violations (Python _run_tool lines 1135-1160, using _classify_violation)
@@ -569,6 +614,7 @@ public class AgentRunner {
 
     @SuppressWarnings("unchecked")
     @Nullable
+        // 对应 Python _classify_violation() (runner.py:1222)
     Map<String, Object> classifyViolation(
             String rawText,
             String softPayload,
@@ -608,6 +654,7 @@ public class AgentRunner {
 
     @SuppressWarnings("unchecked")
     @Nullable
+        // 对应 Python repeated_external_lookup_error (runner.py:1028, 提取自 _run_tool)
     static String repeatedExternalLookupError(String toolName, Object arguments,
                                                Map<String, Integer> extLookupCounts) {
         var sig = externalLookupSignature(toolName, arguments);
@@ -624,6 +671,7 @@ public class AgentRunner {
 
     @SuppressWarnings("unchecked")
     @Nullable
+        // 对应 Python repeated_workspace_violation_error (runner.py:1028, 提取自 _run_tool)
     static String repeatedWorkspaceViolationError(String toolName, Object arguments,
                                                    Map<String, Integer> wsViolationCounts) {
         var sig = workspaceViolationSignature(toolName,
@@ -645,6 +693,7 @@ public class AgentRunner {
 
     // -- normalizeToolResult --
 
+        // 对应 Python _normalize_tool_result() (runner.py:1301)
     Object normalizeToolResult(AgentRunSpec spec, String toolCallId, String toolName, Object result) {
         if (result == null || (result instanceof String s && s.isBlank())) {
             return "(" + toolName + " completed with no output)";
@@ -659,6 +708,7 @@ public class AgentRunner {
 
     // -- partitionToolBatches --
 
+        // 对应 Python _partition_tool_batches() (runner.py:1520)
     List<List<ToolCallRequest>> partitionToolBatches(AgentRunSpec spec,
                                                       List<ToolCallRequest> toolCalls) {
         if (!spec.concurrentTools()) {
@@ -685,6 +735,7 @@ public class AgentRunner {
 
     // -- emitCheckpoint --
 
+        // 对应 Python _emit_checkpoint() (runner.py:1271)
     void emitCheckpoint(AgentRunSpec spec, Map<String, Object> payload) {
         var callback = spec.checkpointCallback();
         if (callback != null) {
@@ -695,6 +746,7 @@ public class AgentRunner {
     // -- external lookup / workspace violation signatures --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python external_lookup_signature — 去重键构建 (runner.py:1028)
     static String externalLookupSignature(String toolName, Object arguments) {
         if (!(arguments instanceof Map<?, ?> args)) return null;
         if ("web_fetch".equals(toolName)) {
@@ -712,6 +764,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python workspace_violation_signature — 去重键构建 (runner.py:1156)
     static String workspaceViolationSignature(String toolName, Map<String, Object> arguments) {
         if (arguments == null) return null;
         var pathObj = arguments.get("file_path");
@@ -725,6 +778,7 @@ public class AgentRunner {
     // -- Context governance --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _drop_orphan_tool_results() (runner.py:1332)
     public static void dropOrphanToolResults(List<Map<String, Object>> messages) {
         var declared = new java.util.HashSet<String>();
         for (var msg : messages) {
@@ -748,6 +802,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _backfill_missing_tool_results() (runner.py:1358)
     public static void backfillMissingToolResults(List<Map<String, Object>> messages) {
         record Declared(int assistantIdx, String callId, String name) {}
         var declared = new ArrayList<Declared>();
@@ -804,6 +859,7 @@ public class AgentRunner {
             "read_file", "exec", "grep", "find_files",
             "web_search", "web_fetch", "list_dir", "list_exec_sessions");
 
+        // 对应 Python _microcompact() (runner.py:1399)
     public static void microcompact(List<Map<String, Object>> messages) {
         // Collect indices of compactable tool results
         var compactableIndices = new ArrayList<Integer>();
@@ -830,6 +886,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _apply_tool_result_budget() (runner.py:1424)
     public void applyToolResultBudget(AgentRunSpec spec, List<Map<String, Object>> messages) {
         for (int idx = 0; idx < messages.size(); idx++) {
             var msg = messages.get(idx);
@@ -846,6 +903,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _snip_history() (runner.py:1445)
     public void snipHistory(AgentRunSpec spec, List<Map<String, Object>> messages) {
         if (messages.isEmpty() || spec.contextWindowTokens() == null || spec.contextWindowTokens() <= 0) return;
 
@@ -923,6 +981,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _find_legal_message_start — 消息列表校验 (runner.py:1504+)
     static int findLegalMessageStart(List<Map<String, Object>> messages) {
         var declared = new java.util.HashSet<String>();
         int start = 0;
@@ -950,6 +1009,7 @@ public class AgentRunner {
         return start;
     }
 
+        // 对应 Python token 估算逻辑 _snip_history() (runner.py:1480+)
     int estimatePromptTokens(List<Map<String, Object>> messages, List<Map<String, Object>> tools) {
         int total = 0;
         for (var msg : messages) {
@@ -961,6 +1021,7 @@ public class AgentRunner {
     // -- helpers --
 
     @SuppressWarnings("unchecked")
+        // 对应 Python build_assistant_message — 构造 OpenAI assistant 消息 (runner.py 内部)
     public static Map<String, Object> buildAssistantMessage(
             @Nullable String content, List<ToolCallRequest> toolCalls,
             @Nullable String reasoningContent,
@@ -985,6 +1046,7 @@ public class AgentRunner {
     }
 
     @SuppressWarnings("unchecked")
+        // 对应 Python _append_injected_messages() (runner.py:154)
     public static void appendInjectedMessages(List<Map<String, Object>> messages,
                                               List<Map<String, Object>> injections) {
         for (var injection : injections) {
@@ -1001,6 +1063,7 @@ public class AgentRunner {
         }
     }
 
+        // 对应 Python _merge_message_content() (runner.py:137)
     static Object mergeMessageContent(Object left, Object right) {
         if (left instanceof String ls && right instanceof String rs) {
             return ls.isEmpty() ? rs : ls + "\n\n" + rs;
@@ -1012,6 +1075,7 @@ public class AgentRunner {
         return result;
     }
 
+        // 对应 Python _to_blocks() 内部函数 (runner.py:141)
     private static List<Map<String, Object>> toBlocks(Object value) {
         if (value instanceof List<?> l) {
             var blocks = new ArrayList<Map<String, Object>>();
@@ -1032,6 +1096,7 @@ public class AgentRunner {
         return text == null || text.isBlank();
     }
 
+        // 对应 Python _merge_usage() (runner.py:985)
     static Map<String, Integer> mergeUsage(Map<String, Integer> base, Map<String, Integer> delta) {
         if (delta.isEmpty()) return base;
         var merged = new LinkedHashMap<>(base);
@@ -1041,12 +1106,14 @@ public class AgentRunner {
         return merged;
     }
 
+        // 对应 Python _accumulate_usage() (runner.py:980)
     public static void accumulateUsage(Map<String, Integer> target, Map<String, Integer> addition) {
         for (var entry : addition.entrySet()) {
             target.merge(entry.getKey(), entry.getValue(), Integer::sum);
         }
     }
 
+        // 对应 Python _usage_total() (runner.py:974)
     public static int usageTotal(Map<String, Integer> usage) {
         if (usage.containsKey("total_tokens")) {
             return usage.get("total_tokens");
@@ -1055,6 +1122,7 @@ public class AgentRunner {
                 + usage.getOrDefault("completion_tokens", 0);
     }
 
+        // 对应 Python _usage_dict() (runner.py:962)
     public static Map<String, Integer> usageDict(@Nullable Map<String, ?> raw) {
         if (raw == null || raw.isEmpty()) return Map.of();
         var result = new LinkedHashMap<String, Integer>();
@@ -1097,12 +1165,29 @@ public class AgentRunner {
             "path traversal detected"
     );
 
+    /** 从模型名推断 AI 系统（用于 GenAI trace 属性）。
+     *  对应 Python langfuse.openai wrapper 自动提取 provider 的逻辑。 */
+    private static String guessSystemFromModel(@Nullable String model) {
+        if (model == null) return "unknown";
+        var lowered = model.toLowerCase();
+        if (lowered.contains("claude")) return "anthropic";
+        if (lowered.contains("gpt") || lowered.contains("o1") || lowered.contains("o3") || lowered.contains("o4")) return "openai";
+        if (lowered.contains("gemini")) return "google_vertex_ai";
+        if (lowered.contains("deepseek")) return "deepseek";
+        if (lowered.contains("qwen")) return "alibaba_cloud";
+        if (lowered.contains("llama") || lowered.contains("mistral") || lowered.contains("mixtral")) return "meta";
+        if (lowered.contains("bedrock")) return "aws_bedrock";
+        return "unknown";
+    }
+
+        // 对应 Python _is_ssrf_violation() (runner.py:1206)
     public static boolean isSsrfViolation(@Nullable String text) {
         if (text == null || text.isEmpty()) return false;
         var lowered = text.toLowerCase();
         return SSRF_MARKERS.stream().anyMatch(lowered::contains);
     }
 
+        // 对应 Python _is_workspace_violation() (runner.py:1213)
     public static boolean isWorkspaceViolation(@Nullable String text) {
         if (text == null || text.isEmpty()) return false;
         var lowered = text.toLowerCase();
@@ -1110,12 +1195,14 @@ public class AgentRunner {
         return WORKSPACE_VIOLATION_MARKERS.stream().anyMatch(lowered::contains);
     }
 
+        // 对应 Python _ssrf_soft_payload() (runner.py:1263)
     public static String ssrfSoftPayload(String rawText) {
         var text = rawText.strip();
         if (text.isEmpty()) text = "Error: request blocked by SSRF guard";
         return text + "\n\n" + SSRF_BOUNDARY_NOTE;
     }
 
+        // 对应 Python _event_detail() (runner.py:1268)
     public static String eventDetail(String prefix, String text, int limit) {
         return (prefix + text.replace("\n", " ").strip()).substring(
                 0, Math.min(prefix.length() + text.replace("\n", " ").strip().length(), limit));
@@ -1123,6 +1210,7 @@ public class AgentRunner {
 
     // -- message helpers --
 
+        // 对应 Python _append_final_message() (runner.py:1281)
     public static void appendFinalMessage(List<Map<String, Object>> messages,
                                           @Nullable String content) {
         if (content == null || content.isEmpty()) return;
@@ -1136,6 +1224,7 @@ public class AgentRunner {
         messages.add(buildAssistantMessage(content, null, null, null));
     }
 
+        // 对应 Python _append_model_error_placeholder() (runner.py:1296)
     public static void appendModelErrorPlaceholder(List<Map<String, Object>> messages) {
         if (!messages.isEmpty()
                 && "assistant".equals(messages.get(messages.size() - 1).get("role"))

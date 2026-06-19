@@ -1,7 +1,7 @@
 package com.nanobot.providers.base;
 
 /**
- * Pairs an active LLM provider with a model name.
- * Mirrors Python LLMRuntime (utils/llm_runtime.py).
+ * 活跃 LLM provider 与模型名称的配对。
+ * 对应 Python LLMRuntime（utils/llm_runtime.py）。
  */
 public record LLMRuntime(LLMProvider provider, String model) {}

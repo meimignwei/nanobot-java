@@ -5,17 +5,23 @@ import com.nanobot.agent.session.Session;
 import jakarta.annotation.Nullable;
 
 /**
- * Everything a command handler needs to produce a response.
- * Mirrors Python CommandContext dataclass.
+ * 命令处理器上下文，包含命令处理所需的全部信息。
+ * 对应 Python CommandContext dataclass。
  */
 public class CommandContext {
 
+    /** 入站消息 */
     private final InboundMessage msg;
+    /** 当前会话（优先级命令可能为 null） */
     @Nullable
     private final Session session;
+    /** 会话 key */
     private final String key;
+    /** 原始命令文本（含参数） */
     private final String raw;
+    /** 命令参数（命令名之后的部分） */
     private String args;
+    /** AgentLoop 引用（部分命令需要访问 loop 状态） */
     @Nullable
     private final Object loop;
 

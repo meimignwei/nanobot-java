@@ -18,12 +18,23 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 会话持久化管理器。
+ *
+ * <p>职责：会话的 CRUD、JSONL 磁盘持久化、从损坏文件中修复、fork 会话、
+ * 以及 flushAll 批量刷盘。对应 Python SessionManager 类。</p>
+ *
+ * <p>存储格式：每会话一个 .jsonl 文件，第一行为 metadata 行（_type=metadata），
+ * 后续每行一条消息 JSON。</p>
+ */
 public class SessionManager {
 
     private static final Logger log = LoggerFactory.getLogger(SessionManager.class);
     private static final ObjectMapper mapper = new ObjectMapper();
+    /** 文件名中不允许的字符，会被替换为下划线 */
     private static final String UNSAFE_CHARS = "[<>:\"/\\\\|?*]";
 
+    /** 内存缓存：key → Session */
     private final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<>();
     private final Path workspace;
     private final Path sessionsDir;
@@ -33,20 +44,25 @@ public class SessionManager {
         this.sessionsDir = ensureDir(workspace.resolve("sessions"));
     }
 
-    // -- key safety --
+    // -- key 安全化 --
 
+    /** 将 session key 中的不安全字符替换为下划线，生成安全的文件名 */
     public static String safeKey(String key) {
         return key.replaceAll(UNSAFE_CHARS, "_").replace(":", "_").strip();
     }
 
-    // -- path helpers --
+    // -- 路径辅助 --
 
     private Path getSessionPath(String key) {
         return sessionsDir.resolve(safeKey(key) + ".jsonl");
     }
 
-    // -- cache operations --
+    // -- 缓存操作 --
 
+    /**
+     * 获取或创建会话。先从磁盘加载，失败则新建。
+     * 对应 Python get_or_create。
+     */
     public Session getOrCreate(String key) {
         return sessions.computeIfAbsent(key, k -> {
             var loaded = loadFromDisk(k);
@@ -54,21 +70,29 @@ public class SessionManager {
         });
     }
 
+    /** 从内存缓存获取会话（不从磁盘加载） */
     public Session get(String key) {
         return sessions.get(key);
     }
 
+    /** 异步保存（不执行 fsync） */
     public void save(Session session) {
         save(session, false);
     }
 
+    /**
+     * 将会话持久化到磁盘。
+     *
+     * <p>先写入 .tmp 文件，再原子 rename 到目标路径，保证写入不损坏已有数据。
+     * fsync=true 时做 best-effort 同步。</p>
+     */
     public void save(Session session, boolean fsync) {
         var path = getSessionPath(session.key());
         var tmpPath = path.resolveSibling(path.getFileName() + ".tmp");
 
         try {
             var lines = new ArrayList<String>();
-            // Metadata line
+            // 元数据行
             var meta = new LinkedHashMap<String, Object>();
             meta.put("_type", "metadata");
             meta.put("key", session.key());
@@ -77,14 +101,14 @@ public class SessionManager {
             meta.put("metadata", session.metadata());
             meta.put("last_consolidated", session.lastConsolidated());
             lines.add(mapper.writeValueAsString(meta));
-            // Message lines
+            // 消息行
             for (var msg : session.messages()) {
                 lines.add(mapper.writeValueAsString(msg));
             }
 
             Files.writeString(tmpPath, String.join("\n", lines) + "\n");
             if (fsync) {
-                // Best-effort fsync
+                // Best-effort fsync — 平台相关
             }
             Files.move(tmpPath, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
@@ -95,14 +119,17 @@ public class SessionManager {
         sessions.put(session.key(), session);
     }
 
+    /** 从内存缓存中移除会话 */
     public void invalidate(String key) {
         sessions.remove(key);
     }
 
+    /** 从内存缓存中移除（同 invalidate） */
     public void delete(String key) {
         sessions.remove(key);
     }
 
+    /** 从内存和磁盘中删除会话 */
     public void deleteSession(String key) {
         invalidate(key);
         try {
@@ -112,6 +139,7 @@ public class SessionManager {
         }
     }
 
+    /** 检查会话是否存在（先查内存缓存，再查磁盘文件） */
     public boolean exists(String key) {
         if (sessions.containsKey(key)) {
             return true;
@@ -123,8 +151,9 @@ public class SessionManager {
         return workspace;
     }
 
-    // -- flush --
+    // -- 批量刷盘 --
 
+    /** 将所有内存中的会话同步写入磁盘，返回成功刷盘的数量 */
     public int flushAll() {
         int flushed = 0;
         for (var entry : List.copyOf(sessions.entrySet())) {
@@ -138,8 +167,9 @@ public class SessionManager {
         return flushed;
     }
 
-    // -- disk I/O --
+    // -- 磁盘 I/O --
 
+    /** 从磁盘 JSONL 文件加载会话 */
     private Session loadFromDisk(String key) {
         var path = getSessionPath(key);
         if (!Files.exists(path)) {
@@ -188,10 +218,6 @@ public class SessionManager {
             session.messages().addAll(messages);
             session.metadata().putAll(metadata);
             session.setLastConsolidated(lastConsolidated);
-            // We can't set createdAt/updatedAt directly without constructor changes,
-            // but the loaded values are what matter. The Session constructor sets
-            // them to Instant.now(), which is close enough for practical purposes.
-            // The key metadata/messages/lastConsolidated are faithfully restored.
             return session;
         } catch (IOException e) {
             log.warn("Failed to load session {}: {}", key, e.getMessage());
@@ -199,6 +225,10 @@ public class SessionManager {
         }
     }
 
+    /**
+     * 从损坏的 JSONL 文件中修复会话。
+     * 跳过无法解析的行，尽力恢复可读的消息和元数据。
+     */
     private Session repairFromDisk(String key) {
         var path = getSessionPath(key);
         if (!Files.exists(path)) {
@@ -264,6 +294,7 @@ public class SessionManager {
         }
     }
 
+    /** 列出所有磁盘上的会话，按更新时间倒序排列 */
     public List<Map<String, Object>> listSessions() {
         var sessions = new ArrayList<Map<String, Object>>();
         try (var stream = Files.newDirectoryStream(sessionsDir, "*.jsonl")) {
@@ -285,7 +316,7 @@ public class SessionManager {
                     info.put("updated_at", data.get("updated_at"));
                     info.put("path", path.toString());
 
-                    // Read preview text
+                    // 读取预览文本（优先 user 消息，其次 assistant）
                     String preview = "";
                     for (int i = 1; i < lines.size(); i++) {
                         @SuppressWarnings("unchecked")
@@ -305,7 +336,7 @@ public class SessionManager {
                     info.put("preview", preview);
                     sessions.add(info);
                 } catch (Exception e) {
-                    // Repair and include a basic entry
+                    // 修复并加入基本信息
                     var repaired = repairFromDisk(fallbackKey);
                     if (repaired != null) {
                         var info = new LinkedHashMap<String, Object>();
@@ -326,6 +357,7 @@ public class SessionManager {
         return sessions;
     }
 
+    /** 读取会话文件的完整内容（元数据 + 消息列表） */
     public Map<String, Object> readSessionFile(String key) {
         var path = getSessionPath(key);
         if (!Files.exists(path)) return null;
@@ -380,6 +412,14 @@ public class SessionManager {
         }
     }
 
+    /**
+     * Fork 会话：在指定 user 消息之前截断，创建新的目标会话。
+     *
+     * @param sourceKey      源会话 key
+     * @param targetKey      目标会话 key
+     * @param beforeUserIndex 在第几个 user 消息前截断
+     * @return 包含 key 和 messages 的 Map，失败返回 null
+     */
     public Map<String, Object> forkSessionBeforeUserIndex(
             String sourceKey, String targetKey, int beforeUserIndex) {
         if (beforeUserIndex < 0) return null;
@@ -405,6 +445,7 @@ public class SessionManager {
         }
         if (!foundTarget) return null;
 
+        // 清除易失性元数据
         var newMetadata = new LinkedHashMap<>(source.metadata());
         for (var volatileKey : List.of("goal_state", "pending_user_turn", "runtime_checkpoint",
                 "thread_goal", "title", "title_user_edited")) {
@@ -425,8 +466,9 @@ public class SessionManager {
         return Map.of("key", targetKey, "messages", copied);
     }
 
-    // -- internal helpers --
+    // -- 内部辅助 --
 
+    /** 确保目录存在，不存在则创建 */
     static Path ensureDir(Path path) {
         try {
             return Files.createDirectories(path);
@@ -435,6 +477,7 @@ public class SessionManager {
         }
     }
 
+    /** 安全解析 ISO 时间戳，失败返回当前时间 */
     static Instant parseInstant(String isoString) {
         if (isoString == null || isoString.isEmpty()) return Instant.now();
         try {

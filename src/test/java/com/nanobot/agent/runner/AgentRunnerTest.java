@@ -394,6 +394,105 @@ class AgentRunnerTest {
         assertThat(messages).hasSize(2);
     }
 
+    // -- classifyViolation --
+
+    @Test
+    void classifyViolationReturnsSsrfPayload() {
+        var runner = new AgentRunner(new ConcreteStub());
+        var toolCall = new com.nanobot.providers.base.ToolCallRequest(
+                "call-1", "web_fetch", Map.of("url", "http://internal"),
+                null, null, null);
+        var event = new java.util.LinkedHashMap<String, Object>();
+        event.put("name", "web_fetch");
+        event.put("status", "error");
+
+        var result = runner.classifyViolation(
+                "internal/private url detected",
+                "soft payload", event, toolCall, new java.util.HashMap<>());
+
+        assertThat(result).isNotNull();
+        assertThat(result.get("content").toString()).contains("non-bypassable security boundary");
+    }
+
+    @Test
+    void classifyViolationReturnsNullForNormalError() {
+        var runner = new AgentRunner(new ConcreteStub());
+        var toolCall = new com.nanobot.providers.base.ToolCallRequest(
+                "call-1", "grep", Map.of("pattern", "test"), null, null, null);
+        var event = new java.util.LinkedHashMap<String, Object>();
+
+        var result = runner.classifyViolation(
+                "Error: file not found",
+                "soft", event, toolCall, new java.util.HashMap<>());
+
+        assertThat(result).isNull();
+    }
+
+    @Test
+    void classifyViolationReturnsWorkspacePayload() {
+        var runner = new AgentRunner(new ConcreteStub());
+        var toolCall = new com.nanobot.providers.base.ToolCallRequest(
+                "call-1", "read_file", Map.of("file_path", "/etc/passwd"),
+                null, null, null);
+        var event = new java.util.LinkedHashMap<String, Object>();
+
+        var result = runner.classifyViolation(
+                "path outside working dir",
+                "soft payload", event, toolCall, new java.util.HashMap<>());
+
+        assertThat(result).isNotNull();
+        assertThat(result.get("content")).isEqualTo("soft payload");
+    }
+
+    // -- repeatedExternalLookupError --
+
+    @Test
+    void repeatedExternalLookupErrorBlocksAfterMax() {
+        var counts = new java.util.HashMap<String, Integer>();
+        counts.put("web_fetch:http://test.com", 2);
+        var result = AgentRunner.repeatedExternalLookupError(
+                "web_fetch", Map.of("url", "http://test.com"), counts);
+        assertThat(result).isNotNull().contains("Repeated external lookup blocked");
+    }
+
+    @Test
+    void repeatedExternalLookupErrorReturnsNullBelowMax() {
+        var result = AgentRunner.repeatedExternalLookupError(
+                "web_fetch", Map.of("url", "http://new.com"), new java.util.HashMap<>());
+        assertThat(result).isNull();
+    }
+
+    // -- repeatedWorkspaceViolationError --
+
+    @Test
+    void repeatedWorkspaceViolationErrorEscalatesAfterMax() {
+        var counts = new java.util.HashMap<String, Integer>();
+        counts.put("read_file:/etc/passwd", 2);
+        var result = AgentRunner.repeatedWorkspaceViolationError(
+                "read_file", Map.of("file_path", "/etc/passwd"), counts);
+        assertThat(result).isNotNull().contains("refusing repeated workspace-bypass");
+    }
+
+    @Test
+    void repeatedWorkspaceViolationErrorReturnsNullBelowMax() {
+        var result = AgentRunner.repeatedWorkspaceViolationError(
+                "read_file", Map.of("file_path", "/tmp/test"), new java.util.HashMap<>());
+        assertThat(result).isNull();
+    }
+
+    /** Concrete stub for testing. */
+    private static class ConcreteStub extends StubProvider {
+        @Override
+        public LLMResponse chat(List<Map<String, Object>> messages,
+                                List<Map<String, Object>> tools, String model,
+                                int maxTokens, double temperature,
+                                String reasoningEffort, Object toolChoice) {
+            calls.add(messages);
+            return new LLMResponse("ok", List.of(), "stop", Map.of(),
+                    null, null, null, null, null, null, null, null, null);
+        }
+    }
+
     /** Abstract stub that records chat calls. */
     private abstract static class StubProvider extends LLMProvider {
         final List<List<Map<String, Object>>> calls = new ArrayList<>();

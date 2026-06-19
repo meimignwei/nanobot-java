@@ -12,29 +12,29 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 /**
- * Shell command execution tool.
- * Port of Python ExecTool (shell.py, 678 lines) — simplified for P3.
+ * Shell 命令执行工具。
+ * 对应 Python ExecTool（shell.py，678 行）— P3 简化版。
  *
- * Differences from Python (to be addressed in later phases):
- * - No async subprocess (Java ProcessBuilder is synchronous; virtual threads handle concurrency)
- * - No session mode (yield_time_ms / write_stdin — requires ExecSession infrastructure)
- * - No sandbox integration (bubblewrap — P4+)
- * - Simplified security guards (core deny patterns only)
- * - No internal URL detection (requires network security module)
+ * <p>与 Python 的差异（后续阶段处理）：
+ * - 无异步子进程（Java ProcessBuilder 同步；虚拟线程处理并发）
+ * - 无 session 模式（yield_time_ms/write_stdin — 需要 ExecSession 基础设施）
+ * - 无 sandbox 集成（bubblewrap — P4+）
+ * - 简化安全守卫（仅核心 deny 模式）
+ * - 无内部 URL 检测（需要网络安全模块）</p>
  */
 @Component
 public class ExecTool extends Tool {
 
     private static final Logger log = LoggerFactory.getLogger(ExecTool.class);
 
-    // _scopes matching Python
+    /** 作用域，匹配 Python */
     @SuppressWarnings("unused")
     private static final Set<String> _scopes = Set.of("core", "subagent");
 
     private static final int MAX_TIMEOUT = 600;
     private static final int DEFAULT_MAX_OUTPUT = 10_000;
 
-    // Port of Python deny patterns (core destructive commands)
+    /** 危险命令拒绝模式（对应 Python deny patterns） */
     private static final List<Pattern> DENY_PATTERNS = List.of(
             Pattern.compile("\\brm\\s+-[rf]{1,2}\\b"),
             Pattern.compile("\\bdel\\s+/[fq]\\b"),
@@ -52,6 +52,7 @@ public class ExecTool extends Tool {
             Pattern.compile("\\bsed\\s+-i[^|;&<>]*(?:history\\.jsonl|\\.dream_cursor)")
     );
 
+    /** 安全 device 路径 */
     private static final Set<String> BENIGN_DEVICE_PATHS = Set.of(
             "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
             "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"
@@ -92,7 +93,7 @@ public class ExecTool extends Tool {
         this.allowPatterns = allowPatternsRaw != null
                 ? allowPatternsRaw.stream().map(Pattern::compile).toList()
                 : List.of();
-        // Merge built-in deny patterns with user-supplied ones
+        // 合并内置 deny 和用户提供的 deny
         List<Pattern> merged = new ArrayList<>(DENY_PATTERNS);
         if (denyPatternsRaw != null) {
             denyPatternsRaw.stream().map(Pattern::compile).forEach(merged::add);
@@ -111,11 +112,10 @@ public class ExecTool extends Tool {
 
     @Override
     @SuppressWarnings("unchecked")
-    public Class<?> configClass() { return null; } // ExecToolConfig not yet ported
+    public Class<?> configClass() { return null; } // ExecToolConfig 尚未移植
 
     @Override
     public boolean isEnabled(ToolContext ctx) {
-        // Port of Python: ctx.config.exec.enable
         return true;
     }
 
@@ -148,6 +148,7 @@ public class ExecTool extends Tool {
         );
     }
 
+    /** 执行命令。对应 Python ExecTool.execute()。 */
     @Override
     public Object execute(Map<String, Object> params, ToolContext ctx) throws Exception {
         String command = (String) params.getOrDefault("command", params.get("cmd"));
@@ -159,23 +160,23 @@ public class ExecTool extends Tool {
             return "Error: Missing command. Provide command or cmd.";
         }
 
-        // Guard against destructive commands
+        // 危险命令守卫
         String guardError = guardCommand(command);
         if (guardError != null) return guardError;
 
-        // Resolve timeout
+        // 解析超时
         int effectiveTimeout = resolveTimeout(timeoutSec);
-        // Resolve cwd
+        // 解析工作目录
         String effectiveCwd = cwd != null ? cwd : (workingDir != null ? workingDir : System.getProperty("user.dir"));
 
-        // Resolve shell
+        // 解析 shell
         String shellPath = resolveShell(shell);
         if (shellPath != null && shellPath.startsWith("Error")) return shellPath;
 
-        // Build environment
+        // 构建环境变量
         Map<String, String> env = buildEnv();
 
-        // Build command with path prepend/append
+        // 构建带 PATH 导出的命令
         String finalCommand = wrapPathExport(command, env);
 
         ProcessBuilder pb;
@@ -225,6 +226,7 @@ public class ExecTool extends Tool {
             result.append("\nExit code: ").append(process.exitValue());
 
             String output = result.toString();
+            // 输出截断：保留头尾各一半
             if (output.length() > DEFAULT_MAX_OUTPUT) {
                 int half = DEFAULT_MAX_OUTPUT / 2;
                 output = output.substring(0, half)
@@ -237,18 +239,21 @@ public class ExecTool extends Tool {
         }
     }
 
-    // ---- Internal helpers ----
+    // ---- 内部辅助方法 ----
 
+    /** 解析超时时间 */
     private int resolveTimeout(Integer perCallTimeout) {
         if (perCallTimeout != null && perCallTimeout > 0) return Math.min(perCallTimeout, MAX_TIMEOUT);
         if (configTimeout > 0) return configTimeout;
         return 60;
     }
 
+    /** 危险命令守卫：allowlist 优先，再检查 denylist。
+     *  对应 Python ExecTool._guard_command()。 */
     private String guardCommand(String command) {
         String lower = command.strip().toLowerCase();
 
-        // allow_patterns take priority
+        // allow_patterns 优先
         boolean explicitlyAllowed = !allowPatterns.isEmpty()
                 && allowPatterns.stream().anyMatch(p -> p.matcher(lower).find());
         if (explicitlyAllowed) return null;
@@ -263,7 +268,7 @@ public class ExecTool extends Tool {
             return "Error: Command blocked by allowlist filter (not in allowlist)";
         }
 
-        // Path traversal check when restrictToWorkspace is enabled
+        // 工作区限制下的路径穿越检查
         if (restrictToWorkspace) {
             if (command.contains("..\\") || command.contains("../")) {
                 return "Error: Command blocked by safety guard (path traversal detected)";
@@ -273,6 +278,7 @@ public class ExecTool extends Tool {
         return null;
     }
 
+    /** 查找可用的 bash */
     private static String findBash() {
         for (String path : List.of("/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash")) {
             if (Files.isExecutable(Path.of(path))) return path;
@@ -280,6 +286,7 @@ public class ExecTool extends Tool {
         return "/bin/sh";
     }
 
+    /** 解析 shell 参数 */
     private String resolveShell(String shell) {
         if (shell == null) return null;
         String os = System.getProperty("os.name").toLowerCase();
@@ -309,6 +316,7 @@ public class ExecTool extends Tool {
         return resolved;
     }
 
+    /** 在 PATH 中查找可执行文件 */
     private static String findInPath(String executable) {
         return java.util.stream.Stream.of(System.getenv("PATH").split(File.pathSeparator))
                 .map(dir -> Path.of(dir, executable))
@@ -318,6 +326,7 @@ public class ExecTool extends Tool {
                 .orElse(null);
     }
 
+    /** 构建环境变量 */
     private Map<String, String> buildEnv() {
         String os = System.getProperty("os.name").toLowerCase();
         boolean isWindows = os.contains("win");
@@ -337,7 +346,6 @@ public class ExecTool extends Tool {
             env.put("LANG", System.getenv().getOrDefault("LANG", "C.UTF-8"));
             env.put("TERM", System.getenv().getOrDefault("TERM", "dumb"));
             env.put("PYTHONUNBUFFERED", "1");
-            // Forward PATH so bash -l can extend it
             String path = System.getenv("PATH");
             if (path != null) env.put("PATH", path);
         }
@@ -349,6 +357,7 @@ public class ExecTool extends Tool {
         return env;
     }
 
+    /** 包装 PATH 导出到命令前 */
     private String wrapPathExport(String command, Map<String, String> env) {
         if (pathPrepend.isEmpty() && pathAppend.isEmpty()) return command;
         String os = System.getProperty("os.name").toLowerCase();

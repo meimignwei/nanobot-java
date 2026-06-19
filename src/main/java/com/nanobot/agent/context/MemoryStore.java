@@ -20,8 +20,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md.
- * Mirrors Python MemoryStore class.
+ * 记忆文件纯 I/O：MEMORY.md、history.jsonl、SOUL.md、USER.md 的读写。
+ * 对应 Python MemoryStore 类（agent/memory.py）。
+ *
+ * <p>职责：长期记忆读写、历史 JSONL 追加/游标/截断、新近历史读取供 prompt 注入、
+ * think/thought 标签清洗、文件数量控制。</p>
  */
 public class MemoryStore {
 
@@ -29,10 +32,12 @@ public class MemoryStore {
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
+    /** 内部历史 session key（心跳等），不注入用户 prompt */
     private static final Set<String> INTERNAL_HISTORY_SESSION_KEYS = Set.of("heartbeat");
+    /** 内部历史 session 前缀（cron:、dream:） */
     private static final Set<String> INTERNAL_HISTORY_SESSION_PREFIXES = Set.of("cron:", "dream:");
 
-    // strip_think patterns (simplified subset)
+    // think/thought 标签清洗正则，对应 Python _strip_think()
     private static final Pattern THINK_BLOCK = Pattern.compile("<think>[\\s\\S]*?</think>");
     private static final Pattern THOUGHT_BLOCK = Pattern.compile("<thought>[\\s\\S]*?</thought>");
     private static final Pattern UNCLOSED_THINK = Pattern.compile("^\\s*<think>[\\s\\S]*$");
@@ -47,9 +52,12 @@ public class MemoryStore {
     private final Path historyFile;
     private final Path soulFile;
     private final Path userFile;
+    /** history.jsonl 自增游标文件 */
     private final Path cursorFile;
+    /** dream 处理游标文件 */
     private final Path dreamCursorFile;
     private final int maxHistoryEntries;
+    /** history 追加锁，保证游标和写入的原子性 */
     private final ReentrantLock appendLock = new ReentrantLock();
 
     private boolean corruptionLogged;
@@ -72,37 +80,49 @@ public class MemoryStore {
     }
 
     // -- MEMORY.md --
+    // 对应 Python MemoryStore.read_memory() / write_memory()
 
+    /** 读取长期记忆文件 */
     public String readMemory() {
         return readFile(memoryFile);
     }
 
+    /** 写入长期记忆文件 */
     public void writeMemory(String content) {
         writeFile(memoryFile, content);
     }
 
     // -- SOUL.md --
+    // 对应 Python MemoryStore.read_soul() / write_soul()
 
+    /** 读取 SOUL.md */
     public String readSoul() {
         return readFile(soulFile);
     }
 
+    /** 写入 SOUL.md */
     public void writeSoul(String content) {
         writeFile(soulFile, content);
     }
 
     // -- USER.md --
+    // 对应 Python MemoryStore.read_user() / write_user()
 
+    /** 读取 USER.md */
     public String readUser() {
         return readFile(userFile);
     }
 
+    /** 写入 USER.md */
     public void writeUser(String content) {
         writeFile(userFile, content);
     }
 
     // -- context injection --
+    // 对应 Python MemoryStore.get_memory_context()
 
+    /** 获取记忆上下文，用于注入系统提示词。
+     *  对应 Python MemoryStore.get_memory_context()。 */
     public String getMemoryContext() {
         var longTerm = readMemory();
         if (longTerm.isEmpty()) return "";
@@ -110,11 +130,17 @@ public class MemoryStore {
     }
 
     // -- history.jsonl --
+    // 对应 Python MemoryStore.append_history() / read_unprocessed_history()
 
+    /** 追加历史条目（无字符限制、无 session key） */
     public int appendHistory(String entry) {
         return appendHistory(entry, null, null);
     }
 
+    /**
+     * 追加历史条目到 history.jsonl，自动分配游标、清洗 think 标签。
+     * 对应 Python MemoryStore.append_history()。
+     */
     public int appendHistory(String entry, Integer maxChars, String sessionKey) {
         int limit = maxChars != null ? maxChars : 64_000;
         var ts = LocalDateTime.now().format(TS_FMT);
@@ -155,6 +181,8 @@ public class MemoryStore {
         }
     }
 
+    /** 读取指定游标之后的未处理历史记录。
+     *  对应 Python MemoryStore.read_unprocessed_history()。 */
     public List<Map<String, Object>> readUnprocessedHistory(int sinceCursor) {
         var result = new ArrayList<Map<String, Object>>();
         for (var entry : readEntries()) {
@@ -179,6 +207,8 @@ public class MemoryStore {
         return result;
     }
 
+    /** 读取最近历史供 prompt 注入，按 unified 标志过滤内部 session。
+     *  对应 Python MemoryStore.read_recent_history_for_prompt()。 */
     public List<Map<String, Object>> readRecentHistoryForPrompt(
             int sinceCursor, String sessionKey, boolean unified) {
         var entries = readUnprocessedHistory(sinceCursor);
@@ -196,6 +226,8 @@ public class MemoryStore {
                 .toList();
     }
 
+    /** 压缩 history.jsonl，仅保留最近 maxHistoryEntries 条记录。
+     *  对应 Python MemoryStore.compact_history()。 */
     public void compactHistory() {
         if (maxHistoryEntries <= 0) return;
         var entries = readEntries();
@@ -205,7 +237,9 @@ public class MemoryStore {
     }
 
     // -- dream cursor --
+    // 对应 Python MemoryStore.get_last_dream_cursor() / set_last_dream_cursor()
 
+    /** 获取最后处理的 dream 游标 */
     public int getLastDreamCursor() {
         try {
             if (Files.exists(dreamCursorFile)) {
@@ -215,12 +249,16 @@ public class MemoryStore {
         return 0;
     }
 
+    /** 设置最后处理的 dream 游标 */
     public void setLastDreamCursor(int cursor) {
         writeFile(dreamCursorFile, String.valueOf(cursor));
     }
 
     // -- internal helpers --
+    // 对应 Python MemoryStore._next_cursor()
 
+    /** 计算下一条历史记录的游标值。
+     *  对应 Python MemoryStore._next_cursor()。 */
     private int nextCursor() {
         if (Files.exists(cursorFile)) {
             try {
@@ -240,6 +278,7 @@ public class MemoryStore {
         return max + 1;
     }
 
+    /** 读取 history.jsonl 全部条目 */
     private List<Map<String, Object>> readEntries() {
         var entries = new ArrayList<Map<String, Object>>();
         if (!Files.exists(historyFile)) return entries;
@@ -259,6 +298,7 @@ public class MemoryStore {
         return entries;
     }
 
+    /** 读取 history.jsonl 最后一条记录（只读尾部 4KB） */
     private Map<String, Object> readLastEntry() {
         if (!Files.exists(historyFile)) return null;
         try {
@@ -277,6 +317,7 @@ public class MemoryStore {
         }
     }
 
+    /** 原子写入条目列表到 history.jsonl */
     private void writeEntries(List<Map<String, Object>> entries) {
         var tmpPath = Path.of(historyFile + ".tmp");
         try {
@@ -293,7 +334,10 @@ public class MemoryStore {
     }
 
     // -- static helpers --
+    // 对应 Python MemoryStore._is_internal_history_session()
 
+    /** 判断是否为内部历史 session（心跳、cron、dream 等不暴露给用户的会话）。
+     *  对应 Python MemoryStore._is_internal_history_session()。 */
     static boolean isInternalHistorySession(String sessionKey) {
         if (sessionKey == null) return false;
         if (INTERNAL_HISTORY_SESSION_KEYS.contains(sessionKey)) return true;
@@ -303,6 +347,8 @@ public class MemoryStore {
         return false;
     }
 
+    /** 清洗文本中的 think/thought 标签及 channel 标记。
+     *  对应 Python MemoryStore._strip_think()。 */
     static String stripThink(String text) {
         text = THINK_BLOCK.matcher(text).replaceAll("");
         text = UNCLOSED_THINK.matcher(text).replaceAll("");
@@ -314,11 +360,14 @@ public class MemoryStore {
         return text.strip();
     }
 
+    /** 截断文本到指定字符数。
+     *  对应 Python MemoryStore._truncate_text()。 */
     static String truncateText(String text, int maxChars) {
         if (maxChars <= 0 || text.length() <= maxChars) return text;
         return text.substring(0, maxChars) + "\n... (truncated)";
     }
 
+    /** 读取文件内容，不存在返回空字符串 */
     static String readFile(Path path) {
         try {
             return Files.readString(path);
@@ -327,6 +376,7 @@ public class MemoryStore {
         }
     }
 
+    /** 写入文件内容 */
     static void writeFile(Path path, String content) {
         try {
             Files.writeString(path, content);
@@ -335,6 +385,7 @@ public class MemoryStore {
         }
     }
 
+    /** 确保目录存在 */
     static Path ensureDir(Path path) {
         try {
             return Files.createDirectories(path);

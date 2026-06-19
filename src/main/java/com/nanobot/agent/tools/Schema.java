@@ -5,11 +5,15 @@ import jakarta.annotation.Nullable;
 import java.util.*;
 
 /**
- * Abstract base for JSON Schema fragments describing tool parameters.
- * Port of Python Schema (base.py lines 28-122) + concrete types (schema.py).
+ * JSON Schema 片段抽象基类，描述工具参数。
+ * 对应 Python Schema（base.py 行 28-122）+ 具体类型（schema.py）。
+ *
+ * <p>提供：JSON Schema 类型解析、值校验（validateJsonSchemaValue）、
+ * 具体 schema 类型（StringSchema、IntegerSchema、BooleanSchema、ArraySchema、ObjectSchema）。</p>
  */
 public abstract class Schema {
 
+    /** JSON Schema type → Java 类型映射 */
     static final Map<String, Set<Class<?>>> JSON_TYPE_MAP = Map.of(
             "string", Set.of(String.class),
             "integer", Set.of(Integer.class, Long.class),
@@ -19,8 +23,10 @@ public abstract class Schema {
             "object", Set.of(Map.class)
     );
 
-    // ---- Static helpers (Python Schema.resolve_json_schema_type / subpath) ----
+    // ---- 静态辅助方法（对应 Python Schema.resolve_json_schema_type / subpath） ----
 
+    /** 解析 JSON Schema type 字段（支持 ["string","null"] 数组形式）。
+     *  对应 Python resolve_json_schema_type()。 */
     @Nullable
     public static String resolveJsonSchemaType(Object t) {
         if (t instanceof List<?> list) {
@@ -33,13 +39,14 @@ public abstract class Schema {
         return t != null ? t.toString() : null;
     }
 
+    /** 构建嵌套路径，如 "parent.child" */
     public static String subpath(String path, String key) {
         return !path.isEmpty() ? path + "." + key : key;
     }
 
     /**
-     * Validate a value against a JSON Schema fragment.
-     * Port of Python Schema.validate_json_schema_value.
+     * 按 JSON Schema 片段校验值。
+     * 对应 Python Schema.validate_json_schema_value。
      */
     @SuppressWarnings("unchecked")
     public static List<String> validateJsonSchemaValue(
@@ -141,8 +148,8 @@ public abstract class Schema {
     }
 
     /**
-     * Normalize a Schema instance or dict to a JSON Schema fragment.
-     * Port of Python Schema.fragment.
+     * 将 Schema 实例或 Map 规范化为 JSON Schema 片段。
+     * 对应 Python Schema.fragment。
      */
     @SuppressWarnings("unchecked")
     public static Map<String, Object> fragment(Object value) {
@@ -151,16 +158,19 @@ public abstract class Schema {
         throw new IllegalArgumentException("Expected schema object or dict, got " + value.getClass().getSimpleName());
     }
 
-    // ---- Abstract ----
+    // ---- 抽象方法 ----
 
+    /** 转为 JSON Schema Map */
     public abstract Map<String, Object> toJsonSchema();
 
+    /** 校验值 */
     public List<String> validateValue(Object value, String path) {
         return validateJsonSchemaValue(value, toJsonSchema(), path);
     }
 
-    // ---- Concrete schema types ----
+    // ---- 具体 schema 类型 ----
 
+    /** 字符串类型 schema */
     public static class StringSchema extends Schema {
         private final String description;
         @Nullable private final Integer minLength, maxLength;
@@ -193,6 +203,7 @@ public abstract class Schema {
         }
     }
 
+    /** 整数类型 schema */
     public static class IntegerSchema extends Schema {
         private final String description;
         @Nullable private final Integer minimum, maximum;
@@ -225,6 +236,7 @@ public abstract class Schema {
         }
     }
 
+    /** 布尔类型 schema */
     public static class BooleanSchema extends Schema {
         private final String description;
         @Nullable private final Boolean defaultValue;
@@ -250,6 +262,7 @@ public abstract class Schema {
         }
     }
 
+    /** 数组类型 schema */
     public static class ArraySchema extends Schema {
         private final Schema itemsSchema;
         private final String description;
@@ -282,6 +295,7 @@ public abstract class Schema {
         }
     }
 
+    /** 对象类型 schema */
     public static class ObjectSchema extends Schema {
         private final Map<String, Object> propRaw;
         private final List<String> required;
@@ -317,8 +331,8 @@ public abstract class Schema {
     }
 
     /**
-     * Convenience: build root tool parameters schema.
-     * Port of Python tool_parameters_schema.
+     * 便捷方法：构建根工具参数 schema。
+     * 对应 Python tool_parameters_schema。
      */
     public static Map<String, Object> toolParametersSchema(
             List<String> required, String description, Map<String, Object> properties) {

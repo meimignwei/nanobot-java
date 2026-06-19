@@ -5,8 +5,11 @@ import jakarta.annotation.Nullable;
 import java.util.Map;
 
 /**
- * Runtime context for tool construction and execution.
- * Port of Python ToolContext (context.py).
+ * 工具构建和执行时的运行时上下文。
+ * 对应 Python ToolContext（context.py）。
+ *
+ * <p>提供配置、工作区、消息总线、子代理管理器、会话管理器、文件状态存储、
+ * 时区等全局依赖。通过 ThreadLocal 绑定到当前线程。</p>
  */
 public class ToolContext {
 
@@ -36,15 +39,18 @@ public class ToolContext {
     @Nullable public Object fileStateStore() { return fileStateStore; }
     public String timezone() { return timezone; }
 
-    // ---- Thread-local binding (port of Python ContextVar) ----
+    // ---- ThreadLocal 绑定（对应 Python ContextVar） ----
 
     private static final ThreadLocal<ToolContext> CURRENT = new ThreadLocal<>();
 
+    /** 绑定到当前线程。对应 Python ctx.set()。 */
     public static void bind(ToolContext ctx) { CURRENT.set(ctx); }
+    /** 获取当前线程绑定的上下文。对应 Python ctx.get()。 */
     @Nullable public static ToolContext current() { return CURRENT.get(); }
+    /** 解绑。对应 Python ctx.reset()。 */
     public static void unbind() { CURRENT.remove(); }
 
-    /** Convenience factory that returns a minimal tool context for testing. */
+    /** 便捷工厂：返回测试用最小 ToolContext */
     public static ToolContext create() {
         return builder().config(Map.of()).workspace(".").build();
     }

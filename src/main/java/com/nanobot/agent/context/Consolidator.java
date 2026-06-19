@@ -14,16 +14,24 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Lightweight consolidation: summarizes evicted messages into history.jsonl.
- * Mirrors Python Consolidator class (agent/memory.py lines 602-1016).
+ * 轻量级会话压缩器：将超出 token 预算的旧消息压缩成摘要写入 history.jsonl。
+ * 对应 Python Consolidator 类（agent/memory.py 行 602-1016）。
+ *
+ * <p>核心流程：估算 prompt token → 与 inputTokenBudget 比较 →
+ * 按 user turn 边界切分 → 调用 LLM 压缩 → 更新 session.lastConsolidated。
+ * 支持 replay-window 溢出压缩和空闲会话压缩（compactIdleSession）。</p>
  */
 public class Consolidator {
 
     private static final Logger log = LoggerFactory.getLogger(Consolidator.class);
 
+    /** 每轮 consolidate 最大压缩轮次 */
     static final int MAX_CONSOLIDATION_ROUNDS = 5;
+    /** token 预算安全余量 */
     static final int SAFETY_BUFFER = 1024;
+    /** raw archive 最大字符数 */
     static final int RAW_ARCHIVE_MAX_CHARS = 16_000;
+    /** archive 摘要最大字符数 */
     static final int ARCHIVE_SUMMARY_MAX_CHARS = 8_000;
 
     private final MemoryStore store;
@@ -33,12 +41,16 @@ public class Consolidator {
     private final int maxCompletionTokens;
     private final double consolidationRatio;
     private final boolean unifiedSession;
+    /** 用于构建 probe 消息的函数引用，对应 Python 的 build_messages 回调 */
     private final BuildMessagesFunction buildMessages;
+    /** 工具定义提供者，对应 Python 的 get_tool_definitions 回调 */
     private final java.util.function.Supplier<List<Map<String, Object>>> getToolDefinitions;
 
     private String model;
+    /** 按 session key 分片的压缩锁，避免同一会话并发压缩 */
     private final ConcurrentHashMap<String, ReentrantLock> locks = new ConcurrentHashMap<>();
 
+    /** 消息构建函数式接口，对应 Python build_messages 回调签名 */
     @FunctionalInterface
     public interface BuildMessagesFunction {
         List<Map<String, Object>> build(
@@ -76,18 +88,28 @@ public class Consolidator {
         this.getToolDefinitions = getToolDefinitions;
     }
 
+    /** 更新 provider 引用（provider 快照切换时调用）。
+     *  对应 Python Consolidator.set_provider()。 */
     public void setProvider(ConsolidatorProvider provider, String model, int contextWindowTokens) {
         this.provider = provider;
         this.model = model;
         this.contextWindowTokens = contextWindowTokens;
     }
 
+    /** 获取 session 对应的压缩锁。
+     *  对应 Python Consolidator._get_lock()。 */
     public ReentrantLock getLock(String sessionKey) {
         return locks.computeIfAbsent(sessionKey, k -> new ReentrantLock());
     }
 
     // -- pickConsolidationBoundary --
+    // 对应 Python Consolidator._pick_consolidation_boundary()
 
+    /**
+     * 选取压缩边界：从未 consolidate 的消息中按 user turn 切分，
+     * 累计 token 数达到 tokensToRemove 时返回边界索引。
+     * 对应 Python Consolidator._pick_consolidation_boundary()。
+     */
     public int[] pickConsolidationBoundary(Session session, int tokensToRemove) {
         int start = session.lastConsolidated();
         var messages = session.messages();
@@ -109,7 +131,10 @@ public class Consolidator {
     }
 
     // -- fullUnconsolidatedHistory --
+    // 对应 Python Consolidator._full_unconsolidated_history()
 
+    /** 获取全部未 consolidate 的历史消息（经 getHistory 清洗）。
+     *  对应 Python Consolidator._full_unconsolidated_history()。 */
     static List<Map<String, Object>> fullUnconsolidatedHistory(Session session, boolean includeTimestamps) {
         int unconsolidatedCount = session.messages().size() - session.lastConsolidated();
         if (unconsolidatedCount <= 0) return List.of();
@@ -117,7 +142,13 @@ public class Consolidator {
     }
 
     // -- estimateSessionPromptTokens --
+    // 对应 Python Consolidator.estimate_session_prompt_tokens()
 
+    /**
+     * 估算当前会话的 prompt token 数。
+     * 返回 [tokens, source] — source 标识估算来源（如 10=provider）。
+     * 对应 Python Consolidator.estimate_session_prompt_tokens()。
+     */
     public int[] estimateSessionPromptTokens(Session session) {
         var history = fullUnconsolidatedHistory(session, true);
         String channel = null, chatId = null;
@@ -142,19 +173,25 @@ public class Consolidator {
     }
 
     // -- inputTokenBudget --
+    // 对应 Python Consolidator.input_token_budget()
 
+    /** 计算可用于 prompt 的 token 预算。
+     *  对应 Python Consolidator.input_token_budget() property。 */
     public int inputTokenBudget() {
         return contextWindowTokens - maxCompletionTokens - SAFETY_BUFFER;
     }
 
     // -- truncateToTokenBudget --
+    // 对应 Python Consolidator._truncate_to_token_budget()
 
+    /** 按 token 预算截断文本。
+     *  对应 Python Consolidator._truncate_to_token_budget()。 */
     public String truncateToTokenBudget(String text) {
         int budget = inputTokenBudget();
         if (budget <= 0) {
             return MemoryStore.truncateText(text, RAW_ARCHIVE_MAX_CHARS);
         }
-        // Java has no tiktoken; use char/4 ratio
+        // Java 无 tiktoken，使用 ~4 字符/token 估算
         int estimated = text.length() / 4;
         if (estimated <= budget) return text;
         int charLimit = budget * 4;
@@ -162,7 +199,12 @@ public class Consolidator {
     }
 
     // -- archive --
+    // 对应 Python Consolidator._archive()
 
+    /**
+     * 调用 LLM 将消息列表压缩为摘要。
+     * 对应 Python Consolidator._archive()。
+     */
     public String archive(List<Map<String, Object>> messages, @Nullable String sessionKey) {
         if (messages == null || messages.isEmpty()) return null;
         try {
@@ -186,7 +228,10 @@ public class Consolidator {
     }
 
     // -- rawArchive --
+    // 对应 Python Consolidator._raw_archive()
 
+    /** 降级方案：直接将原始消息文本写入 history（LLM 压缩失败时）。
+     *  对应 Python Consolidator._raw_archive()。 */
     void rawArchive(List<Map<String, Object>> messages, @Nullable String sessionKey) {
         var formatted = truncateToTokenBudget(formatMessages(messages));
         formatted = MemoryStore.truncateText(
@@ -196,7 +241,13 @@ public class Consolidator {
     }
 
     // -- maybeConsolidateByTokens --
+    // 对应 Python Consolidator.maybe_consolidate_by_tokens()
 
+    /**
+     * 根据 token 预算判断是否需要压缩，最多执行 MAX_CONSOLIDATION_ROUNDS 轮。
+     * 先处理 replay-window 溢出，再逐步切分压缩直到预算内。
+     * 对应 Python Consolidator.maybe_consolidate_by_tokens()。
+     */
     public void maybeConsolidateByTokens(Session session, Integer replayMaxMessages) {
         if (contextWindowTokens <= 0) return;
 
@@ -271,7 +322,10 @@ public class Consolidator {
     }
 
     // -- consolidateReplayOverflow --
+    // 对应 Python Consolidator._consolidate_replay_overflow()
 
+    /** 处理 replay-window 溢出：当未 consolidate 消息超过 replay_max 时压缩溢出部分。
+     *  对应 Python Consolidator._consolidate_replay_overflow()。 */
     String consolidateReplayOverflow(Session session, @Nullable Integer replayMaxMessages) {
         Integer endIdx = replayOverflowBoundary(session, replayMaxMessages);
         if (endIdx == null) return null;
@@ -286,6 +340,8 @@ public class Consolidator {
         return summary;
     }
 
+    /** 计算 replay 溢出边界：找到保留 replayMaxMessages 条消息后，需要压缩的索引。
+     *  对应 Python Consolidator._replay_overflow_boundary()。 */
     Integer replayOverflowBoundary(Session session, @Nullable Integer replayMaxMessages) {
         if (replayMaxMessages == null || replayMaxMessages <= 0) return null;
         var messages = session.messages();
@@ -314,14 +370,17 @@ public class Consolidator {
         }
         if (sliced.isEmpty()) return messages.size();
 
-        // Find original index of first remaining message
+        // 找到第一条保留消息在原始列表中的索引
         int firstVisibleIdx = start + tail.size() - replayMaxMessages + trimFromFront + legalStart;
         if (firstVisibleIdx <= start) return null;
         return firstVisibleIdx;
     }
 
     // -- persistLastSummary --
+    // 对应 Python Consolidator._persist_last_summary()
 
+    /** 将最后一次压缩的摘要持久化到 session 元数据中。
+     *  对应 Python Consolidator._persist_last_summary()。 */
     void persistLastSummary(Session session, @Nullable String summary) {
         if (summary != null && !summary.equals("(nothing)")) {
             var summaryMap = new java.util.LinkedHashMap<String, Object>();
@@ -333,7 +392,12 @@ public class Consolidator {
     }
 
     // -- compactIdleSession --
+    // 对应 Python Consolidator.compact_idle_session()
 
+    /**
+     * 压缩空闲会话：保留最近 maxSuffix 条合法消息，其余压缩为摘要。
+     * 对应 Python Consolidator.compact_idle_session()。
+     */
     @SuppressWarnings("unchecked")
     public String compactIdleSession(String sessionKey, int maxSuffix) {
         var lock = getLock(sessionKey);
@@ -403,7 +467,10 @@ public class Consolidator {
     }
 
     // -- formatMessages --
+    // 对应 Python Consolidator._format_messages()
 
+    /** 将消息列表格式化为纯文本，供 LLM 压缩使用。
+     *  对应 Python Consolidator._format_messages()。 */
     static String formatMessages(List<Map<String, Object>> messages) {
         var sb = new StringBuilder();
         for (var message : messages) {
@@ -422,8 +489,7 @@ public class Consolidator {
         return sb.toString();
     }
 
-    // -- archive system prompt (inline, mirrors consolidator_archive.md) --
-
+    /** 压缩系统提示词，对应 consolidator_archive.md */
     private static final String ARCHIVE_SYSTEM_PROMPT = """
             You are a memory consolidator. Summarize the conversation below into a concise \
             summary that captures the key facts, decisions, and context. The summary will be \

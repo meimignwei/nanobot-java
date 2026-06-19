@@ -13,59 +13,91 @@ import java.util.concurrent.BlockingQueue;
 import java.util.function.Consumer;
 
 /**
- * Mutable per-turn context carried through the state machine.
- * Mirrors Python TurnContext dataclass (loop.py lines 97-135).
+ * 每轮 turn 的可变上下文，贯穿状态机各阶段。
+ * 对应 Python TurnContext dataclass（loop.py 行 97-135）。
+ *
+ * <p>包含：入站消息、session 引用、历史消息、工具使用记录、流式回调、
+ * trace 追踪、pending 队列等全部 turn 生命周期状态。</p>
  */
 public class TurnContext {
 
+    /** 入站消息 */
     private final InboundMessage msg;
+    /** 会话 key */
     private final String sessionKey;
+    /** 当前状态机状态 */
     private TurnState state;
+    /** turn 唯一标识 */
     private final String turnId;
+    /** 当前会话引用 */
     @Nullable
     private Session session;
 
+    /** 清洗后的历史消息列表 */
     private List<Map<String, Object>> history = new ArrayList<>();
+    /** 初始消息列表（不含当前用户输入） */
     private List<Map<String, Object>> initialMessages = new ArrayList<>();
 
+    /** 最终回复内容 */
     @Nullable
     private String finalContent;
+    /** 本轮使用的工具列表 */
     private List<String> toolsUsed = new ArrayList<>();
+    /** 全部消息（含 system 提示词） */
     private List<Map<String, Object>> allMessages = new ArrayList<>();
+    /** 停止原因 */
     private String stopReason = "";
+    /** 是否有注入消息 */
     private boolean hadInjections;
 
+    /** 用户消息是否已提前持久化 */
     private boolean userPersistedEarly;
+    /** SAVE 阶段跳过次数 */
     private int saveSkip;
 
+    /** 出站回复消息 */
     @Nullable
     private OutboundMessage outbound;
+    /** 是否抑制回复发送 */
     private boolean suppressResponse;
 
+    // 回调
+    /** 进度回调（map 含 type, content 等字段） */
     @Nullable
     private Consumer<Map<String, Object>> onProgress;
+    /** 流式 delta 回调 */
     @Nullable
     private Consumer<String> onStream;
+    /** 流式结束回调 */
     @Nullable
     private Runnable onStreamEnd;
+    /** 重试等待回调 */
     @Nullable
     private Consumer<String> onRetryWait;
 
+    /** pending 消息队列（turn 期间到达的新消息暂存于此） */
     @Nullable
     private BlockingQueue<InboundMessage> pendingQueue;
+    /** pending 摘要文本 */
     @Nullable
     private String pendingSummary;
 
+    /** 是否临时会话 */
     private boolean ephemeral;
+    /** 工具注册表 */
     @Nullable
     private ToolRegistry tools;
 
+    /** turn 整体开始时间（epoch 秒） */
     private final double turnWallStartedAt = System.currentTimeMillis() / 1000.0;
+    /** 可见运行开始时间（epoch 秒） */
     @Nullable
     private Double visibleRunStartedAt;
+    /** turn 延迟（毫秒） */
     @Nullable
     private Integer turnLatencyMs;
 
+    /** 状态机追踪记录 */
     private final List<StateTraceEntry> trace = new ArrayList<>();
 
     public TurnContext(InboundMessage msg, String sessionKey, TurnState state, String turnId) {

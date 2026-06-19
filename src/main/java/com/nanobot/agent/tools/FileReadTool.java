@@ -9,15 +9,15 @@ import java.util.*;
 import java.util.regex.Pattern;
 
 /**
- * Read file contents with optional line-based pagination.
- * Port of Python ReadFileTool (filesystem.py lines 162-384).
+ * 文件读取工具（支持行号分页）。
+ * 对应 Python ReadFileTool（filesystem.py 行 162-384）。
  *
- * Differences from Python (to be addressed in later phases):
- * - No PDF support (requires pymupdf / PDFBox)
- * - No Office document support (.docx/.xlsx/.pptx — requires POI)
- * - No image content blocks (requires MIME detection + base64)
- * - No file-state deduplication (requires FileStates infrastructure)
- * - Simplified workspace guard (no _FsTool base class, no sandbox integration)
+ * <p>与 Python 的差异（后续阶段处理）：
+ * - 无 PDF 支持（需要 pymupdf / PDFBox）
+ * - 无 Office 文档支持（.docx/.xlsx/.pptx — 需要 Apache POI）
+ * - 无图片内容块（需要 MIME 检测 + base64）
+ * - 无 file-state 去重（需要 FileStates 基础设施）
+ * - 简化工作区守卫（无 _FsTool 基类、无 sandbox 集成）</p>
  */
 @Component
 public class FileReadTool extends Tool {
@@ -28,7 +28,7 @@ public class FileReadTool extends Tool {
     private static final int MAX_CHARS = 128_000;
     private static final int DEFAULT_LIMIT = 2000;
 
-    // Port of Python _BLOCKED_DEVICE_PATHS
+    /** 禁止读取的 device 路径（对应 Python _BLOCKED_DEVICE_PATHS） */
     private static final Set<String> BLOCKED_DEVICE_PATHS = Set.of(
             "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
             "/dev/stdin", "/dev/stdout", "/dev/stderr",
@@ -36,6 +36,7 @@ public class FileReadTool extends Tool {
             "/dev/fd/0", "/dev/fd/1", "/dev/fd/2"
     );
 
+    /** /proc/PID/fd/N 模式 */
     private static final Pattern PROC_FD_PATTERN =
             Pattern.compile("/proc/\\d+/fd/[012]$|/proc/self/fd/[012]$");
 
@@ -88,6 +89,7 @@ public class FileReadTool extends Tool {
         );
     }
 
+    /** 执行文件读取。对应 Python ReadFileTool.execute()。 */
     @Override
     public Object execute(Map<String, Object> params, ToolContext ctx) throws Exception {
         String pathStr = (String) params.get("path");
@@ -100,13 +102,13 @@ public class FileReadTool extends Tool {
             return "Error reading file: Unknown path";
         }
 
-        // Device path blacklist — check before workspace guard (Python order)
+        // Device 路径黑名单检查（Python 顺序：先于工作区守卫）
         Path rawPath = Path.of(pathStr);
         if (isBlockedDevice(rawPath)) {
             return "Error: Reading " + pathStr + " is blocked (device path that could hang or produce infinite output).";
         }
 
-        // Resolve path with workspace guard
+        // 路径解析 + 工作区守卫
         Path fp = resolvePath(pathStr, ctx);
         if (fp == null) {
             return "Error: File path is outside the workspace: " + pathStr;
@@ -122,7 +124,7 @@ public class FileReadTool extends Tool {
             return "Error: Not a file: " + pathStr;
         }
 
-        // PDF support (basic — delegates to external check)
+        // PDF 支持（基础 — 委托到外部检查）
         String fileName = fp.getFileName().toString().toLowerCase();
         if (fileName.endsWith(".pdf")) {
             return "Error: PDF reading requires pymupdf. Install with: pip install pymupdf";
@@ -142,13 +144,13 @@ public class FileReadTool extends Tool {
             return "(Empty file: " + pathStr + ")";
         }
 
-        // Image detection — basic MIME check
+        // 图片检测 — 基础 MIME 检查
         String mime = probeMime(raw, fileName);
         if (mime != null && mime.startsWith("image/")) {
             return "(Image file: " + pathStr + ")";
         }
 
-        // UTF-8 decode
+        // UTF-8 解码
         String textContent;
         try {
             textContent = new String(raw).replace("\r\n", "\n");
@@ -175,6 +177,7 @@ public class FileReadTool extends Tool {
         }
 
         String output = result.toString();
+        // 输出截断
         if (output.length() > MAX_CHARS) {
             int charCount = 0;
             int truncEnd = start;
@@ -202,26 +205,26 @@ public class FileReadTool extends Tool {
         return output;
     }
 
-    // ---- Path resolution ----
+    // ---- 路径解析 ----
 
+    /** 解析路径，确保在工作区内 */
     private Path resolvePath(String pathStr, ToolContext ctx) {
         Path p = Path.of(pathStr);
         Path ws = getWorkspace(ctx);
 
         if (p.isAbsolute()) {
-            // Check if within workspace
             if (ws != null && p.normalize().startsWith(ws.normalize())) {
                 return p.normalize();
             }
-            if (ws != null) return null; // outside workspace
-            return p.normalize(); // no workspace restriction
+            if (ws != null) return null; // 工作区外
+            return p.normalize(); // 无工作区限制
         }
 
-        // Relative path → resolve against workspace
+        // 相对路径 → 基于工作区解析
         Path resolved = (ws != null ? ws : Path.of(System.getProperty("user.dir")))
                 .resolve(p).normalize();
         if (ws != null && !resolved.startsWith(ws.normalize())) {
-            return null; // path traversal
+            return null; // 路径穿越
         }
         return resolved;
     }
@@ -232,8 +235,9 @@ public class FileReadTool extends Tool {
         return null;
     }
 
-    // ---- Device path check ----
+    // ---- Device 路径检查 ----
 
+    /** 检查路径是否为禁止读取的 device */
     static boolean isBlockedDevice(Path fp) {
         String raw = fp.toString();
         String resolved;
@@ -251,13 +255,14 @@ public class FileReadTool extends Tool {
         return resolved.startsWith("/dev/");
     }
 
-    // ---- Basic MIME detection ----
+    // ---- 基础 MIME 检测 ----
 
+    /** 魔数 + 扩展名 MIME 检测 */
     private static String probeMime(byte[] data, String fileName) {
         if (data == null || data.length < 4) {
             return fileName != null ? guessByExtension(fileName) : null;
         }
-        // Magic bytes
+        // 魔数检测
         if (data[0] == (byte) 0xFF && data[1] == (byte) 0xD8) return "image/jpeg";
         if (data[0] == (byte) 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') return "image/png";
         if (data[0] == 'G' && data[1] == 'I' && data[2] == 'F') return "image/gif";
@@ -266,6 +271,7 @@ public class FileReadTool extends Tool {
         return fileName != null ? guessByExtension(fileName) : null;
     }
 
+    /** 按扩展名推断 MIME 类型 */
     private static String guessByExtension(String name) {
         String lower = name.toLowerCase();
         if (lower.endsWith(".png")) return "image/png";

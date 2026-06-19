@@ -19,9 +19,11 @@ com/nanobot/providers/BedrockProvider$3.class
 com/nanobot/providers/ProviderSpec$Builder.class
 com/nanobot/providers/ModelOverride.class
 com/nanobot/agent/loop/TurnContext.class
+com/nanobot/trace/TraceObservation$SpanContext.class
 com/nanobot/agent/context/MemoryStore.class
 com/nanobot/providers/base/LLMResponse$Builder.class
 com/nanobot/providers/openai_responses/OpenAiResponsesHelper$SseState.class
+com/nanobot/trace/TraceObservation.class
 com/nanobot/config/DreamProperties.class
 com/nanobot/providers/openai_responses/OpenAiResponsesHelper$1.class
 com/nanobot/providers/GitHubCopilotProvider$2.class
@@ -54,6 +56,7 @@ com/nanobot/bus/MessageBus.class
 com/nanobot/providers/OpenAICodexProvider$CodexToken.class
 com/nanobot/agent/runner/AgentRunSpec.class
 com/nanobot/config/ConfigLoader$1.class
+com/nanobot/config/OpenTelemetryConfig.class
 com/nanobot/agent/session/Session.class
 com/nanobot/bus/OutboundMessage.class
 com/nanobot/providers/AnthropicProvider$3.class

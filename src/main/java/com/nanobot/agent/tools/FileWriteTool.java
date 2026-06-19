@@ -10,12 +10,12 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Write content to a file.
- * Port of Python WriteFileTool (filesystem.py lines 399-430).
+ * 文件写入工具。
+ * 对应 Python WriteFileTool（filesystem.py 行 399-430）。
  *
- * Differences from Python (to be addressed in later phases):
- * - No file-state tracking (requires FileStates infrastructure)
- * - Simplified workspace guard
+ * <p>与 Python 的差异（后续阶段处理）：
+ * - 无 file-state 追踪（需要 FileStates 基础设施）
+ * - 简化工作区守卫</p>
  */
 @Component
 public class FileWriteTool extends Tool {
@@ -56,6 +56,7 @@ public class FileWriteTool extends Tool {
         );
     }
 
+    /** 执行文件写入。对应 Python WriteFileTool.execute()。 */
     @Override
     public Object execute(Map<String, Object> params, ToolContext ctx) throws Exception {
         String pathStr = (String) params.get("path");
@@ -73,7 +74,7 @@ public class FileWriteTool extends Tool {
             return "Error: File path is outside the workspace: " + pathStr;
         }
 
-        // Block device paths
+        // 禁止写入 device 路径
         if (FileReadTool.isBlockedDevice(fp)) {
             return "Error: Writing to " + fp + " is blocked (device path).";
         }
@@ -87,8 +88,9 @@ public class FileWriteTool extends Tool {
         }
     }
 
-    // ---- Path resolution (same logic as FileReadTool) ----
+    // ---- 路径解析（与 FileReadTool 相同逻辑） ----
 
+    /** 解析路径，确保在工作区内 */
     private Path resolvePath(String pathStr, ToolContext ctx) {
         Path p = Path.of(pathStr);
         Path ws = getWorkspace(ctx);

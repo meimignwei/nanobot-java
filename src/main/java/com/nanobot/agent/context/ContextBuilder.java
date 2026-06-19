@@ -13,11 +13,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Builds the context (system prompt + messages) for the agent.
- * Mirrors Python ContextBuilder class (agent/context.py 281 lines).
+ * 构建发给 LLM 的上下文（系统提示词 + 消息列表）。
+ * 对应 Python ContextBuilder 类（agent/context.py，281 行）。
+ *
+ * <p>职责：系统提示词组装（含 identity、bootstrap 文件、SOUL/USER）、运行时上下文注入、
+ * 用户消息内容构建（含图片 base64 编码）、历史消息与当前消息合并。</p>
  */
 public class ContextBuilder {
 
+    /** 工作区根目录下按序加载的 bootstrap 文件 */
     static final List<String> BOOTSTRAP_FILES = List.of("AGENTS.md", "SOUL.md", "USER.md");
     private static final String RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]";
     private static final String RUNTIME_CONTEXT_END = "[/Runtime Context]";
@@ -39,7 +43,13 @@ public class ContextBuilder {
     }
 
     // -- buildSystemPrompt --
+    // 对应 Python ContextBuilder.build_system_prompt()
 
+    /**
+     * 构建系统提示词，依次拼接 identity、bootstrap 文件、工具契约、记忆上下文、
+     * 最近历史、会话摘要。
+     * 对应 Python ContextBuilder.build_system_prompt()。
+     */
     public String buildSystemPrompt(
             List<String> skillNames,
             String channel,
@@ -95,7 +105,10 @@ public class ContextBuilder {
     }
 
     // -- buildIdentity --
+    // 对应 Python ContextBuilder.build_identity()
 
+    /** 构建 identity 段：工作区路径、运行时信息、渠道。
+     *  对应 Python ContextBuilder.build_identity()。 */
     static String buildIdentity(String channel, Path workspace) {
         var workspacePath = workspace.toAbsolutePath().normalize().toString();
         var os = System.getProperty("os.name");
@@ -109,7 +122,10 @@ public class ContextBuilder {
     }
 
     // -- loadBootstrapFiles --
+    // 对应 Python ContextBuilder._load_bootstrap_files()
 
+    /** 加载工作区根目录下的 AGENTS.md、SOUL.md、USER.md。
+     *  对应 Python ContextBuilder._load_bootstrap_files()。 */
     public String loadBootstrapFiles(Path workspace) {
         var parts = new ArrayList<String>();
         var root = workspace != null ? workspace : this.workspace;
@@ -126,7 +142,10 @@ public class ContextBuilder {
     }
 
     // -- buildRuntimeContext --
+    // 对应 Python ContextBuilder.build_runtime_context()
 
+    /** 构建运行时上下文块，包含当前时间、渠道、会话 ID、发送者 ID 等。
+     *  对应 Python ContextBuilder.build_runtime_context()。 */
     public static String buildRuntimeContext(
             String channel, String chatId, String timezone,
             String senderId, List<String> supplementalLines) {
@@ -146,7 +165,10 @@ public class ContextBuilder {
     }
 
     // -- buildUserContent --
+    // 对应 Python ContextBuilder.build_user_content()
 
+    /** 构建用户消息内容，图片附件做 base64 编码。
+     *  对应 Python ContextBuilder.build_user_content()。 */
     @SuppressWarnings("unchecked")
     public Object buildUserContent(String text, List<String> media) {
         if (media == null || media.isEmpty()) {
@@ -180,7 +202,10 @@ public class ContextBuilder {
     }
 
     // -- buildMessages --
+    // 对应 Python ContextBuilder.build_messages()
 
+    /** 构建完整的消息列表（system + history + 当前用户消息 + 运行时上下文）。
+     *  对应 Python ContextBuilder.build_messages()。 */
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> buildMessages(
             List<Map<String, Object>> history,
@@ -231,6 +256,7 @@ public class ContextBuilder {
         messages.add(Map.of("role", "system", "content", systemPrompt));
         messages.addAll(history);
 
+        // 若最后一条消息与当前角色相同，合并内容而非新增一条
         if (!messages.isEmpty() && currentRole.equals(messages.get(messages.size() - 1).get("role"))) {
             var last = new LinkedHashMap<>(messages.get(messages.size() - 1));
             last.put("content", mergeMessageContent(last.get("content"), merged));
@@ -242,7 +268,10 @@ public class ContextBuilder {
     }
 
     // -- mergeMessageContent --
+    // 对应 Python ContextBuilder.merge_message_content()
 
+    /** 合并两条消息的内容（字符串拼接或 content-block 列表合并）。
+     *  对应 Python ContextBuilder.merge_message_content()。 */
     @SuppressWarnings("unchecked")
     static Object mergeMessageContent(Object left, Object right) {
         if (left instanceof String ls && right instanceof String rs) {
@@ -255,6 +284,7 @@ public class ContextBuilder {
         return result;
     }
 
+    /** 将消息内容统一转为 content-block 列表 */
     private static List<Map<String, Object>> toBlocks(Object value) {
         if (value instanceof List<?> l) {
             var blocks = new ArrayList<Map<String, Object>>();
@@ -272,7 +302,10 @@ public class ContextBuilder {
     }
 
     // -- detectImageMime --
+    // 对应 Python ContextBuilder._detect_image_mime()
 
+    /** 通过魔数检测图片 MIME 类型，支持 PNG/JPEG/GIF/WebP。
+     *  对应 Python ContextBuilder._detect_image_mime()。 */
     public static String detectImageMime(byte[] data) {
         if (data == null || data.length < 3) return null;
         // PNG: 89 50 4E 47 0D 0A 1A 0A
@@ -293,7 +326,10 @@ public class ContextBuilder {
     }
 
     // -- currentTimeStr --
+    // 对应 Python ContextBuilder._current_time_str()
 
+    /** 格式化当前时间字符串，含时区和 UTC 偏移。
+     *  对应 Python ContextBuilder._current_time_str()。 */
     static String currentTimeStr(String timezone) {
         ZoneId zone;
         try {
