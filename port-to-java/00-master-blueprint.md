@@ -131,6 +131,52 @@ public class AgentLoop {
 }
 ```
 
+### 3.6 注释规范（落地实现强制要求）
+
+所有 Java 源码在落地实现时，必须满足以下注释规范，确保可追溯 Python 原始出处：
+
+**类级注释**：每个 `public class` / `public interface` / `public enum` 的 Javadoc 中，必须标明对标的 Python 源文件和类/函数名：
+
+```java
+/**
+ * 对标 Python {@code AgentRunner} — 核心 LLM 对话循环。
+ * 源码文件：nanobot/agent/runner.py
+ */
+public class AgentRunner { ... }
+```
+
+**方法级注释**：每个 `public` 或核心 `private` 方法，必须在其上方用单行或多行注释标明对标的 Python 方法及行号范围：
+
+```java
+// 对标 Python runner.py:323-668 _run_core() — 核心对话循环
+private CompletableFuture<AgentRunResult> _runCore(...) { ... }
+
+// 对标 Python runner.py:992-1026 _execute_tools() — 工具执行（含并发/串行批次）
+private CompletableFuture<_ToolOutcome> _executeTools(...) { ... }
+
+// 对标 Python context.py:187-255 build_messages() — 组装完整消息列表
+public List<Map<String, Object>> buildMessages(...) { ... }
+```
+
+**常数字段注释**：直接翻译的 Python 常量，注释标明来源：
+
+```java
+// 对标 Python runner.py:63
+private static final int MAX_EMPTY_RETRIES = 2;
+
+// 对标 Python runner.py:70-73
+private static final Set<String> COMPACTABLE_TOOLS = Set.of(
+    "read_file", "exec", "grep", "find_files",
+    "web_search", "web_fetch", "list_dir", "list_exec_sessions"
+);
+```
+
+**规则总结**：
+1. 注释使用中文，说明"对标 Python"；
+2. 必须包含 Python 文件名（如 `runner.py`）、行号范围（如 `:323-668`）、原函数名（如 `_run_core()`）；
+3. 若 Python 方法名与 Java 方法名不同，需在注释中同时写出两个名字；
+4. 设计文档（本 `port-to-java/` 目录下的 `.md`）中的代码块也应遵循同一规范，作为落地实现的直接模板。
+
 ## 4. 1:1 包结构映射
 
 Java 工程根目录为 `nanobot-java/`（与 Python 的 `nanobot/` 同名但不同语言）。基础包名为 `com.nanobot`。

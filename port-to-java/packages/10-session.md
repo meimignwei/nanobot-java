@@ -132,6 +132,8 @@ com.nanobot.session/
 package com.nanobot.session;
 
 import jakarta.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -148,6 +150,7 @@ import java.util.function.Consumer;
  */
 public class Session {
 
+    private static final Logger log = LoggerFactory.getLogger(Session.class);
     private static final DateTimeFormatter ISO_FMT =
         DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneOffset.UTC);
 
@@ -325,8 +328,15 @@ public class Session {
         RetainResult r = retainRecentLegalSuffix(limit);
         if (r.dropped().isEmpty()) return;
         int ac = r.alreadyConsolidatedCount();
-        if (ac < r.dropped().size() && onArchive != null)
-            onArchive.accept(new ArrayList<>(r.dropped().subList(ac, r.dropped().size())));
+        List<Map<String, Object>> archiveChunk = (ac < r.dropped().size())
+            ? r.dropped().subList(ac, r.dropped().size()) : List.of();
+        if (!archiveChunk.isEmpty() && onArchive != null)
+            onArchive.accept(new ArrayList<>(archiveChunk));
+        log.info("Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
+            key, r.dropped().size(), archiveChunk.size(), messages.size());
+    }
+    public void enforceFileCap(@Nullable Consumer<List<Map<String, Object>>> onArchive) {
+        enforceFileCap(onArchive, SessionConstants.FILE_MAX_MESSAGES);
     }
 
     public record RetainResult(List<Map<String, Object>> dropped, int alreadyConsolidatedCount) {}
@@ -498,11 +508,35 @@ final class SessionSanitizer {
         return textPreview(content);
     }
 
+    static String stripThink(String text) {
+        if (text == null) return "";
+        // 1. Well-formed blocks (python_analog: strip_think steps 1-2)
+        text = text.replaceAll("(?s)<think>.*?</think>", "");
+        text = text.replaceAll("(?s)^\\s*<think>.*$", "");
+        text = text.replaceAll("(?s)<thought>.*?</thought>", "");
+        text = text.replaceAll("(?s)^\\s*<thought>.*$", "");
+        // 2. Malformed opening tags missing > (python_analog: strip_think step 3)
+        text = text.replaceAll("<think(?![A-Za-z0-9_\\-:>/])", "");
+        text = text.replaceAll("<thought(?![A-Za-z0-9_\\-:>/])", "");
+        // 3. Edge-only orphan closing tags (python_analog: strip_think step 5)
+        text = text.replaceAll("^\\s*</think>\\s*", "");
+        text = text.replaceAll("\\s*</think>\\s*$", "");
+        text = text.replaceAll("^\\s*</thought>\\s*", "");
+        text = text.replaceAll("\\s*</thought>\\s*$", "");
+        // 4. Edge-only channel markers (python_analog: strip_think step 4)
+        text = text.replaceAll("^\\s*<\\|?channel\\|?>\\s*", "");
+        // 5. Trailing partial control tags (python_analog: strip_think step 6)
+        String partial = "</?(?:t|th|thi|thin|think|tho|thou|thoug|though|thought)>?|<\\|?(?:c|ch|cha|chan|chann|channe|channel)(?:\\|?>?)?";
+        text = text.replaceAll("(?:" + partial + ")$", "");
+        text = text.replaceAll("^\\s*<\\|?$", "");
+        return text.strip();
+    }
+
     static String metadataTitle(Map<String, Object> metadata) {
         Object t = metadata.get("title");
         if (!(t instanceof String s) || s.isEmpty()) return "";
         if (Boolean.TRUE.equals(metadata.get("title_user_edited"))) return s;
-        return s.replaceAll("(?s)<thinking>.*?</thinking>", "").strip();
+        return stripThink(s);
     }
 
     private static String truncate(String s, int max) {
@@ -641,8 +675,9 @@ public class SessionManager {
 
     // --- path helpers ---
 
+    /** python_analog: safe_key(key) → safe_filename(key.replace(":", "_")) */
     public static String safeKey(String key) {
-        return key.replace(":", "_").replaceAll("[^a-zA-Z0-9_.\\-]", "_");
+        return key.replace(":", "_").replaceAll("[<>: \"/\\\\|?*]", "_");
     }
 
     public Path getSessionPath(String key) { return sessionsDir.resolve(safeKey(key) + ".jsonl"); }
@@ -650,13 +685,14 @@ public class SessionManager {
 
     // --- get_or_create (python_analog: get_or_create) ---
 
+    /** python_analog: get_or_create(key) — direct dict assign, not putIfAbsent */
     public Session getOrCreate(String key) {
         Session cached = cache.get(key);
         if (cached != null) return cached;
-        Session loaded = load(key);
-        if (loaded == null) loaded = new Session(key);
-        Session existing = cache.putIfAbsent(key, loaded);
-        return existing != null ? existing : loaded;
+        Session session = load(key);
+        if (session == null) session = new Session(key);
+        cache.put(key, session);
+        return session;
     }
 
     // --- load (python_analog: _load) ---
@@ -683,14 +719,51 @@ public class SessionManager {
 
     // --- read-only load (python_analog: read_session_file) ---
 
+    /**
+     * Load a session from disk without caching; intended for read-only HTTP endpoints.
+     * Returns raw fields {"key", "created_at", "updated_at", "metadata", "messages"}
+     * or null when the session file does not exist or fails to parse.
+     * python_analog: read_session_file(key)
+     */
     public Map<String, Object> readSessionFile(String key) {
         Path path = getSessionPath(key);
         if (!Files.exists(path)) return null;
-        try { return sessionPayload(parseFile(key, path)); }
-        catch (Exception e) {
+        try {
+            List<Map<String, Object>> messages = new ArrayList<>();
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            String createdAt = null, updatedAt = null, storedKey = null;
+            try (BufferedReader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    line = line.strip();
+                    if (line.isEmpty()) continue;
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> data = (Map<String, Object>) MAPPER.readValue(line, Map.class);
+                    if ("metadata".equals(data.get("_type"))) {
+                        metadata = safeMap(data, "metadata");
+                        createdAt = safeStr(data, "created_at");
+                        updatedAt = safeStr(data, "updated_at");
+                        storedKey = safeStr(data, "key");
+                    } else {
+                        messages.add(data);
+                    }
+                }
+            }
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("key", storedKey != null ? storedKey : key);
+            result.put("created_at", createdAt);
+            result.put("updated_at", updatedAt);
+            result.put("metadata", metadata);
+            result.put("messages", messages);
+            return result;
+        } catch (Exception e) {
             log.warn("Failed to read session {}: {}", key, e.getMessage());
             Session repaired = repair(key);
-            return (repaired != null) ? sessionPayload(repaired) : null;
+            if (repaired != null) {
+                log.info("Recovered read-only session view {} from corrupt file", key);
+                return sessionPayload(repaired);
+            }
+            return null;
         }
     }
 
@@ -846,7 +919,8 @@ public class SessionManager {
 
     public Session forkSessionBeforeUserIndex(String srcKey, String tgtKey, int beforeUserIdx) {
         if (beforeUserIdx < 0) return null;
-        Session source = cache.getOrDefault(srcKey, load(srcKey));
+        Session source = cache.get(srcKey);
+        if (source == null) source = load(srcKey);
         if (source == null) return null;
 
         List<Map<String, Object>> copied = new ArrayList<>();
@@ -1249,6 +1323,20 @@ public final class TurnContinuation {
         meta.put(GOAL_ROUNDS_KEY, r + 1);
     }
 
+    // 对标 Python turn_continuation.py:141-151 prepare_save_boundary
+    public static void prepareSaveBoundary(TurnContinuationContext ctx) {
+        if (ctx.getSession() != null) {
+            clearInternalContinuationState(ctx.getSession().getMetadata());
+        }
+        int saveSkip = saveSkipForTurn(
+            ctx.getMessageMetadata(),
+            ctx.getInitialMessageCount(),
+            ctx.getHistory().size(),
+            ctx.isUserPersistedEarly()
+        );
+        ctx.setSaveSkip(saveSkip);
+    }
+
     /**
      * The core continuation trigger. Called by AgentLoop after a turn completes.
      *
@@ -1268,6 +1356,9 @@ public final class TurnContinuation {
 
         log.info("Turn budget reached; scheduling internal continuation");
         ctx.getMessageMetadata().put(INTERNAL_CONTINUATION_PENDING_META, Boolean.TRUE);
+        ctx.setFinalContent("");
+        ctx.setAllMessages(stripped);
+        ctx.setSuppressResponse(true);
 
         InboundMessage contMsg = new InboundMessage(
             ctx.getOriginalMsg().channel(), GOAL_SENDER, ctx.getOriginalMsg().chatId(),
@@ -1287,8 +1378,16 @@ public final class TurnContinuation {
         String getStopReason();
         @Nullable Double getVisibleRunStartedAt();
         List<Map<String, Object>> getAllMessages();
+        void setAllMessages(List<Map<String, Object>> messages);
         @Nullable String getFinalContent();
+        void setFinalContent(String content);
         @Nullable String getSessionKey();
+        int getInitialMessageCount();
+        List<Map<String, Object>> getHistory();
+        boolean isUserPersistedEarly();
+        int getSaveSkip();
+        void setSaveSkip(int saveSkip);
+        void setSuppressResponse(boolean suppress);
     }
 }
 ```
@@ -1299,10 +1398,11 @@ public final class TurnContinuation {
 package com.nanobot.session;
 
 import com.nanobot.bus.*;
+import com.nanobot.providers.LLMProvider;
+import com.nanobot.utils.llm_runtime.LLMRuntime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 /**
  * Translates runtime events into WebUI/WebSocket wire messages.
@@ -1312,15 +1412,23 @@ import java.util.concurrent.Executors;
  */
 public class WebuiTurnCoordinator {
 
+    // 对标 Python webui_turns.py:31-33
+    public static final String WEBUI_SESSION_META = "webui";
+    public static final String WEBUI_TITLE_META = "title";
+    public static final String WEBUI_TITLE_USER_EDITED_META = "title_user_edited";
+
     private final MessageBus bus;
     private final SessionManager sessions;
-    private final ExecutorService background;
-    private final ConcurrentHashMap<String, Object> titleContexts;  // sessionKey → LLMRuntime
+    private final Consumer<Runnable> scheduleBackground;
+    private final ConcurrentHashMap<String, LLMRuntime> titleContexts;  // sessionKey → LLMRuntime
 
-    public WebuiTurnCoordinator(MessageBus bus, SessionManager sessions) {
+    // 对标 Python webui_turns.py:40 _WEBSOCKET_TURN_WALL_STARTED_AT
+    private static final ConcurrentHashMap<String, Double> WEBSOCKET_TURN_WALL_STARTED_AT = new ConcurrentHashMap<>();
+
+    public WebuiTurnCoordinator(MessageBus bus, SessionManager sessions, Consumer<Runnable> scheduleBackground) {
         this.bus = bus;
         this.sessions = sessions;
-        this.background = Executors.newVirtualThreadPerTaskExecutor();
+        this.scheduleBackground = scheduleBackground;
         this.titleContexts = new ConcurrentHashMap<>();
     }
 
@@ -1334,47 +1442,47 @@ public class WebuiTurnCoordinator {
         return () -> { u5.run(); u4.run(); u3.run(); u2.run(); u1.run(); };
     }
 
-    public void captureTitleContext(String sk, InboundMessage msg, Object llm) {
-        if ("websocket".equals(msg.channel()) && Boolean.TRUE.equals(msg.metadata().get("webui")))
-            titleContexts.put(sk, llm);
+    // 对标 Python webui_turns.py:343-352 capture_title_context / discard
+    public void captureTitleContext(String sessionKey, InboundMessage msg, LLMRuntime llm) {
+        if ("websocket".equals(msg.channel()) && Boolean.TRUE.equals(msg.metadata().get(WEBUI_SESSION_META))) {
+            titleContexts.put(sessionKey, llm);
+        }
     }
-    public void discard(String sk) { titleContexts.remove(sk); }
+    public void discard(String sessionKey) { titleContexts.remove(sessionKey); }
 
     // --- event handlers ---
     private void onSessionTurnStarted(SessionTurnStarted e) {
         if (!isWs(e.context())) return;
         Session s = sessions.getOrCreate(e.context().sessionKey());
-        if (Boolean.TRUE.equals(e.context().metadata().get("webui")))
-            s.getMetadata().put("webui", Boolean.TRUE);
+        if (Boolean.TRUE.equals(e.context().metadata().get(WEBUI_SESSION_META))) {
+            s.getMetadata().put(WEBUI_SESSION_META, Boolean.TRUE);
+        }
     }
 
+    // 对标 Python webui_turns.py:290-298 _handle_run_status_changed
     private void onRunStatusChanged(TurnRunStatusChanged e) {
         if (!isWs(e.context())) return;
-        String cid = e.context().chatId();
-        Map<String, Object> meta = new LinkedHashMap<>(e.context().metadata());
-        meta.put("_goal_status", Boolean.TRUE); meta.put("goal_status", e.status());
-        if ("running".equals(e.status()))
-            meta.put("started_at", (e.startedAt() != null && e.startedAt() > 0) ? e.startedAt() : currentEpoch());
-        publish(cid, e.context().channel(), meta);
+        publishTurnRunStatus(bus, ctxMsg(e.context()), e.status(), e.startedAt());
     }
 
+    // 对标 Python webui_turns.py:300-309 _handle_turn_completed_event
     private void onTurnCompleted(TurnCompleted e) {
         if (!isWs(e.context())) return;
-        Map<String, Object> meta = new LinkedHashMap<>(e.context().metadata());
-        meta.put("_turn_end", Boolean.TRUE);
-        if (e.latencyMs() != null) meta.put("latency_ms", e.latencyMs());
-        Session s = sessions.getOrCreate(e.context().sessionKey());
-        meta.put("goal_state", GoalState.goalStateWsBlob(s.getMetadata()));
-        publish(e.context().chatId(), e.context().channel(), meta);
+        handleTurnEnd(ctxMsg(e.context()), e.context().sessionKey(), e.latencyMs());
+        scheduleTitleUpdateFromEvent(e);
     }
 
+    // 对标 Python webui_turns.py:311-327 _handle_goal_state_changed
     private void onGoalStateChanged(GoalStateChanged e) {
         if (!isWs(e.context())) return;
-        publish(e.context().chatId(), e.context().channel(), Map.of(
+        String cid = e.context().chatId();
+        if (cid == null || cid.isBlank()) return;
+        publish(cid, e.context().channel(), Map.of(
             "_goal_state_sync", Boolean.TRUE,
             "goal_state", GoalState.goalStateWsBlob(e.sessionMetadata())));
     }
 
+    // 对标 Python webui_turns.py:329-341 _handle_runtime_model_changed
     private void onRuntimeModelChanged(RuntimeModelChanged e) {
         publish("*", "websocket", Map.of(
             "_runtime_model_updated", Boolean.TRUE,
@@ -1382,9 +1490,100 @@ public class WebuiTurnCoordinator {
             "model_preset", Objects.toString(e.modelPreset(), "")));
     }
 
+    // --- public helpers (python_analog: publish_turn_run_status, handle_turn_end) ---
+
+    // 对标 Python webui_turns.py:195-227 publish_turn_run_status
+    public static void publishTurnRunStatus(MessageBus bus, InboundMessage msg, String status, Double startedAt) {
+        if (!"websocket".equals(msg.channel())) return;
+        String cid = msg.chatId();
+        Map<String, Object> meta = new LinkedHashMap<>(msg.metadata() != null ? msg.metadata() : Map.of());
+        meta.put("_goal_status", Boolean.TRUE);
+        meta.put("goal_status", status);
+        if ("running".equals(status)) {
+            double t0 = (startedAt != null && startedAt > 0) ? startedAt : currentEpoch();
+            meta.put("started_at", t0);
+            WEBSOCKET_TURN_WALL_STARTED_AT.put(cid, t0);
+        } else {
+            WEBSOCKET_TURN_WALL_STARTED_AT.remove(cid);
+        }
+        try {
+            bus.publishOutbound(new OutboundMessage(msg.channel(), cid, "", null, List.of(), meta, List.of()));
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    // 对标 Python webui_turns.py:364-384 handle_turn_end
+    public void handleTurnEnd(InboundMessage msg, String sessionKey, Integer latencyMs) {
+        if (!"websocket".equals(msg.channel())) return;
+        Map<String, Object> turnMeta = new LinkedHashMap<>(msg.metadata() != null ? msg.metadata() : Map.of());
+        turnMeta.put("_turn_end", Boolean.TRUE);
+        if (latencyMs != null) turnMeta.put("latency_ms", latencyMs);
+        Session s = sessions.getOrCreate(sessionKey);
+        turnMeta.put("goal_state", GoalState.goalStateWsBlob(s.getMetadata()));
+        publish(msg.chatId(), msg.channel(), turnMeta);
+        scheduleTitleUpdate(msg, sessionKey);
+    }
+
+    // 对标 Python webui_turns.py:387-415 _schedule_title_update
+    public void scheduleTitleUpdate(InboundMessage msg, String sessionKey) {
+        LLMRuntime titleContext = titleContexts.remove(sessionKey);
+        if (!Boolean.TRUE.equals(msg.metadata().get(WEBUI_SESSION_META)) || titleContext == null) return;
+
+        scheduleBackground.accept(() -> {
+            boolean generated = WebuiTitleGenerator.maybeGenerateTitleAfterTurn(
+                msg.channel(), msg.metadata(), sessions, sessionKey,
+                titleContext.getProvider(), titleContext.getModel());
+            if (generated) {
+                Map<String, Object> meta = new LinkedHashMap<>(msg.metadata());
+                meta.put("_session_updated", Boolean.TRUE);
+                meta.put("_session_update_scope", "metadata");
+                publish(msg.chatId(), msg.channel(), meta);
+            }
+        });
+    }
+
+    // 对标 Python webui_turns.py:417-449 _schedule_title_update_from_event
+    public void scheduleTitleUpdateFromEvent(TurnCompleted event) {
+        Object runtime = event.runtime();
+        if (!Boolean.TRUE.equals(event.context().metadata().get(WEBUI_SESSION_META))
+            || runtime == null || !(runtime instanceof LLMRuntime titleContext)) {
+            return;
+        }
+
+        scheduleBackground.accept(() -> {
+            boolean generated = WebuiTitleGenerator.maybeGenerateTitleAfterTurn(
+                event.context().channel(), event.context().metadata(), sessions,
+                event.context().sessionKey(), titleContext.getProvider(), titleContext.getModel());
+            if (generated) {
+                Map<String, Object> meta = new LinkedHashMap<>(event.context().metadata());
+                meta.put("_session_updated", Boolean.TRUE);
+                meta.put("_session_update_scope", "metadata");
+                publish(event.context().chatId(), event.context().channel(), meta);
+            }
+        });
+    }
+
+    // --- static helpers ---
+
+    // 对标 Python webui_turns.py:182-184 websocket_turn_wall_started_at
+    public static Double websocketTurnWallStartedAt(String chatId) {
+        return WEBSOCKET_TURN_WALL_STARTED_AT.get(chatId);
+    }
+
+    // 对标 Python webui_turns.py:187-192 build_bus_progress_callback
+    public static Runnable buildBusProgressCallback(MessageBus bus, InboundMessage msg) {
+        return () -> {}; // 占位：实际应调用 bus.buildProgressCallback
+    }
+
     private void publish(String chatId, String channel, Map<String, Object> meta) {
         try { bus.publishOutbound(new OutboundMessage(channel, chatId, "", null, List.of(), meta, List.of())); }
         catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
+    }
+
+    private static InboundMessage ctxMsg(RuntimeEventContext ctx) {
+        return new InboundMessage(
+            ctx.channel(), "runtime", ctx.chatId(), "",
+            null, List.of(), new LinkedHashMap<>(ctx.metadata() != null ? ctx.metadata() : Map.of()),
+            ctx.sessionKey());
     }
 
     private static boolean isWs(RuntimeEventContext c) { return "websocket".equals(c.channel()); }
@@ -1411,6 +1610,8 @@ public final class WebuiTitleGenerator {
     private WebuiTitleGenerator() {}
 
     private static final int MAX_CHARS = 60;
+    private static final int MAX_TOKENS = 96;
+    private static final String REASONING_EFFORT = "none";
     private static final Pattern LEAD_RE = Pattern.compile("^\\s*(title|标题)\\s*[:：]\\s*", Pattern.CASE_INSENSITIVE);
 
     public static String cleanGeneratedTitle(String raw) {
@@ -1418,7 +1619,7 @@ public final class WebuiTitleGenerator {
         if (text.isEmpty()) return "";
         text = LEAD_RE.matcher(text).replaceFirst("");
         text = text.strip().replaceAll("^[\"'`" + "“" + "”" + "‘’]+|[\"'`" + "“" + "”" + "‘’]+$", "");
-        text = text.replaceAll("(?s)<thinking>.*?</thinking>", "").strip();
+        text = SessionSanitizer.stripThink(text);
         text = text.replaceAll("\\s+", " ").strip();
         text = text.replaceAll("[。.!！?？,，;；:]$", "");
         if (text.length() > MAX_CHARS) text = text.substring(0, MAX_CHARS - 1).stripTrailing() + "…";
@@ -1433,7 +1634,7 @@ public final class WebuiTitleGenerator {
             String role = Objects.toString(msg.get("role"), "");
             Object content = msg.get("content");
             if (!(content instanceof String s) || s.strip().isEmpty()) continue;
-            String clean = s.replaceAll("(?s)<thinking>.*?</thinking>", "").strip();
+            String clean = SessionSanitizer.stripThink(s);
             if (clean.isEmpty()) continue;
             if ("user".equals(role) && u.isEmpty()) u = clean;
             else if ("assistant".equals(role) && a.isEmpty()) a = clean;
@@ -1445,12 +1646,14 @@ public final class WebuiTitleGenerator {
     public record TitleInputs(String userText, String assistantText) {}
 
     /**
-     * Generate and persist a title for WebUI sessions only.
+     * Generate and persist a title for WebUI-owned sessions only.
      * Returns true if a title was generated.
+     *
+     * python_analog: async def maybe_generate_webui_title(...)
      */
     public static boolean maybeGenerateTitle(
         SessionManager sm, String sessionKey,
-        com.nanobot.providers.base.LLMProvider provider, String model) {
+        com.nanobot.providers.LLMProvider provider, String model) {
         Session s = sm.getOrCreate(sessionKey);
         if (!Boolean.TRUE.equals(s.getMetadata().get("webui"))) return false;
         if (Boolean.TRUE.equals(s.getMetadata().get("title_user_edited"))) return false;
@@ -1475,21 +1678,40 @@ public final class WebuiTitleGenerator {
         if (!inputs.assistantText().isEmpty()) prompt += "\nAssistant: " + truncate(inputs.assistantText(), 1000);
 
         try {
-            // LLM call stub — in production: provider.chatWithRetry(systemPrompt, userMsg,
-            //   model=model, max_tokens=96, temperature=0.2, reasoning_effort="none", retry_mode="standard")
-            String generated = ""; // placeholder
+            List<Map<String, Object>> messages = List.of(
+                Map.of("role", "system", "content", "You write short, neutral chat titles. Return only the title text."),
+                Map.of("role", "user", "content", prompt)
+            );
+            var response = provider.chatWithRetry(messages, null, model, MAX_TOKENS, 0.2f, REASONING_EFFORT);
+            String generated = response.getContent();
             String title = cleanGeneratedTitle(generated);
             if (title.isEmpty() || title.toLowerCase(Locale.ROOT).startsWith("error")) {
-                log.debug("Title generation returned no usable title for {}", sessionKey);
+                log.debug("WebUI title generation returned no usable title for {} (finish_reason={})",
+                    sessionKey, response.getFinishReason());
                 return false;
             }
             s.getMetadata().put("title", title);
             sm.save(s);
             return true;
         } catch (Exception e) {
-            log.debug("Failed to generate title for {}", sessionKey, e);
+            log.debug("Failed to generate webui session title for {}", sessionKey, e);
             return false;
         }
+    }
+
+    /**
+     * Wrapper called after a turn completes to generate title only for websocket channels.
+     *
+     * python_analog: async def maybe_generate_webui_title_after_turn(...)
+     */
+    public static boolean maybeGenerateTitleAfterTurn(
+        String channel, Map<String, Object> metadata,
+        SessionManager sm, String sessionKey,
+        com.nanobot.providers.LLMProvider provider, String model) {
+        if (!"websocket".equals(channel) || !Boolean.TRUE.equals(metadata.get("webui"))) {
+            return false;
+        }
+        return maybeGenerateTitle(sm, sessionKey, provider, model);
     }
 
     private static String truncate(String s, int max) {
@@ -1504,7 +1726,7 @@ public final class WebuiTitleGenerator {
 |----------|------|------|
 | `Session.messages` | `CopyOnWriteArrayList` | 追加为主，读取频繁，COW 零开销读 |
 | `Session` 多步操作 | `ReentrantReadWriteLock` | `getHistory`/`save` 读锁，`clear`/`retain` 写锁 |
-| `SessionManager.cache` | `ConcurrentHashMap` | 内置线程安全，`putIfAbsent` 防重复创建 |
+| `SessionManager.cache` | `ConcurrentHashMap` | 内置线程安全，直接 put 覆盖（与 Python `self._cache[key] = session` 语义一致） |
 | `WebuiTurnCoordinator.titleContexts` | `ConcurrentHashMap` | 可能并发访问 |
 
 **CopyOnWriteArrayList vs synchronized wrapper:**
@@ -1524,8 +1746,8 @@ public SessionManager sessionManager(AppPaths paths) {
 
 @Bean
 @ConditionalOnMissingBean
-public WebuiTurnCoordinator webuiTurnCoordinator(MessageBus bus, SessionManager sm) {
-    return new WebuiTurnCoordinator(bus, sm);
+public WebuiTurnCoordinator webuiTurnCoordinator(MessageBus bus, SessionManager sm, TaskExecutor executor) {
+    return new WebuiTurnCoordinator(bus, sm, r -> executor.execute(r));
 }
 ```
 
@@ -1552,7 +1774,7 @@ class SessionManagerTest {
 }
 
 class GoalStateTest {
-    @Test void sustainedGoalActiveTrue/False() { /* status=="active" check */ }
+    @Test void sustainedGoalActiveTrueAndFalse() { /* status=="active" check */ }
     @Test void legacyKeyFallback() { /* thread_goal works */ }
     @Test void goalStateRuntimeLinesGeneratesContext() { /* LLM context lines */ }
     @Test void runnerWallLlmTimeoutReturnsZeroForGoalTurn() { /* 0.0 */ }
