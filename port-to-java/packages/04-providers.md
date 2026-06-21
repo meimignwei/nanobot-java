@@ -81,6 +81,7 @@ GenerationSettings frozen dataclass:
 独立工具函数:
   parse_tool_arguments(arguments) → JSON解析，回退到原始字符串
   tool_arguments_object_for_replay(arguments) → JSON解析 + json_repair修复
+  tool_arguments_json_for_replay(arguments) → 返回JSON字符串形式，用于provider历史replay
 ```
 
 ### `registry.py` — 提供商注册表
@@ -215,7 +216,9 @@ public record ToolCallRequest(
 // com.nanobot.providers.LLMResponse.java
 package com.nanobot.providers;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -236,16 +239,18 @@ public record LLMResponse(
     Double errorRetryAfterS,
     Boolean errorShouldRetry
 ) {
-    /** Compact constructor with defaults. */
+    /** Compact constructor with defaults.
+     *  Uses mutable collections to match Python dataclass default_factory=list/dict.
+     */
     public LLMResponse {
-        if (toolCalls == null) toolCalls = Collections.emptyList();
+        if (toolCalls == null) toolCalls = new ArrayList<>();
         if (finishReason == null) finishReason = "stop";
-        if (usage == null) usage = Collections.emptyMap();
+        if (usage == null) usage = new HashMap<>();
     }
 
     /** Convenience: successful text-only response. */
     public LLMResponse(String content, String finishReason) {
-        this(content, Collections.emptyList(), finishReason, Collections.emptyMap(),
+        this(content, new ArrayList<>(), finishReason, new HashMap<>(),
              null, null, null, null, null, null, null, null, null);
     }
 
@@ -253,7 +258,7 @@ public record LLMResponse(
     public LLMResponse(String content, String finishReason, Integer errorStatusCode,
                        String errorKind, String errorType, String errorCode,
                        Double retryAfter, Boolean errorShouldRetry) {
-        this(content, Collections.emptyList(), finishReason, Collections.emptyMap(),
+        this(content, new ArrayList<>(), finishReason, new HashMap<>(),
              retryAfter, null, null,
              errorStatusCode, errorKind, errorType, errorCode,
              retryAfter, errorShouldRetry);
@@ -276,6 +281,12 @@ public record LLMResponse(
             || "stop".equals(finishReason);
     }
 
+    /**
+     * Check if this response represents an error.
+     *
+     * Note: This convenience method is not present in the Python source;
+     * it is added in Java for ergonomic error checks.
+     */
     public boolean isError() {
         return "error".equals(finishReason);
     }
@@ -284,7 +295,7 @@ public record LLMResponse(
 
 ### 2. `LLMProvider.java` 抽象基类
 
-关键转换：Python 的 `async/await` → Java 虚拟线程 + 同步阻塞调用。Python 的 `asyncio.sleep()` → Java 的 `Thread.sleep()`。
+关键转换：Python 的 `async/await` → Java `CompletableFuture`。Python 的 `asyncio.sleep()` → `CompletableFuture.delayedExecutor` 或 `Thread.sleep` inside `CompletableFuture.runAsync`。
 
 ```java
 // com.nanobot.providers.LLMProvider.java
@@ -388,23 +399,16 @@ public abstract class LLMProvider {
     /**
      * Send a chat completion request.
      *
-     * @param messages       list of message maps with 'role' and 'content'
-     * @param tools          optional list of tool definitions (OpenAI function format)
-     * @param model          model identifier (provider-specific)
-     * @param maxTokens      maximum tokens in response
-     * @param temperature    sampling temperature
-     * @param reasoningEffort reasoning effort level (e.g. "low", "medium", "high")
-     * @param toolChoice     tool selection strategy ("auto", "required", or specific dict)
-     * @return LLMResponse with content and/or tool calls
+     * python_analog: async def chat(...)
      */
-    public abstract LLMResponse chat(
+    public abstract CompletableFuture<LLMResponse> chat(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
         int maxTokens,
         double temperature,
         String reasoningEffort,
-        Object toolChoice   // String or Map
+        Object toolChoice
     );
 
     /** Get the default model for this provider. */
@@ -413,11 +417,11 @@ public abstract class LLMProvider {
     // --- Streaming (default falls back to chat) ---
 
     /**
-     * Stream a chat completion. Default implementation falls back to non-streaming
-     * chat() and delivers the full content as a single delta. Providers that
-     * support native streaming should override this method.
+     * Stream a chat completion.
+     *
+     * python_analog: async def chat_stream(...)
      */
-    public LLMResponse chatStream(
+    public CompletableFuture<LLMResponse> chatStream(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -429,17 +433,24 @@ public abstract class LLMProvider {
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta
     ) {
-        LLMResponse response = chat(messages, tools, model, maxTokens, temperature,
-                                    reasoningEffort, toolChoice);
-        if (onContentDelta != null && response.content() != null) {
-            onContentDelta.accept(response.content());
-        }
-        return response;
+        return chat(messages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice)
+            .thenCompose(response -> {
+                if (onContentDelta != null && response.content() != null) {
+                    return onContentDelta.onDelta(response.content())
+                        .thenApply(v -> response);
+                }
+                return CompletableFuture.completedFuture(response);
+            });
     }
 
     // --- Safe call wrappers (convert exceptions to error responses) ---
 
-    protected LLMResponse safeChat(
+    /**
+     * Call chat() and convert unexpected exceptions to error responses.
+     *
+     * python_analog: async def _safe_chat(self, **kwargs)
+     */
+    protected CompletableFuture<LLMResponse> safeChat(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -448,18 +459,24 @@ public abstract class LLMProvider {
         String reasoningEffort,
         Object toolChoice
     ) {
-        try {
-            return chat(messages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return new LLMResponse("Error: operation interrupted", "error",
-                                    null, "interrupted", null, null, null, null);
-        } catch (Exception e) {
-            return new LLMResponse("Error calling LLM: " + e.getMessage(), "error");
-        }
+        return chat(messages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice)
+            .exceptionally(exc -> {
+                if (exc instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                // Note: Python re-raises asyncio.CancelledError instead of converting
+                // to an error response. Java cannot distinguish cancellation in
+                // CompletableFuture.exceptionally, so we convert to error response.
+                return new LLMResponse("Error calling LLM: " + exc.getMessage(), "error");
+            });
     }
 
-    protected LLMResponse safeChatStream(
+    /**
+     * Call chatStream() and convert unexpected exceptions to error responses.
+     *
+     * python_analog: async def _safe_chat_stream(self, **kwargs)
+     */
+    protected CompletableFuture<LLMResponse> safeChatStream(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -471,17 +488,15 @@ public abstract class LLMProvider {
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta
     ) {
-        try {
-            return chatStream(messages, tools, model, maxTokens, temperature,
-                             reasoningEffort, toolChoice,
-                             onContentDelta, onThinkingDelta, onToolCallDelta);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return new LLMResponse("Error: operation interrupted", "error",
-                                    null, "interrupted", null, null, null, null);
-        } catch (Exception e) {
-            return new LLMResponse("Error calling LLM: " + e.getMessage(), "error");
-        }
+        return chatStream(messages, tools, model, maxTokens, temperature,
+                         reasoningEffort, toolChoice,
+                         onContentDelta, onThinkingDelta, onToolCallDelta)
+            .exceptionally(exc -> {
+                if (exc instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                return new LLMResponse("Error calling LLM: " + exc.getMessage(), "error");
+            });
     }
 
     // =========================================================================
@@ -490,8 +505,10 @@ public abstract class LLMProvider {
 
     /**
      * Call chat() with retry on transient provider failures.
+     *
+     * python_analog: async def chat_with_retry(...)
      */
-    public LLMResponse chatWithRetry(
+    public CompletableFuture<LLMResponse> chatWithRetry(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -516,8 +533,10 @@ public abstract class LLMProvider {
 
     /**
      * Call chatStream() with retry on transient provider failures.
+     *
+     * python_analog: async def chat_stream_with_retry(...)
      */
-    public LLMResponse chatStreamWithRetry(
+    public CompletableFuture<LLMResponse> chatStreamWithRetry(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -528,7 +547,7 @@ public abstract class LLMProvider {
         ContentDeltaCallback onContentDelta,
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta,
-        Runnable onStreamRecover,
+        Supplier<CompletableFuture<Void>> onStreamRecover,
         String retryMode,
         RetryWaitCallback onRetryWait
     ) {
@@ -540,14 +559,18 @@ public abstract class LLMProvider {
 
         ContentDeltaCallback trackingDelta = text -> {
             if (text != null && !text.isEmpty()) hasStreamedContent[0] = true;
-            if (onContentDelta != null) onContentDelta.accept(text);
+            if (onContentDelta != null) return onContentDelta.onDelta(text);
+            return CompletableFuture.completedFuture(null);
         };
 
         ContentDeltaCallback effectiveDelta = (onContentDelta != null) ? trackingDelta : null;
 
-        Runnable recoverStream = () -> {
-            if (onStreamRecover != null) onStreamRecover.run();
+        Supplier<CompletableFuture<Void>> recoverStream = () -> {
+            if (onStreamRecover != null) {
+                return onStreamRecover.get().thenRun(() -> hasStreamedContent[0] = false);
+            }
             hasStreamedContent[0] = false;
+            return CompletableFuture.completedFuture(null);
         };
 
         ChatStreamCallable streamCall = (msgs, t, mdl, mt, temp, re, tc) ->
@@ -592,7 +615,7 @@ public abstract class LLMProvider {
 
     @FunctionalInterface
     protected interface ChatStreamCallable {
-        LLMResponse call(
+        CompletableFuture<LLMResponse> call(
             List<Map<String, Object>> messages,
             List<Map<String, Object>> tools,
             String model,
@@ -605,26 +628,40 @@ public abstract class LLMProvider {
 
     @FunctionalInterface
     public interface ContentDeltaCallback {
-        void accept(String text);
+        /**
+         * Receive a text delta chunk.
+         *
+         * python_analog: Callable[[str], Awaitable[None]] (async callback)
+         */
+        CompletableFuture<Void> onDelta(String text);
     }
 
     @FunctionalInterface
     public interface ToolCallDeltaCallback {
-        void accept(Map<String, Object> delta);
+        /**
+         * Receive a tool-call delta chunk.
+         *
+         * python_analog: Callable[[dict], Awaitable[None]] (async callback)
+         */
+        CompletableFuture<Void> onDelta(Map<String, Object> delta);
     }
 
     @FunctionalInterface
     public interface RetryWaitCallback {
-        void accept(String message);
+        /**
+         * Notify caller before each retry sleep chunk.
+         *
+         * python_analog: Callable[[str], Awaitable[None]] (async callback)
+         */
+        CompletableFuture<Void> onWait(String message);
     }
 
     /**
-     * Core retry engine. Replaces Python's async _run_with_retry.
+     * Core retry engine.
      *
-     * In Java with Virtual Threads, we use Thread.sleep() instead of asyncio.sleep().
-     * Virtual threads are cheap and blocking a virtual thread during sleep is fine.
+     * python_analog: async def _run_with_retry(...)
      */
-    protected LLMResponse runWithRetry(
+    protected CompletableFuture<LLMResponse> runWithRetry(
         ChatStreamCallable call,
         List<Map<String, Object>> originalMessages,
         List<Map<String, Object>> tools,
@@ -636,112 +673,113 @@ public abstract class LLMProvider {
         String retryMode,
         RetryWaitCallback onRetryWait,
         Supplier<Boolean> shouldRetryGuard,
-        Runnable onStreamRecover
+        Supplier<CompletableFuture<Void>> onStreamRecover
     ) {
-        boolean persistent = "persistent".equals(retryMode);
-        int attempt = 0;
-        LLMResponse lastResponse = null;
-        String lastErrorKey = null;
-        int identicalErrorCount = 0;
+        return CompletableFuture.supplyAsync(() -> {
+            boolean persistent = "persistent".equals(retryMode);
+            int attempt = 0;
+            LLMResponse lastResponse = null;
+            String lastErrorKey = null;
+            int identicalErrorCount = 0;
 
-        while (true) {
-            attempt++;
-            LLMResponse response = call.call(originalMessages, tools, model,
-                                             maxTokens, temperature,
-                                             reasoningEffort, toolChoice);
+            while (true) {
+                attempt++;
+                LLMResponse response = call.call(originalMessages, tools, model,
+                                                 maxTokens, temperature,
+                                                 reasoningEffort, toolChoice).join();
 
-            if (!"error".equals(response.finishReason())) {
-                return response;  // success
-            }
+                if (!"error".equals(response.finishReason())) {
+                    return response;  // success
+                }
 
-            lastResponse = response;
+                lastResponse = response;
 
-            // Handle "has streamed content" guard
-            if (shouldRetryGuard != null && !shouldRetryGuard.get()) {
-                boolean isTimeout = "timeout".equals(
-                    (response.errorKind() != null) ? response.errorKind().toLowerCase() : "");
-                if (isTimeout) {
-                    if (onStreamRecover != null) {
-                        log.warn("LLM stream stalled after content was emitted; " +
-                                 "starting a new stream segment and retrying");
-                        onStreamRecover.run();
+                // Handle "has streamed content" guard
+                if (shouldRetryGuard != null && !shouldRetryGuard.get()) {
+                    boolean isTimeout = "timeout".equals(
+                        (response.errorKind() != null) ? response.errorKind().toLowerCase() : "");
+                    if (isTimeout) {
+                        if (onStreamRecover != null) {
+                            log.warn("LLM stream stalled after content was emitted; " +
+                                     "starting a new stream segment and retrying");
+                            onStreamRecover.get().join();
+                        } else {
+                            log.warn("LLM stream stalled after content was emitted; " +
+                                     "suppressing delta callbacks and retrying");
+                            shouldRetryGuard = null;
+                        }
                     } else {
-                        log.warn("LLM stream stalled after content was emitted; " +
-                                 "suppressing delta callbacks and retrying");
-                        shouldRetryGuard = null; // stop guarding, cannot check again
+                        log.warn("LLM stream failed after content was emitted; skipping retry");
+                        return response;
                     }
+                }
+
+                // Track identical error count for persistent mode
+                String errorKey = (response.content() != null)
+                    ? response.content().strip().toLowerCase() : null;
+                if (errorKey != null && !errorKey.isEmpty() && errorKey.equals(lastErrorKey)) {
+                    identicalErrorCount++;
                 } else {
-                    log.warn("LLM stream failed after content was emitted; skipping retry");
+                    lastErrorKey = errorKey;
+                    identicalErrorCount = (errorKey != null && !errorKey.isEmpty()) ? 1 : 0;
+                }
+
+                // Non-transient errors are NOT retried
+                if (!isTransientResponse(response)) {
+                    List<Map<String, Object>> stripped = stripImageContent(originalMessages);
+                    if (stripped != null && !stripped.equals(originalMessages)) {
+                        log.warn("Non-transient LLM error with image content, retrying without images");
+                        LLMResponse result = call.call(stripped, tools, model,
+                                                        maxTokens, temperature,
+                                                        reasoningEffort, toolChoice).join();
+                        if (!"error".equals(result.finishReason())) {
+                            stripImageContentInplace(originalMessages);
+                        }
+                        return result;
+                    }
                     return response;
                 }
-            }
 
-            // Track identical error count for persistent mode
-            String errorKey = (response.content() != null)
-                ? response.content().strip().toLowerCase() : null;
-            if (errorKey != null && !errorKey.isEmpty() && errorKey.equals(lastErrorKey)) {
-                identicalErrorCount++;
-            } else {
-                lastErrorKey = errorKey;
-                identicalErrorCount = (errorKey != null && !errorKey.isEmpty()) ? 1 : 0;
-            }
-
-            // Non-transient errors are NOT retried
-            if (!isTransientResponse(response)) {
-                // Try without images
-                List<Map<String, Object>> stripped = stripImageContent(originalMessages);
-                if (stripped != null && !stripped.equals(originalMessages)) {
-                    log.warn("Non-transient LLM error with image content, retrying without images");
-                    LLMResponse result = call.call(stripped, tools, model,
-                                                    maxTokens, temperature,
-                                                    reasoningEffort, toolChoice);
-                    if (!"error".equals(result.finishReason())) {
-                        stripImageContentInplace(originalMessages);
+                // Persistent mode: stop after too many identical errors
+                if (persistent && identicalErrorCount >= PERSISTENT_IDENTICAL_ERROR_LIMIT) {
+                    log.warn("Stopping persistent retry after {} identical transient errors: {}",
+                             identicalErrorCount,
+                             truncateContent(response.content(), 120));
+                    if (onRetryWait != null) {
+                        onRetryWait.onWait("Persistent retry stopped after " +
+                                           identicalErrorCount + " identical errors.").join();
                     }
-                    return result;
+                    return response;
                 }
-                return response;
-            }
 
-            // Persistent mode: stop after too many identical errors
-            if (persistent && identicalErrorCount >= PERSISTENT_IDENTICAL_ERROR_LIMIT) {
-                log.warn("Stopping persistent retry after {} identical transient errors: {}",
-                         identicalErrorCount,
+                // Standard mode: stop after exhausting delays
+                if (!persistent && attempt > CHAT_RETRY_DELAYS.length) {
+                    log.warn("LLM request failed after {} retries, giving up: {}",
+                             attempt, truncateContent(response.content(), 120));
+                    if (onRetryWait != null) {
+                        onRetryWait.onWait("Model request failed after " + attempt +
+                                           " retries, giving up.").join();
+                    }
+                    break;
+                }
+
+                double baseDelay = CHAT_RETRY_DELAYS[Math.min(attempt - 1, CHAT_RETRY_DELAYS.length - 1)];
+                double delay = extractRetryAfterFromResponse(response);
+                if (delay <= 0) delay = baseDelay;
+                if (persistent) delay = Math.min(delay, PERSISTENT_MAX_DELAY);
+
+                log.warn("LLM transient error (attempt {}{}), retrying in {}s: {}",
+                         attempt,
+                         (persistent && attempt > CHAT_RETRY_DELAYS.length) ? "+" : "/" + CHAT_RETRY_DELAYS.length,
+                         (int) Math.round(delay),
                          truncateContent(response.content(), 120));
-                if (onRetryWait != null) {
-                    onRetryWait.accept("Persistent retry stopped after " +
-                                       identicalErrorCount + " identical errors.");
-                }
-                return response;
+
+                sleepWithHeartbeat(delay, attempt, persistent, onRetryWait).join();
             }
 
-            // Standard mode: stop after exhausting delays
-            if (!persistent && attempt > CHAT_RETRY_DELAYS.length) {
-                log.warn("LLM request failed after {} retries, giving up: {}",
-                         attempt, truncateContent(response.content(), 120));
-                if (onRetryWait != null) {
-                    onRetryWait.accept("Model request failed after " + attempt +
-                                       " retries, giving up.");
-                }
-                break;
-            }
-
-            double baseDelay = CHAT_RETRY_DELAYS[Math.min(attempt - 1, CHAT_RETRY_DELAYS.length - 1)];
-            double delay = extractRetryAfterFromResponse(response);
-            if (delay <= 0) delay = baseDelay;
-            if (persistent) delay = Math.min(delay, PERSISTENT_MAX_DELAY);
-
-            log.warn("LLM transient error (attempt {}{}), retrying in {}s: {}",
-                     attempt,
-                     (persistent && attempt > CHAT_RETRY_DELAYS.length) ? "+" : "/" + CHAT_RETRY_DELAYS.length,
-                     (int) Math.round(delay),
-                     truncateContent(response.content(), 120));
-
-            sleepWithHeartbeat(delay, attempt, persistent, onRetryWait);
-        }
-
-        return lastResponse != null ? lastResponse : call.call(
-            originalMessages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice);
+            return lastResponse != null ? lastResponse : call.call(
+                originalMessages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice).join();
+        });
     }
 
     // =========================================================================
@@ -750,31 +788,40 @@ public abstract class LLMProvider {
     // are designed for blocking operations.
     // =========================================================================
 
-    protected void sleepWithHeartbeat(
+    /**
+     * Sleep with heartbeat notifications.
+     *
+     * python_analog: async def _sleep_with_heartbeat(...)
+     */
+    protected CompletableFuture<Void> sleepWithHeartbeat(
         double delay,
         int attempt,
         boolean persistent,
         RetryWaitCallback onRetryWait
     ) {
-        double remaining = Math.max(0.0, delay);
-        while (remaining > 0) {
-            if (onRetryWait != null) {
-                String kind = persistent ? "persistent retry" : "retry";
-                onRetryWait.accept(
-                    "Model request failed, " + kind + " in " +
-                    Math.max(1, (int) Math.round(remaining)) + "s " +
-                    "(attempt " + attempt + ")."
-                );
+        return CompletableFuture.runAsync(() -> {
+            double remaining = Math.max(0.0, delay);
+            while (remaining > 0) {
+                if (onRetryWait != null) {
+                    String kind = persistent ? "persistent retry" : "retry";
+                    try {
+                        onRetryWait.onWait(
+                            "Model request failed, " + kind + " in " +
+                            Math.max(1, (int) Math.round(remaining)) + "s " +
+                            "(attempt " + attempt + ")."
+                        ).join();
+                    } catch (Exception ignored) {}
+                }
+                double chunk = Math.min(remaining, RETRY_HEARTBEAT_CHUNK);
+                try {
+                    Thread.sleep((long) (chunk * 1000));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                remaining -= chunk;
             }
-            double chunk = Math.min(remaining, RETRY_HEARTBEAT_CHUNK);
-            try {
-                Thread.sleep((long) (chunk * 1000));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            remaining -= chunk;
-        }
+        });
     }
 
     // =========================================================================

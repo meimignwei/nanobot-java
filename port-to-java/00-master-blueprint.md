@@ -22,12 +22,12 @@
 
 | 关注点 | Python 原版 | Java 复刻 | 理由 |
 |--------|------------|-----------|------|
-| 运行时 | asyncio | Virtual Threads (JEP 444) | 同步写法、异步性能、不再传染 async |
+| 运行时基础设施 | asyncio | Virtual Threads (JEP 444) | 仅用于同步并发场景（如消息循环），不替代 async def 语义 |
 | HTTP/WS | aiohttp + websockets | Spring Boot 3.2+ (Tomcat) | 虚拟线程一行启用，WebSocket 成熟 |
 | 配置 | Pydantic BaseSettings | @ConfigurationProperties + Java Record | 编译时类型安全 |
 | JSON | 内置 json + json_repair | Jackson ObjectMapper | 行业标准 |
 | 插件发现 | pkgutil.iter_modules + entry_points | Spring @Component scan + ServiceLoader | 编译时 + 运行时 |
-| LLM HTTP | httpx / aiohttp | java.net.http.HttpClient (虚拟线程) | JDK 内置，零额外依赖 |
+| LLM HTTP | httpx / aiohttp | java.net.http.HttpClient (异步 API) | JDK 内置，sendAsync() 返回 CompletableFuture |
 | 测试 | pytest + pytest-asyncio | JUnit 5 + AssertJ | 标准选择 |
 | 构建 | pip/setuptools | Maven (pom.xml) | 依赖管理清晰 |
 
@@ -74,22 +74,36 @@ var content = response.content();
 | `Enum` | Java `enum` |
 | `asyncio.Queue` | `LinkedBlockingQueue` |
 | `contextvars.ContextVar` | `ThreadLocal<T>`（虚拟线程天然隔离） |
-| `async def` | 虚拟线程中的普通方法（同步风格） |
-| `await` | 直接调用（虚拟线程自动 yield） |
+| `async def` | `CompletableFuture<T>` |
+| `await` | `.thenCompose()` / `.join()` / `.get()` |
 
 ### 3.4 并发模型
 
-Python asyncio 的协程模型在 Java 中全部替换为 Virtual Threads：
+**最高原则**：源码中的 `async def` 必须映射为 `CompletableFuture<T>`，`await` 映射为 CompletableFuture 链式操作。Virtual Threads 仅用于源码中**本就同步**的并发场景（如长时间运行的阻塞循环），**绝不用于将异步方法改为同步风格**。
+
+| Python | Java | 说明 |
+|--------|------|------|
+| `async def` | `CompletableFuture<T>` | 100% 复刻源码异步语义 |
+| `await` | `.thenCompose()` / `.join()` | CompletableFuture 链式组合或阻塞等待 |
+| `asyncio.Queue` | `LinkedBlockingQueue` | 在 Virtual Thread 中调用 `take()` 或使用 `supplyAsync(() -> queue.take())` |
+| `asyncio.wait_for(task, timeout=N)` | `.orTimeout(timeout, unit)` | CF 原生超时 |
+| `asyncio.CancelledError` | `CancellationException` | CF 取消时抛出 |
 
 ```java
+// Python: async def chat(...) -> LLMResponse
+// Java:   public CompletableFuture<LLMResponse> chat(...) { ... }
+
+// Python: response = await provider.chat(...)
+// Java:   LLMResponse response = provider.chat(...).join();
+
 // Python: asyncio.Queue + await queue.get()
-// Java:   LinkedBlockingQueue + queue.take()  (在虚拟线程中调用)
+// Java:   LinkedBlockingQueue + queue.take()  (在 Virtual Thread 中运行)
 
 // Python: asyncio.wait_for(task, timeout=N)
-// Java:   StructuredTaskScope.joinUntil(deadline) 或 Future.get(timeout)
+// Java:   task.orTimeout(timeout, TimeUnit.SECONDS)
 
 // Python: asyncio.CancelledError
-// Java:   InterruptedException (协作取消)
+// Java:   CancellationException (CompletableFuture.cancel(true))
 ```
 
 Spring Boot 启用虚拟线程：
@@ -488,8 +502,8 @@ nanobot-java/
 
 | 风险 | 缓解 |
 |------|------|
-| Python asyncio.CancelledError | 虚拟线程中用 `InterruptedException` 实现协作取消，在关键检查点 `Thread.interrupted()` |
-| asyncio.wait_for(timeout=N) | `StructuredTaskScope.joinUntil(deadline)` 或 `Future.get(timeout).cancel()` |
+| Python asyncio.CancelledError | `CompletableFuture` 层用 `CancellationException`；Virtual Thread 层用 `InterruptedException` 实现协作取消，在关键检查点 `Thread.interrupted()` |
+| asyncio.wait_for(timeout=N) | `CompletableFuture.orTimeout(timeout, unit)` 或 `Future.get(timeout, unit).cancel(true)` |
 | contextvars 跨线程泄漏 | 虚拟线程 1:1 对应请求 → `ThreadLocal<T>` 天然正确 |
 | dict[str, Any] 类型安全 | 用 sealed interface / record 替代，保持 JSON 序列化兼容 |
 | provider retry-after header 解析 | `DateTimeFormatter.RFC_1123_DATE_TIME` 对标 Python `email.utils.parsedate_to_datetime` |

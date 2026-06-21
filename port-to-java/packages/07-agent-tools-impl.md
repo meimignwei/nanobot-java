@@ -6,7 +6,7 @@
 
 ## Overview
 
-This document covers all 23 tool implementations in the nanobot agent framework. Each tool extends `Tool` (or `_FsTool` for filesystem tools) and follows the same lifecycle: enabled-check, factory creation, parameter casting/validation, and async execution.
+This document covers all 24 tool implementations in the nanobot agent framework. Each tool extends `Tool` (or `_FsTool` for filesystem tools) and follows the same lifecycle: enabled-check, factory creation, parameter casting/validation, and async execution.
 
 ### Class Hierarchy
 
@@ -24,7 +24,10 @@ Tool (abstract)
   |-- MessageTool                      (message.py)
   |-- SpawnTool                        (spawn.py)
   |-- MyTool                           (self.py)
+  |-- CliAppsTool                      (cli_apps.py)
   |-- MCPToolWrapper                   (mcp.py — wraps external MCP tools)
+  |-- MCPResourceWrapper               (mcp.py — wraps MCP resources)
+  |-- MCPPromptWrapper                 (mcp.py — wraps MCP prompts)
   |-- _FsTool (abstract intermediate)
   |     |-- ReadFileTool               (filesystem.py)
   |     |-- WriteFileTool              (filesystem.py)
@@ -116,6 +119,19 @@ private static final List<String> HARD_DENY_PATTERNS = List.of(
     "\\bdd\\b[^|;&<>]*\\bof=\\S*(?:history\\.jsonl|\\.dream_cursor)",
     "\\bsed\\s+-i[^|;&<>]*(?:history\\.jsonl|\\.dream_cursor)"
 );
+
+private static final String WORKSPACE_BOUNDARY_NOTE =
+    "\n\nNote: this is a hard policy boundary, not a transient failure. "
+    + "Do NOT retry with shell tricks (symlinks, base64 piping, alternative "
+    + "tools, working_dir overrides). If the user genuinely needs this "
+    + "resource, tell them you cannot reach it under the current "
+    + "restrict_to_workspace policy and ask how to proceed.";
+
+// Kernel device files safe as stdio redirect targets (#3599).
+private static final Set<String> BENIGN_DEVICE_PATHS = Set.of(
+    "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+    "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"
+);
 ```
 
 ### Key Implementation: _guardCommand
@@ -138,7 +154,14 @@ public String guardCommand(String command, Path cwd,
                     .matcher(lower).find());
 
     if (!explicitlyAllowed) {
-        // 2. Check deny patterns
+        // 2. Check hard-coded deny patterns first
+        for (String pattern : HARD_DENY_PATTERNS) {
+            if (Pattern.compile(pattern, Pattern.CASE_INSENSITIVE)
+                    .matcher(lower).find()) {
+                return "Error: Command blocked by deny pattern filter";
+            }
+        }
+        // 3. Check config-level deny patterns (appended to hard-coded list in Python)
         for (String pattern : denyPatterns) {
             if (Pattern.compile(pattern, Pattern.CASE_INSENSITIVE)
                     .matcher(lower).find()) {
@@ -146,7 +169,7 @@ public String guardCommand(String command, Path cwd,
             }
         }
 
-        // 3. If allow-patterns are configured and command isn't in them
+        // 4. If allow-patterns are configured and command isn't in them
         if (!allowPatterns.isEmpty()) {
             return "Error: Command blocked by allowlist filter (not in allowlist)";
         }
@@ -159,17 +182,19 @@ public String guardCommand(String command, Path cwd,
 
     // 5. Workspace boundary guard
     if (restrictToWorkspace) {
-        if (cmd.contains("..\\") || cmd.contains("../")) {
+        // Python checks "../" and "..\" literally; match exactly.
+        if (cmd.contains("../") || cmd.contains("..\\")) {
             return "Error: Command blocked by safety guard (path traversal detected)"
                     + WORKSPACE_BOUNDARY_NOTE;
         }
 
         for (String absPath : extractAbsolutePaths(cmd)) {
             try {
-                String expanded = System.getenv().entrySet().stream()
-                        .reduce(absPath, (s, e) ->
-                                s.replace("$" + e.getKey(), e.getValue()),
-                                (a, b) -> a);
+                // Expand environment variables ($HOME on Unix, %VAR% not handled here)
+                String expanded = absPath;
+                for (Map.Entry<String, String> e : System.getenv().entrySet()) {
+                    expanded = expanded.replace("$" + e.getKey(), e.getValue());
+                }
                 if (isBenignDevicePath(expanded)) continue;
 
                 Path resolved = Path.of(expanded.replaceFirst("^~",
@@ -189,6 +214,27 @@ public String guardCommand(String command, Path cwd,
     }
     return null; // all clear
 }
+
+/** Return true for kernel device files that should never be workspace-blocked. */
+private static boolean isBenignDevicePath(String path) {
+    if (BENIGN_DEVICE_PATHS.contains(path)) return true;
+    return path.startsWith("/dev/fd/");
+}
+
+/** Extract absolute paths from a command string for workspace boundary checks. */
+private static List<String> extractAbsolutePaths(String command) {
+    List<String> paths = new ArrayList<>();
+    // Windows: C:\path, \\server\share
+    Matcher win = Pattern.compile("(?<![A-Za-z])(?:[A-Za-z]:[^\\s\"'|><;]*|\\\\[^\\s\"'|><;]+(?:\\[^\\s\"'|><;]+)*)").matcher(command);
+    while (win.find()) paths.add(win.group());
+    // POSIX absolute
+    Matcher posix = Pattern.compile("(?:^|[\\s|>'\"])(/[^\\s\"'>;|<]+)").matcher(command);
+    while (posix.find()) paths.add(posix.group(1));
+    // Home shortcuts
+    Matcher home = Pattern.compile("(?:^|[\\s>'\"])(~[^\\s\"'>;|<]*)").matcher(command);
+    while (home.find()) paths.add(home.group(1));
+    return paths;
+}
 ```
 
 ### Process Spawning
@@ -198,39 +244,49 @@ public String guardCommand(String command, Path cwd,
  * Launch a command in a platform-appropriate shell.
  * On Windows: powershell for multi-line, cmd for single-line.
  * On Unix: bash -l (login shell) for proper PATH/profile.
+ *
+ * <p>Mirrors Python {@code async def _spawn(...)} — returns a
+ * {@link CompletableFuture} because subprocess creation is async in the
+ * source. Java uses {@code ProcessBuilder} (sync API) wrapped in
+ * {@code supplyAsync} to preserve the external async contract.
  */
-public Process spawn(String command, Path cwd, Map<String, String> env,
-                     String shellProgram, boolean login) throws IOException {
-
-    ProcessBuilder pb;
-    if (IS_WINDOWS) {
-        if (command.contains("\n")) {
-            pb = new ProcessBuilder("powershell", "-NoProfile", "-Command", command);
+public static CompletableFuture<Process> spawn(String command, Path cwd, Map<String, String> env,
+                     String shellProgram, boolean login, boolean sessionMode) {
+    return CompletableFuture.supplyAsync(() -> {
+        ProcessBuilder pb;
+        if (IS_WINDOWS) {
+            if (command.contains("\n")) {
+                pb = new ProcessBuilder("powershell", "-NoProfile", "-Command", command);
+            } else {
+                pb = new ProcessBuilder("cmd", "/c", command);
+            }
         } else {
-            pb = new ProcessBuilder("cmd", "/c", command);
+            String shell = (shellProgram != null) ? shellProgram
+                    : (Files.exists(Path.of("/bin/bash")) ? "/bin/bash" : "/bin/sh");
+            List<String> args = new ArrayList<>();
+            args.add(shell);
+            String shellName = Path.of(shell).getFileName().toString().toLowerCase();
+            if (login && (shellName.equals("bash") || shellName.equals("zsh"))) {
+                args.add("-l");
+            }
+            args.add("-c");
+            args.add(command);
+            pb = new ProcessBuilder(args);
         }
-    } else {
-        String shell = (shellProgram != null) ? shellProgram
-                : (Files.exists(Path.of("/bin/bash")) ? "/bin/bash" : "/bin/sh");
-        List<String> args = new ArrayList<>();
-        args.add(shell);
-        String shellName = Path.of(shell).getFileName().toString().toLowerCase();
-        if (login && (shellName.equals("bash") || shellName.equals("zsh"))) {
-            args.add("-l");
+
+        pb.directory(cwd.toFile());
+        pb.environment().clear();
+        pb.environment().putAll(env);
+        if (sessionMode) {
+            pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+        } else {
+            pb.redirectInput(ProcessBuilder.Redirect.DISCARD);
         }
-        args.add("-c");
-        args.add(command);
-        pb = new ProcessBuilder(args);
-    }
+        pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
+        pb.redirectError(ProcessBuilder.Redirect.PIPE);
 
-    pb.directory(cwd.toFile());
-    pb.environment().clear();
-    pb.environment().putAll(env);
-    pb.redirectInput(ProcessBuilder.Redirect.PIPE); // or DEVNULL for one-shot
-    pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
-    pb.redirectError(ProcessBuilder.Redirect.PIPE);
-
-    return pb.start();
+        return pb.start();
+    });
 }
 
 /**
@@ -281,18 +337,22 @@ private static final Map<String, Object> PARAMETERS =
             "cmd", new StringSchema("Compatibility alias for command"),
             "working_dir", new StringSchema("Optional working directory for the command"),
             "workdir", new StringSchema("Compatibility alias for working_dir"),
-            "timeout", new IntegerSchema(60,
-                    "Timeout in seconds (default 60, max 600)", 1, 600),
+            "timeout", new IntegerSchema(
+                    "Timeout in seconds (default 60, max 600)", 1, 600, null, false),
             "shell", new StringSchema(
                     "Optional shell binary. On Unix: sh, bash, or zsh.",
-                    null, null, null, true), // nullable
+                    null, null, null, true),
             "login", new BooleanSchema(
-                    "Whether to run bash/zsh with login shell semantics (default true)"),
-            "yield_time_ms", new IntegerSchema(null,
+                    "Whether to run bash/zsh with login shell semantics (default true)",
+                    true, true),
+            "yield_time_ms", new IntegerSchema(
                     "Milliseconds to wait before returning output. When set, returns session_id",
-                    0, 30_000, null, true), // nullable
+                    0, 30_000, null, true),
             "max_output_chars", new IntegerSchema(
                     "Maximum output chars when yield_time_ms is used (default 10000, max 50000)",
+                    1000, 50_000, null, true),
+            "max_output_tokens", new IntegerSchema(
+                    "Compatibility alias for max_output_chars. The current runtime uses a character budget.",
                     1000, 50_000, null, true)
         )
     );
@@ -346,17 +406,19 @@ public abstract class FsTool extends Tool {
 
     protected final Path workspace;
     protected final Path allowedDir;
+    protected final Path mediaDir;
     protected final List<Path> extraAllowedDirs;
     protected final boolean restrictToWorkspace;
     protected final boolean sandboxRestrictsWorkspace;
     protected final FileStates explicitFileStates;
     private final FileStates fallbackFileStates = new FileStates();
 
-    public FsTool(Path workspace, Path allowedDir, List<Path> extraAllowedDirs,
+    public FsTool(Path workspace, Path allowedDir, Path mediaDir, List<Path> extraAllowedDirs,
                   FileStates fileStates, boolean restrictToWorkspace,
                   boolean sandboxRestrictsWorkspace) {
         this.workspace = workspace;
         this.allowedDir = allowedDir;
+        this.mediaDir = mediaDir;
         this.extraAllowedDirs = extraAllowedDirs;
         this.explicitFileStates = fileStates;
         this.restrictToWorkspace = restrictToWorkspace;
@@ -371,14 +433,18 @@ public abstract class FsTool extends Tool {
 
     /** Resolve a user-supplied path against the workspace with containment check. */
     protected Path resolve(String path) {
-        return PathUtils.resolveWorkspacePath(path, workspace, allowedDir, extraAllowedDirs);
+        return PathUtils.resolveWorkspacePath(path, workspace, allowedDir, mediaDir, extraAllowedDirs);
     }
 
-    /** Get the FileStates — prefers explicit, falls back to ContextVar-bound, then local. */
+    /** Get the FileStates — prefers explicit, falls back to ThreadLocal-bound, then local. */
+    private static final ThreadLocal<FileStates> FILE_STATES_CONTEXT = new ThreadLocal<>();
+
+    public static void bindFileStates(FileStates fs) { FILE_STATES_CONTEXT.set(fs); }
+    public static void unbindFileStates() { FILE_STATES_CONTEXT.remove(); }
+
     protected FileStates fileStates() {
         if (explicitFileStates != null) return explicitFileStates;
-        // In Java: use ThreadLocal<FileStates> for per-task binding
-        FileStates bound = FileStatesContext.current();
+        FileStates bound = FILE_STATES_CONTEXT.get();
         return (bound != null) ? bound : fallbackFileStates;
     }
 }
@@ -400,28 +466,60 @@ Reads files with support for:
 
 ```java
 @Component
-@ToolParametersDef({
-    @Param(name = "path", type = StringSchema.class, description = "The file path to read"),
-    @Param(name = "offset", type = IntegerSchema.class, description = "Line number (1-indexed, default 1)"),
-    @Param(name = "limit", type = IntegerSchema.class, description = "Max lines to read (default 2000)"),
-    @Param(name = "pages", type = StringSchema.class, description = "Page range for PDF, e.g. '1-5'"),
-    @Param(name = "force", type = BooleanSchema.class, description = "Bypass deduplication")
-})
 public class ReadFileTool extends FsTool {
+
+    private static final Map<String, Object> PARAMETERS =
+        ToolParametersSchema.create(
+            List.of("path"),
+            null,
+            Map.of(
+                "path", new StringSchema("The file path to read"),
+                "offset", new IntegerSchema("Line number to start reading from (1-indexed, default 1)", 1, null, null, false),
+                "limit", new IntegerSchema("Max lines to read (default 2000)", 1, null, null, false),
+                "pages", new StringSchema("Page range for PDF, e.g. '1-5'"),
+                "force", new BooleanSchema("Bypass deduplication and force re-read", false, false)
+            )
+        );
 
     private static final int MAX_CHARS = 128_000;
     private static final int DEFAULT_LIMIT = 2000;
     private static final int MAX_PDF_PAGES = 20;
 
     // Blocked device paths (infinite output / hang risk)
+    // Mirrors Python _BLOCKED_DEVICE_PATHS + _is_blocked_device regex checks.
     private static final Set<String> BLOCKED_DEVICE_PATHS = Set.of(
             "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
             "/dev/stdin", "/dev/stdout", "/dev/stderr",
-            "/dev/tty", "/dev/console"
+            "/dev/tty", "/dev/console",
+            "/dev/fd/0", "/dev/fd/1", "/dev/fd/2"
     );
+
+    private static final Pattern PROC_FD_PATTERN = Pattern.compile("/proc/(?:self|\\d+)/fd/[012]$");
+
+    private boolean isBlockedDevice(String path) {
+        String raw = path.strip();
+        if (BLOCKED_DEVICE_PATHS.contains(raw)) return true;
+        if (PROC_FD_PATTERN.matcher(raw).find()) return true;
+        // Resolved symlinks under /dev/ are also blocked
+        try {
+            String resolved = Path.of(raw).toRealPath().toString();
+            if (BLOCKED_DEVICE_PATHS.contains(resolved)) return true;
+            if (PROC_FD_PATTERN.matcher(resolved).find()) return true;
+            if (resolved.startsWith("/dev/")) return true;
+        } catch (IOException e) {
+            // path does not exist — not a blocked device
+        }
+        return false;
+    }
 
     @Override
     public String getName() { return "read_file"; }
+
+    @Override
+    public String getDescription() { return "Read a file from the workspace. Supports text, PDF, Office docs, and images."; }
+
+    @Override
+    public Map<String, Object> getParameters() { return ToolParameters.deepCopy(PARAMETERS); }
 
     @Override
     public boolean isReadOnly() { return true; }
@@ -501,7 +599,10 @@ public class ReadFileTool extends FsTool {
 
             // 7. Read as text
             try {
-                String content = new String(raw, StandardCharsets.UTF_8);
+                CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT);
+                String content = decoder.decode(ByteBuffer.wrap(raw)).toString();
                 content = content.replace("\r\n", "\n"); // normalize CRLF
 
                 List<String> allLines = List.of(content.split("\n", -1));
@@ -614,34 +715,32 @@ public class WebSearchTool extends Tool {
 
     @Override
     public CompletableFuture<Object> execute(Map<String, Object> params) {
-        return CompletableFuture.supplyAsync(() -> {
-            refreshConfig();
-            String provider = config.provider().strip().toLowerCase();
-            String query = (String) params.get("query");
-            int count = Math.min(Math.max(
-                    params.containsKey("count") ? (int) params.get("count")
-                            : config.maxResults(), 1), 10);
+        refreshConfig();
+        String provider = config.provider().strip().toLowerCase();
+        if (provider.isEmpty()) provider = "brave";
+        String query = (String) params.get("query");
+        int count = Math.min(Math.max(
+                params.containsKey("count") ? (int) params.get("count")
+                        : config.maxResults(), 1), 10);
 
-            try {
-                return switch (provider) {
-                    case "duckduckgo" -> searchDuckDuckGo(query, count);
-                    case "brave" -> searchBrave(query, count);
-                    case "tavily" -> searchTavily(query, count);
-                    case "searxng" -> searchSearXNG(query, count);
-                    case "jina" -> searchJina(query, count);
-                    case "kagi" -> searchKagi(query, count);
-                    case "exa" -> searchExa(query, count);
-                    case "olostep" -> searchOlostep(query, count);
-                    case "bocha" -> searchBocha(query, count);
-                    case "volcengine" -> searchVolcengine(query, count, params);
-                    default -> "Error: unknown search provider '" + provider + "'";
-                };
-            } catch (Exception e) {
-                log.warn("Search provider '{}' failed, falling back to DuckDuckGo. Error: {}",
-                        provider, e.getMessage());
-                return searchDuckDuckGo(query, count);
-            }
-        }, Thread.ofVirtual().factory());
+        // All provider-specific search methods are async (mirroring Python async def _search_*)
+        CompletableFuture<String> searchFuture = switch (provider) {
+            case "duckduckgo" -> searchDuckDuckGo(query, count);
+            case "brave" -> searchBrave(query, count);
+            case "tavily" -> searchTavily(query, count);
+            case "searxng" -> searchSearXNG(query, count);
+            case "jina" -> searchJina(query, count);
+            case "kagi" -> searchKagi(query, count);
+            case "exa" -> searchExa(query, count);
+            case "olostep" -> searchOlostep(query, count);
+            case "bocha" -> searchBocha(query, count);
+            case "volcengine" -> searchVolcengine(query, count, params);
+            default -> CompletableFuture.completedFuture(
+                    "Error: unknown search provider '" + provider + "'");
+        };
+
+        return searchFuture
+                .thenApply(result -> (Object) result);
     }
 
     /** Format results into the shared plaintext output format. */
@@ -668,7 +767,12 @@ public class WebSearchTool extends Tool {
 ### Brave Search Implementation (example provider)
 
 ```java
-private String searchBrave(String query, int count) {
+/**
+ * Brave Search implementation.
+ * Mirrors Python {@code async def _search_brave(...)} — uses
+ * {@code HttpClient.sendAsync} to preserve the async contract.
+ */
+private CompletableFuture<String> searchBrave(String query, int count) {
     String apiKey = config.apiKey();
     if (apiKey == null || apiKey.isEmpty()) {
         apiKey = System.getenv("BRAVE_API_KEY");
@@ -693,41 +797,43 @@ private String searchBrave(String query, int count) {
             .GET()
             .build();
 
-    try {
-        // Retry once on 429
-        for (int attempt = 0; attempt < 2; attempt++) {
-            var response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 429) {
+    // Retry once on 429
+    return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .thenCompose(response -> {
+                if (response.statusCode() == 429) {
+                    log.warn("Brave search rate limited; retrying in 1s");
+                    return CompletableFuture.supplyAsync(() -> {
+                        try { Thread.sleep(1000); } catch (InterruptedException e) {}
+                        return null;
+                    }).thenCompose(_ -> client.sendAsync(request, HttpResponse.BodyHandlers.ofString()));
+                }
+                return CompletableFuture.completedFuture(response);
+            })
+            .thenApply(response -> {
                 if (response.statusCode() >= 400) {
                     return "Error: Brave search HTTP " + response.statusCode();
                 }
-                // Parse results
-                ObjectMapper mapper = new ObjectMapper();
-                JsonNode root = mapper.readTree(response.body());
-                List<SearchResult> results = new ArrayList<>();
-                for (JsonNode item : root.at("/web/results")) {
-                    results.add(new SearchResult(
-                            item.path("title").asText(""),
-                            item.path("url").asText(""),
-                            item.path("description").asText("")));
+                try {
+                    ObjectMapper mapper = new ObjectMapper();
+                    JsonNode root = mapper.readTree(response.body());
+                    List<SearchResult> results = new ArrayList<>();
+                    for (JsonNode item : root.at("/web/results")) {
+                        results.add(new SearchResult(
+                                item.path("title").asText(""),
+                                item.path("url").asText(""),
+                                item.path("description").asText("")));
+                    }
+                    return formatResults(query, results, count);
+                } catch (Exception e) {
+                    return "Error: " + e.getMessage();
                 }
-                return formatResults(query, results, count);
-            }
-            if (attempt == 0) {
-                log.warn("Brave search rate limited; retrying in 1s");
-                Thread.sleep(1000);
-            }
-        }
-        return "Error: Brave search rate limited after retry.";
-    } catch (Exception e) {
-        return "Error: " + e.getMessage();
-    }
+            });
 }
 ```
 
 ---
 
-## Summary Table: All 23 Tools
+## Summary Table: All 24 Tools
 
 | # | Tool Name | Class | Lines | ReadOnly | Exclusive | Scopes | Key Design Notes |
 |---|-----------|-------|-------|----------|-----------|--------|-------------------|
@@ -750,7 +856,8 @@ private String searchBrave(String query, int count) {
 | 17 | `generate_image` | `ImageGenerationTool` | ~200 | No | No | core | Multi-provider image gen via ImageGenerationProvider interface |
 | 18 | `message` | `MessageTool` | 273 | No | No | core | Cross-channel proactive delivery, media attachments, inline keyboard buttons |
 | 19 | `my` | `MyTool` | 485 | No | No | core | Runtime state inspection + modification (check/set), sensitive field redaction |
-| 20-23 | `mcp_*` | `MCPToolWrapper` | ~1122 | varies | varies | core | Dynamic tools from MCP servers, schema normalization, transient error retry |
+| 20 | `cli_apps` | `CliAppsTool` | ~150 | No | No | core | Registered CLI app invocation with arg passing, json output, working_dir, timeout |
+| 21-24 | `mcp_*` | `MCPToolWrapper` | ~1122 | varies | varies | core | Dynamic tools from MCP servers, schema normalization, transient error retry |
 
 ### Tools Requiring Specific Dependencies
 
@@ -783,6 +890,12 @@ import java.util.concurrent.*;
  * Manages up to 8 concurrent long-running exec sessions.
  * Each session wraps a Process with async stdout/stderr readers,
  * supports stdin writes, EOF, terminate, and poll with yield timing.
+ *
+ * <p>All public methods return {@link CompletableFuture} to mirror Python
+ * {@code async def start/write/list}. The {@code ExecSession} inner class
+ * methods ({@code write}, {@code closeStdin}, {@code poll}, {@code kill})
+ * are also async ({@code CompletableFuture}) because the Python source
+ * counterparts use {@code await} on stream I/O.
  */
 public class ExecSessionManager {
 
@@ -799,95 +912,131 @@ public class ExecSessionManager {
 
     /**
      * Start a new exec session. Spawns the process, returns session_id + initial poll.
+     * Mirrors Python {@code async def start(...)}.
      */
     public record StartResult(String sessionId, SessionPoll poll) {}
 
-    public StartResult start(String command, Path cwd, Map<String, String> env,
+    public CompletableFuture<StartResult> start(String command, Path cwd, Map<String, String> env,
                               Integer timeout, String shellProgram, boolean login,
                               int yieldTimeMs, int maxOutputChars,
-                              String ownerSessionKey) throws Exception {
+                              String ownerSessionKey) {
 
-        lock.lock();
-        try {
-            cleanupStale();
-            if (sessions.size() >= MAX_SESSIONS) {
-                throw new RuntimeException("maximum exec sessions reached (" + MAX_SESSIONS + ")");
-            }
-
-            Process process = ExecTool.spawn(command, cwd, env, shellProgram, login);
-            String sessionId = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-            ExecSession session = new ExecSession(
-                    sessionId, process, command, cwd.toString(),
-                    timeout, ownerSessionKey);
-            sessions.put(sessionId, session);
-        } finally {
-            lock.unlock();
-        }
-
-        // Initial poll outside lock
-        ExecSession session = sessions.get(sessionId);
-        SessionPoll poll = session.poll(yieldTimeMs, maxOutputChars);
-        if (poll.done()) {
+        return cleanupStale().thenCompose(_ -> CompletableFuture.supplyAsync(() -> {
             lock.lock();
-            try { sessions.remove(sessionId); }
-            finally { lock.unlock(); }
-        }
-        return new StartResult(sessionId, poll);
-    }
-
-    /** Poll/write to/close/terminate an existing session. */
-    public SessionPoll interact(String sessionId, String chars, boolean closeStdin,
-                                 boolean terminate, int yieldTimeMs, int maxOutputChars,
-                                 String ownerSessionKey) throws Exception {
-        ExecSession session = sessions.get(sessionId);
-        if (session == null) throw new NoSuchElementException(sessionId);
-        if (ownerSessionKey != null && session.ownerSessionKey() != null
-                && !session.ownerSessionKey().equals(ownerSessionKey)) {
-            throw new NoSuchElementException(sessionId);
-        }
-
-        if (chars != null && !chars.isEmpty()) {
-            String error = session.write(chars);
-            if (error != null) throw new RuntimeException(error);
-        }
-        if (closeStdin) session.closeStdin();
-        if (terminate) session.kill();
-
-        SessionPoll poll = session.poll(yieldTimeMs, maxOutputChars, terminate, closeStdin);
-        if (poll.done()) {
-            lock.lock();
-            try { sessions.remove(sessionId); }
-            finally { lock.unlock(); }
-        }
-        return poll;
-    }
-
-    public List<ExecSessionInfo> list(String ownerSessionKey) {
-        lock.lock();
-        try {
-            cleanupStale();
-            Instant now = Instant.now();
-            return sessions.entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .filter(e -> ownerSessionKey == null
-                            || e.getValue().ownerSessionKey() == null
-                            || e.getValue().ownerSessionKey().equals(ownerSessionKey))
-                    .map(e -> e.getValue().toInfo(now))
-                    .toList();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void cleanupStale() {
-        Instant now = Instant.now();
-        sessions.entrySet().removeIf(e -> {
-            Duration idle = Duration.between(e.getValue().lastAccess(), now);
-            if (idle.compareTo(IDLE_TIMEOUT) > 0) {
-                e.getValue().kill();
+            try {
+                if (sessions.size() >= MAX_SESSIONS) {
+                    throw new RuntimeException("maximum exec sessions reached (" + MAX_SESSIONS + ")");
+                }
                 return true;
+            } finally {
+                lock.unlock();
             }
-            return false;
+        })).thenCompose(_ -> ExecTool.spawn(command, cwd, env, shellProgram, login, true))
+          .thenCompose(process -> {
+              String sessionId = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+              ExecSession session = new ExecSession(
+                      sessionId, process, command, cwd.toString(),
+                      timeout, ownerSessionKey);
+              lock.lock();
+              try { sessions.put(sessionId, session); }
+              finally { lock.unlock(); }
+              return session.poll(yieldTimeMs, maxOutputChars)
+                      .thenApply(poll -> {
+                          if (poll.done()) {
+                              lock.lock();
+                              try { sessions.remove(sessionId); }
+                              finally { lock.unlock(); }
+                          }
+                          return new StartResult(sessionId, poll);
+                      });
+          });
+    }
+
+    /** Poll/write to/close/terminate an existing session. Mirrors Python {@code async def write(...)}. */
+    public CompletableFuture<SessionPoll> interact(String sessionId, String chars, boolean closeStdin,
+                                 boolean terminate, int yieldTimeMs, int maxOutputChars,
+                                 String ownerSessionKey) {
+        return cleanupStale().thenCompose(_ -> CompletableFuture.supplyAsync(() -> {
+            lock.lock();
+            try {
+                ExecSession session = sessions.get(sessionId);
+                if (session == null) throw new NoSuchElementException(sessionId);
+                if (ownerSessionKey != null && session.ownerSessionKey() != null
+                        && !session.ownerSessionKey().equals(ownerSessionKey)) {
+                    throw new NoSuchElementException(sessionId);
+                }
+                return session;
+            } finally {
+                lock.unlock();
+            }
+        })).thenCompose(session -> {
+            CompletableFuture<String> writeFuture = (chars != null && !chars.isEmpty())
+                    ? session.write(chars)
+                    : CompletableFuture.completedFuture(null);
+            return writeFuture.thenCompose(writeError -> {
+                if (writeError != null) throw new RuntimeException(writeError);
+                CompletableFuture<Void> closeFuture = closeStdin
+                        ? session.closeStdin() : CompletableFuture.completedFuture(null);
+                return closeFuture.thenCompose(_ -> {
+                    CompletableFuture<Void> killFuture = terminate
+                            ? session.kill() : CompletableFuture.completedFuture(null);
+                    return killFuture.thenCompose(_ -> session.poll(
+                            yieldTimeMs, maxOutputChars, terminate, closeStdin)
+                            .thenApply(poll -> {
+                                if (poll.done()) {
+                                    lock.lock();
+                                    try { sessions.remove(sessionId); }
+                                    finally { lock.unlock(); }
+                                }
+                                return poll;
+                            }));
+                });
+            });
+        });
+    }
+
+    public CompletableFuture<List<ExecSessionInfo>> list(String ownerSessionKey) {
+        return cleanupStale().thenApply(_ -> {
+            lock.lock();
+            try {
+                Instant now = Instant.now();
+                return sessions.entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey())
+                        .filter(e -> ownerSessionKey == null
+                                || e.getValue().ownerSessionKey() == null
+                                || e.getValue().ownerSessionKey().equals(ownerSessionKey))
+                        .map(e -> e.getValue().toInfo(now))
+                        .toList();
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    private CompletableFuture<Void> cleanupStale() {
+        return CompletableFuture.supplyAsync(() -> {
+            lock.lock();
+            try {
+                Instant now = Instant.now();
+                List<ExecSession> stale = new ArrayList<>();
+                Iterator<Map.Entry<String, ExecSession>> it = sessions.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry<String, ExecSession> e = it.next();
+                    if (Duration.between(e.getValue().lastAccess(), now).compareTo(IDLE_TIMEOUT) > 0) {
+                        it.remove();
+                        stale.add(e.getValue());
+                    }
+                }
+                return stale;
+            } finally {
+                lock.unlock();
+            }
+        }).thenCompose(stale -> {
+            CompletableFuture<Void> future = CompletableFuture.completedFuture(null);
+            for (ExecSession s : stale) {
+                future = future.thenCompose(_ -> s.kill());
+            }
+            return future;
         });
     }
 }
@@ -917,6 +1066,196 @@ public record SessionPoll(
         boolean stdinClosed,
         int truncatedChars
 ) {}
+```
+
+### ExecSession Class
+
+```java
+/**
+ * Wraps a single running subprocess in an exec session.
+ * Mirrors Python {@code _ExecSession} (exec_session.py lines 54-176).
+ *
+ * <p>Spawns async stdout/stderr reader tasks (virtual threads),
+ * supports stdin writes, EOF, terminate, and timed poll.
+ * All mutating methods return {@link CompletableFuture} to match
+ * Python {@code async def write/close_stdin/poll/kill}.
+ */
+public class ExecSession {
+
+    private static final Duration OUTPUT_DRAIN_GRACE = Duration.ofMillis(100);
+
+    private final String sessionId;
+    private final Process process;
+    private final String command;
+    private final String cwd;
+    private final Instant startedAt;
+    private final Instant deadline;
+    private volatile Instant lastAccess;
+    private final String ownerSessionKey;
+    private final List<String> chunks = Collections.synchronizedList(new ArrayList<>());
+    private final CompletableFuture<Void> stdoutTask;
+    private final CompletableFuture<Void> stderrTask;
+    private boolean timedOut = false;
+
+    public ExecSession(String sessionId, Process process, String command, String cwd,
+                       Integer timeout, String ownerSessionKey) {
+        this.sessionId = sessionId;
+        this.process = process;
+        this.command = command;
+        this.cwd = cwd;
+        this.ownerSessionKey = ownerSessionKey;
+        this.startedAt = Instant.now();
+        this.deadline = (timeout != null && timeout > 0)
+                ? Instant.now().plusSeconds(timeout) : Instant.MAX;
+        this.lastAccess = Instant.now();
+        this.stdoutTask = readStream(process.getInputStream(), "");
+        this.stderrTask = readStream(process.getErrorStream(), "STDERR:\n");
+    }
+
+    private CompletableFuture<Void> readStream(InputStream stream, String prefix) {
+        return CompletableFuture.runAsync(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                boolean first = true;
+                char[] buffer = new char[4096];
+                int n;
+                while ((n = reader.read(buffer)) != -1) {
+                    String text = new String(buffer, 0, n);
+                    if (prefix != null && !prefix.isEmpty() && first) {
+                        text = prefix + text;
+                        first = false;
+                    }
+                    chunks.add(text);
+                }
+            } catch (IOException e) {
+                // stream closed — expected on process exit
+            }
+        }, Thread.ofVirtual().factory());
+    }
+
+    /** Write chars to stdin. Returns error message or null on success. */
+    public CompletableFuture<String> write(String chars) {
+        return CompletableFuture.supplyAsync(() -> {
+            if (!process.isAlive()) return "session has already exited";
+            try (OutputStream out = process.getOutputStream()) {
+                out.write(chars.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                return null;
+            } catch (IOException e) {
+                return "session stdin is closed";
+            }
+        }, Thread.ofVirtual().factory());
+    }
+
+    /** Close stdin (send EOF). Returns error message or null on success. */
+    public CompletableFuture<Void> closeStdin() {
+        return CompletableFuture.runAsync(() -> {
+            if (process.isAlive()) {
+                try { process.getOutputStream().close(); }
+                catch (IOException ignored) {}
+            }
+        }, Thread.ofVirtual().factory());
+    }
+
+    /** Kill the process and reap it. */
+    public CompletableFuture<Void> kill() {
+        return CompletableFuture.runAsync(() -> {
+            if (!process.isAlive()) return;
+            process.destroyForcibly();
+            try {
+                process.waitFor(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {}
+        }, Thread.ofVirtual().factory());
+    }
+
+    /**
+     * Poll recent output, optionally yielding for new data.
+     * Mirrors Python {@code async def poll(...)}.
+     */
+    public CompletableFuture<SessionPoll> poll(int yieldTimeMs, int maxOutputChars,
+                                                   boolean terminated, boolean stdinClosed) {
+        return CompletableFuture.supplyAsync(() -> {
+            lastAccess = Instant.now();
+            if (yieldTimeMs > 0 && process.isAlive()) {
+                try { Thread.sleep(Math.min(yieldTimeMs, MAX_YIELD_MS)); }
+                catch (InterruptedException ignored) {}
+            }
+            return process.isAlive() && Instant.now().isAfter(deadline);
+        }, Thread.ofVirtual().factory()).thenCompose(shouldKill -> {
+            if (shouldKill) {
+                timedOut = true;
+                return kill();
+            }
+            return CompletableFuture.completedFuture(null);
+        }).thenApply(_ -> {
+            if (!process.isAlive()) {
+                try {
+                    CompletableFuture.allOf(stdoutTask, stderrTask).get(2, TimeUnit.SECONDS);
+                } catch (Exception ignored) {}
+            } else if (yieldTimeMs > 0) {
+                waitForBufferedOutput();
+            }
+
+            String output;
+            synchronized (chunks) {
+                output = String.join("", chunks);
+                chunks.clear();
+            }
+
+            var truncated = truncateOutput(output, maxOutputChars);
+            return new SessionPoll(
+                    truncated.text(),
+                    !process.isAlive(),
+                    process.isAlive() ? null : process.exitValue(),
+                    Duration.between(startedAt, Instant.now()).toMillis() / 1000.0,
+                    timedOut,
+                    terminated,
+                    stdinClosed,
+                    truncated.omitted()
+            );
+        });
+    }
+
+    private void waitForBufferedOutput() {
+        Instant graceDeadline = Instant.now().plus(OUTPUT_DRAIN_GRACE);
+        while (Instant.now().isBefore(graceDeadline)) {
+            synchronized (chunks) {
+                if (!chunks.isEmpty()) return;
+            }
+            try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+        }
+    }
+
+    private static Truncated truncateOutput(String output, int maxChars) {
+        if (output.length() <= maxChars) return new Truncated(output, 0);
+        int half = maxChars / 2;
+        int omitted = output.length() - maxChars;
+        return new Truncated(
+                output.substring(0, half)
+                        + "\n\n... (" + omitted + " chars truncated) ...\n\n"
+                        + output.substring(output.length() - half),
+                omitted
+        );
+    }
+
+    private record Truncated(String text, int omitted) {}
+
+    public Instant lastAccess() { return lastAccess; }
+    public String ownerSessionKey() { return ownerSessionKey; }
+
+    public ExecSessionInfo toInfo(Instant now) {
+        return new ExecSessionInfo(
+                sessionId,
+                command,
+                cwd,
+                Duration.between(startedAt, now).toMillis() / 1000.0,
+                Duration.between(lastAccess, now).toMillis() / 1000.0,
+                deadline.equals(Instant.MAX) ? Double.POSITIVE_INFINITY
+                        : Math.max(0, Duration.between(now, deadline).toMillis() / 1000.0),
+                process.isAlive() ? null : process.exitValue(),
+                ownerSessionKey
+        );
+    }
+}
 ```
 
 ---
@@ -985,55 +1324,80 @@ Two-tier extraction strategy:
 Security: Every redirect target is validated against internal IP ranges (SSRF protection) before the request is made. Maximum 5 redirect hops.
 
 ```java
-/** SSRF-safe redirect-aware fetch. Validates every redirect URL against internal IP ranges. */
+/** SSRF-safe redirect-aware fetch. Validates every redirect URL against internal IP ranges.
+ * Mirrors Python {@code async def _get_with_safe_redirects(...)}. */
 private record FetchResult(HttpResponse<String> response, String error) {}
 
-public FetchResult getWithSafeRedirects(HttpClient client, String url,
-                                         Map<String, String> headers) throws Exception {
-    String currentUrl = url;
-    for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
-        if (!NetworkSecurity.isSafeUrl(currentUrl)) {
-            return new FetchResult(null, "Redirect blocked: internal/private IP detected");
-        }
+private static final int MAX_REDIRECTS = 5;
 
-        var request = HttpRequest.newBuilder()
-                .uri(URI.create(currentUrl))
-                .headers(toHeaderArray(headers))
-                .GET()
-                .build();
-        var response = client.send(request, HttpResponse.BodyHandlers.ofString());
+public CompletableFuture<FetchResult> getWithSafeRedirects(HttpClient client, String url,
+                                         Map<String, String> headers) {
+    return fetchWithRedirects(client, url, headers, 0);
+}
 
-        boolean isRedirect = response.statusCode() >= 300 && response.statusCode() < 400;
-        if (!isRedirect) {
-            return new FetchResult(response, null);
-        }
-
-        // Follow Location header to next hop
-        String location = response.headers().firstValue("Location").orElse(null);
-        if (location == null) return new FetchResult(response, null);
-
-        currentUrl = resolveRedirect(response.uri().toString(), location);
-        if (!NetworkSecurity.isSafeUrl(currentUrl)) {
-            return new FetchResult(null, "Redirect blocked: internal/private IP detected");
-        }
+private CompletableFuture<FetchResult> fetchWithRedirects(HttpClient client, String url,
+                                                           Map<String, String> headers, int hop) {
+    if (hop > MAX_REDIRECTS) {
+        return CompletableFuture.completedFuture(
+                new FetchResult(null, "Too many redirects: exceeded " + MAX_REDIRECTS));
     }
-    return new FetchResult(null, "Too many redirects: exceeded " + MAX_REDIRECTS);
+    if (!NetworkSecurity.isSafeUrl(url)) {
+        return CompletableFuture.completedFuture(
+                new FetchResult(null, "Redirect blocked: internal/private IP detected"));
+    }
+
+    var request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .headers(toHeaderArray(headers))
+            .GET()
+            .build();
+
+    return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .thenCompose(response -> {
+                boolean isRedirect = response.statusCode() >= 300 && response.statusCode() < 400;
+                if (!isRedirect) {
+                    return CompletableFuture.completedFuture(new FetchResult(response, null));
+                }
+                String location = response.headers().firstValue("Location").orElse(null);
+                if (location == null) {
+                    return CompletableFuture.completedFuture(new FetchResult(response, null));
+                }
+                String nextUrl = resolveRedirect(response.uri().toString(), location);
+                return fetchWithRedirects(client, nextUrl, headers, hop + 1);
+            });
+}
+
+/** Flatten a Map<String,String> into varargs for HttpRequest.headers(). */
+private static String[] toHeaderArray(Map<String, String> headers) {
+    List<String> list = new ArrayList<>();
+    for (Map.Entry<String, String> e : headers.entrySet()) {
+        list.add(e.getKey());
+        list.add(e.getValue());
+    }
+    return list.toArray(new String[0]);
+}
+
+/** Resolve a redirect Location header against the request URI. */
+private static String resolveRedirect(String baseUri, String location) {
+    return URI.create(baseUri).resolve(location).toString();
 }
 ```
 
 ---
 
-## 8. MCPToolWrapper — MCP Server Tools
+## 8. MCP Wrappers — MCP Server Tools
 
 ### Source: `mcp.py` (1122 lines)
 
-Wraps tools exposed by external MCP servers as native nanobot tools. Key behaviors:
+Wraps tools, resources, and prompts exposed by external MCP servers as native nanobot tools. Key behaviors:
 
 - **Schema normalization**: Nullable unions (`{"type": ["string", "null"]}`) are flattened for OpenAI compatibility
 - **Transient error retry**: ConnectionResetError, BrokenPipeError, etc. trigger a single reconnection attempt
 - **Name sanitization**: `re.sub(r"[^a-zA-Z0-9_-]", "_", name)` → collapse runs of underscores
 - **HTTP probe**: Before connecting to streamable HTTP MCP servers, a quick TCP probe avoids crashing the event loop
 - **Windows shell wrapping**: `npx`, `npm`, `pnpm`, `yarn` commands are wrapped through `cmd /d /c` for reliability
+
+### MCPToolWrapper
 
 ```java
 /**
@@ -1053,9 +1417,21 @@ public class MCPToolWrapper extends Tool {
 }
 ```
 
+### MCPResourceWrapper
+
+Python `mcp.py` also defines `MCPResourceWrapper`, which wraps MCP resources (URI-addressable data) as callable tools. It exposes a `parameters` schema with a `uri` argument and delegates to `session.readResource(uri)`.
+
+### MCPPromptWrapper
+
+Python `mcp.py` also defines `MCPPromptWrapper`, which wraps MCP prompts as callable tools. It exposes a `parameters` schema and delegates to `session.getPrompt(promptName, arguments)`.
+
 ---
 
 ## 9. Remaining Tools — Summaries
+
+### CliAppsTool (`cli_apps.py`, ~150 lines)
+
+Registered CLI app invocation. Loads apps from config (`cli_apps` section), validates the named app exists, and executes it with passed arguments. Supports `json` flag for structured output, `working_dir` override, and per-call `timeout`. The tool is config-gated via `config_key = "cli_apps"` and `enabled()` checks the config master switch.
 
 ### CronTool (`cron.py`, ~300 lines)
 
@@ -1136,6 +1512,7 @@ com/nanobot/agent/tools/
   |-- impl/
         |-- ExecTool.java
         |-- FsTool.java             (abstract intermediate)
+        |-- _SearchTool.java        (abstract intermediate)
         |-- ReadFileTool.java
         |-- WriteFileTool.java
         |-- EditFileTool.java
@@ -1154,6 +1531,7 @@ com/nanobot/agent/tools/
         |-- ImageGenerationTool.java
         |-- MessageTool.java
         |-- MyTool.java
+        |-- CliAppsTool.java
         |-- MCPToolWrapper.java
 ```
 
@@ -1161,13 +1539,13 @@ com/nanobot/agent/tools/
 
 ## Concurrency Model
 
-All tools run on **Java 21 virtual threads** via `Thread.ofVirtual().factory()`. Key implications:
+Every tool's `execute()` returns `CompletableFuture<Object>` to faithfully map Python `async def execute(**kwargs)`. Key implications:
 
-1. **`Tool.execute()` returns `CompletableFuture<Object>`** — the agent loop can run multiple non-exclusive tools in parallel via `CompletableFuture.allOf()`
-2. **Process.waitFor() is blocking** — virtual threads handle this efficiently by unmounting from the carrier thread during the blocking wait (no need for async Process API)
-3. **ThreadLocal is safe** — each virtual thread has its own ThreadLocal storage. RequestContext is bound per-invocation via `RequestContext.bind()` / `RequestContext.unbind()` in try-finally blocks
-4. **Exclusive tools serialize** — when `isExclusive() == true` (ExecTool, WriteStdinTool, WebSearchTool when DDG), the agent loop runs them one at a time
-5. **ReadOnly tools can parallelize** — when all tools in a batch are `isReadOnly() == true` and `isConcurrencySafe() == true`, they run concurrently
+1. **Async contract preservation** — `Tool.execute()` returns `CompletableFuture<Object>`; the agent loop runs multiple non-exclusive tools in parallel via `CompletableFuture.allOf()`. This mirrors Python `await asyncio.gather(*coros)`.
+2. **Blocking I/O inside async tools** — When a tool performs blocking I/O (e.g., `ProcessBuilder.start()`, `Files.readAllBytes()`), the Java implementation wraps it in `CompletableFuture.supplyAsync(...)`. Virtual Threads may be used as the executor for these blocking operations, but they are **not** a substitute for the async/await semantics — they are merely the Java mechanism for running blocking code without pinning carrier threads.
+3. **ThreadLocal is safe** — Each virtual thread has its own ThreadLocal storage. RequestContext is bound per-invocation via `RequestContext.bind()` / `RequestContext.unbind()` in try-finally blocks.
+4. **Exclusive tools serialize** — When `isExclusive() == true` (ExecTool, WriteStdinTool, WebSearchTool when DDG), the agent loop runs them one at a time.
+5. **ReadOnly tools can parallelize** — When all tools in a batch are `isReadOnly() == true` and `isConcurrencySafe() == true`, they run concurrently.
 
 ```java
 // Agent loop tool execution pattern (conceptual)

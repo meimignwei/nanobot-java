@@ -272,7 +272,7 @@ public class StringSchema extends Schema {
     }
 }
 
-// IntegerSchema.java — same pattern
+// IntegerSchema.java
 public class IntegerSchema extends Schema {
     private final String description;
     private final Integer minimum;
@@ -280,13 +280,159 @@ public class IntegerSchema extends Schema {
     private final List<Integer> enumValues;
     private final boolean nullable;
 
-    // constructor, toJsonSchema() following same pattern as StringSchema
+    public IntegerSchema(String description) {
+        this(description, null, null, null, false);
+    }
+
+    public IntegerSchema(String description, Integer minimum, Integer maximum,
+                         List<Integer> enumValues, boolean nullable) {
+        this.description = description;
+        this.minimum = minimum;
+        this.maximum = maximum;
+        this.enumValues = enumValues;
+        this.nullable = nullable;
+    }
+
+    @Override
+    public Map<String, Object> toJsonSchema() {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", nullable ? List.of("integer", "null") : "integer");
+        if (description != null && !description.isEmpty()) d.put("description", description);
+        if (minimum != null) d.put("minimum", minimum);
+        if (maximum != null) d.put("maximum", maximum);
+        if (enumValues != null) d.put("enum", enumValues);
+        return d;
+    }
 }
 
-// NumberSchema.java — same pattern with Double bounds
+// NumberSchema.java
+public class NumberSchema extends Schema {
+    private final String description;
+    private final Double minimum;
+    private final Double maximum;
+    private final List<Double> enumValues;
+    private final boolean nullable;
+
+    public NumberSchema(String description) {
+        this(description, null, null, null, false);
+    }
+
+    public NumberSchema(String description, Double minimum, Double maximum,
+                        List<Double> enumValues, boolean nullable) {
+        this.description = description;
+        this.minimum = minimum;
+        this.maximum = maximum;
+        this.enumValues = enumValues;
+        this.nullable = nullable;
+    }
+
+    @Override
+    public Map<String, Object> toJsonSchema() {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", nullable ? List.of("number", "null") : "number");
+        if (description != null && !description.isEmpty()) d.put("description", description);
+        if (minimum != null) d.put("minimum", minimum);
+        if (maximum != null) d.put("maximum", maximum);
+        if (enumValues != null) d.put("enum", enumValues);
+        return d;
+    }
+}
+
 // BooleanSchema.java — type: "boolean", supports default value
+public class BooleanSchema extends Schema {
+    private final String description;
+    private final Boolean defaultValue;
+    private final boolean nullable;
+
+    public BooleanSchema(String description) {
+        this(description, null, false);
+    }
+
+    public BooleanSchema(String description, Boolean defaultValue, boolean nullable) {
+        this.description = description;
+        this.defaultValue = defaultValue;
+        this.nullable = nullable;
+    }
+
+    @Override
+    public Map<String, Object> toJsonSchema() {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", nullable ? List.of("boolean", "null") : "boolean");
+        if (description != null && !description.isEmpty()) d.put("description", description);
+        if (defaultValue != null) d.put("default", defaultValue);
+        return d;
+    }
+}
+
 // ArraySchema.java — type: "array", takes child `Schema items` (defaults to StringSchema)
+public class ArraySchema extends Schema {
+    private final Schema itemsSchema;
+    private final String description;
+    private final Integer minItems;
+    private final Integer maxItems;
+    private final boolean nullable;
+
+    public ArraySchema(String description) {
+        this(new StringSchema(""), description, null, null, false);
+    }
+
+    public ArraySchema(Schema itemsSchema, String description,
+                       Integer minItems, Integer maxItems, boolean nullable) {
+        this.itemsSchema = itemsSchema != null ? itemsSchema : new StringSchema("");
+        this.description = description;
+        this.minItems = minItems;
+        this.maxItems = maxItems;
+        this.nullable = nullable;
+    }
+
+    @Override
+    public Map<String, Object> toJsonSchema() {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", nullable ? List.of("array", "null") : "array");
+        d.put("items", itemsSchema.toJsonSchema());
+        if (description != null && !description.isEmpty()) d.put("description", description);
+        if (minItems != null) d.put("minItems", minItems);
+        if (maxItems != null) d.put("maxItems", maxItems);
+        return d;
+    }
+}
+
 // ObjectSchema.java — type: "object", takes Map<String, Object> properties, List<String> required
+public class ObjectSchema extends Schema {
+    private final Map<String, Object> properties;
+    private final List<String> required;
+    private final String description;
+    private final Object additionalProperties;
+    private final boolean nullable;
+
+    public ObjectSchema(String description) {
+        this(null, null, description, null, false);
+    }
+
+    public ObjectSchema(Map<String, Object> properties, List<String> required,
+                        String description, Object additionalProperties, boolean nullable) {
+        this.properties = properties != null ? properties : new LinkedHashMap<>();
+        this.required = required != null ? required : new ArrayList<>();
+        this.description = description;
+        this.additionalProperties = additionalProperties;
+        this.nullable = nullable;
+    }
+
+    @Override
+    public Map<String, Object> toJsonSchema() {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", nullable ? List.of("object", "null") : "object");
+        Map<String, Object> props = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : properties.entrySet()) {
+            props.put(e.getKey(), fragment(e.getValue()));
+        }
+        d.put("properties", props);
+        if (!required.isEmpty()) d.put("required", required);
+        if (description != null && !description.isEmpty()) d.put("description", description);
+        if (additionalProperties != null) d.put("additionalProperties", additionalProperties);
+        return d;
+    }
+}
 ```
 
 ### Static Convenience Factory
@@ -393,6 +539,15 @@ public abstract class Tool {
     /** Config section key, e.g. "exec", "web". Empty if no config. */
     public String getConfigKey() {
         return "";
+    }
+
+    /**
+     * Optional config class for this tool (Python {@code config_cls()} mapping).
+     * Java equivalent: bind via Spring {@code @ConfigurationProperties}
+     * or read from the {@link ToolContext#config} bag in {@link #create}.
+     */
+    public static Class<?> getConfigClass(Class<? extends Tool> toolClass) {
+        return null;
     }
 
     /** Plugin-discoverable flag (default true). Set false for manually-registered tools. */
@@ -1269,6 +1424,37 @@ public record RequestContext(
 }
 ```
 
+### ContextAware Protocol Mapping
+
+Python `context.py` defines a `@runtime_checkable Protocol` for tools that need explicit request-context injection:
+
+```python
+class ContextAware(Protocol):
+    def set_context(self, ctx: RequestContext) -> None: ...
+```
+
+Usage in `agent/loop.py`: before executing a tool, the loop checks `isinstance(tool, ContextAware)` and calls `tool.set_context(request_ctx)` so the tool knows the current channel, chat, and session.
+
+Java equivalent — an interface in the same package:
+
+```java
+package com.nanobot.agent.tools;
+
+/**
+ * Marker interface for tools that need per-request routing metadata.
+ *
+ * <p>Before execution, the agent loop checks {@code tool instanceof ContextAware}
+ * and calls {@link #setContext(RequestContext)} so the tool can route messages
+ * or access session-scoped state.
+ *
+ * <p>Example: a {@code SpawnTool} that sends follow-up messages needs the
+ * channel name and chat ID from the current request.
+ */
+public interface ContextAware {
+    void setContext(RequestContext ctx);
+}
+```
+
 ---
 
 ## Component 7: FileStates.java — Read/Write Tracker
@@ -1426,6 +1612,8 @@ public class FileStateStore {
 }
 ```
 
+**ContextVar mapping**: Python `file_state.py` uses `contextvars.ContextVar` (`_current_file_states`) with `bind_file_states()` / `reset_file_states()` and module-level helpers (`record_read`, `record_write`, etc.). In Java this maps to either (a) passing `FileStates` explicitly through `ToolContext` / `RequestContext`, or (b) a `ThreadLocal<FileStates>` bound around tool execution, reset in `try-finally`. The per-session lookup via `FileStateStore.forSession(sessionKey)` is the primary entry point; implicit global accessors are omitted because Java lacks Python's module-level dynamic attribute fallback (`__getattr__`).
+
 ---
 
 ## Component 8: Path Resolution Utilities
@@ -1449,11 +1637,16 @@ public final class PathUtils {
     /**
      * Resolve a user-supplied path against the workspace and enforce
      * containment within the allowed directory.
+     *
+     * <p>Mirrors Python {@code resolve_workspace_path}: the media directory
+     * is automatically included as an extra allowed root (read-only access
+     * for attachments), alongside any caller-supplied extras.
      */
     public static Path resolveWorkspacePath(
             String path,
             Path workspace,
             Path allowedDir,
+            Path mediaDir,
             List<Path> extraAllowedDirs) {
 
         Path resolved = workspace.resolve(path).normalize();
@@ -1461,6 +1654,10 @@ public final class PathUtils {
         // Check containment
         if (allowedDir != null) {
             if (isPathWithin(resolved, allowedDir)) {
+                return resolved;
+            }
+            // Always allow media directory (Python get_media_dir() is auto-included)
+            if (mediaDir != null && isPathWithin(resolved, mediaDir)) {
                 return resolved;
             }
             if (extraAllowedDirs != null) {
@@ -1616,6 +1813,6 @@ public final class Sandbox {
 
 3. **Defensive Parameter Copy** -- `Tool.getParameters()` always returns a deep copy so the shared schema map is never mutated by callers.
 
-4. **CompletableFuture for Async** -- `Tool.execute()` returns `CompletableFuture<Object>`, consistent with Java 21's virtual-thread model where blocking I/O on virtual threads is efficient (no need for explicit async/await).
+4. **CompletableFuture for Async** -- `Tool.execute()` returns `CompletableFuture<Object>` to faithfully map Python `async def execute(**kwargs)`. This preserves the explicit async contract from the source code: any subclass that performs I/O must chain async operations via `thenCompose` / async SDK clients, not block a worker thread. Virtual Threads are **not** a substitute for this async semantics.
 
 5. **Record for ToolContext** -- Immutable by design. Tools destructure it in their factory method to extract only the dependencies they need.

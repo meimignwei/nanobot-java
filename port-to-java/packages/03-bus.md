@@ -201,6 +201,9 @@ public class MessageBus {
     /**
      * Creates a MessageBus with capacity-bounded queues.
      * When capacity is non-positive, queues are unbounded.
+     *
+     * Note: Python asyncio.Queue() is always unbounded. This constructor
+     *       is an extension for backpressure control in Java.
      */
     public MessageBus(int inboundCapacity, int outboundCapacity) {
         this.inbound = (inboundCapacity > 0)
@@ -299,7 +302,8 @@ package com.nanobot.bus;
 
 import jakarta.annotation.Nullable;
 import java.time.Instant;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -319,22 +323,23 @@ public record InboundMessage(
     @Nullable String sessionKeyOverride  // Optional thread-scoped session override
 ) {
 
-    /** Compact constructor: provide defaults for optional fields. */
+    /**
+     * Compact constructor: provide defaults for optional fields.
+     * Uses mutable collections to match Python dataclass default_factory=list/dict.
+     */
     public InboundMessage {
         if (timestamp == null) timestamp = Instant.now();
-        // media and metadata use empty immutable collections,
-        // but the caller should pass List.of() / Map.of() explicitly.
-        if (media == null) media = List.of();
-        if (metadata == null) metadata = Map.of();
+        if (media == null) media = new ArrayList<>();
+        if (metadata == null) metadata = new HashMap<>();
     }
 
     /**
      * Convenience constructor with minimal required fields.
-     * All optional fields default to sensible values.
+     * Uses mutable collections to match Python dataclass default_factory=list/dict.
      */
     public InboundMessage(String channel, String senderId, String chatId, String content) {
         this(channel, senderId, chatId, content,
-             Instant.now(), List.of(), Map.of(), null);
+             Instant.now(), new ArrayList<>(), new HashMap<>(), null);
     }
 
     /**
@@ -360,6 +365,8 @@ public record InboundMessage(
 package com.nanobot.bus;
 
 import jakarta.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -383,19 +390,22 @@ public record OutboundMessage(
     List<List<String>> buttons
 ) {
 
-    /** Compact constructor: provide defaults for optional fields. */
+    /**
+     * Compact constructor: provide defaults for optional fields.
+     * Uses mutable collections to match Python dataclass default_factory=list/dict.
+     */
     public OutboundMessage {
-        if (replyTo != null && replyTo.isEmpty()) replyTo = null;
-        if (media == null) media = List.of();
-        if (metadata == null) metadata = Map.of();
-        if (buttons == null) buttons = List.of();
+        if (media == null) media = new ArrayList<>();
+        if (metadata == null) metadata = new HashMap<>();
+        if (buttons == null) buttons = new ArrayList<>();
     }
 
     /**
      * Convenience constructor: content-only message with no optional fields.
+     * Uses mutable collections to match Python dataclass default_factory=list/dict.
      */
     public OutboundMessage(String channel, String chatId, String content) {
-        this(channel, chatId, content, null, List.of(), Map.of(), List.of());
+        this(channel, chatId, content, null, new ArrayList<>(), new HashMap<>(), new ArrayList<>());
     }
 }
 ```
@@ -477,6 +487,9 @@ public interface BusProgressCallback {
      * on the given bus, scoped to the given inbound message.
      *
      * python_analog: build_bus_progress_callback(bus, msg)
+     * Note: Python has two nested functions (_publish_progress and _bus_progress);
+     *       _bus_progress currently just delegates to _publish_progress.
+     *       Java folds this into a single lambda for simplicity.
      */
     static BusProgressCallback create(MessageBus bus, InboundMessage msg) {
         return (
@@ -683,6 +696,26 @@ import java.util.function.Consumer;
  *
  * python_analog: nanobot.bus.runtime_events.RuntimeEventBus
  */
+/**
+ * Synchronous runtime event handler.
+ *
+ * python_analog: RuntimeEventHandler where return type is None
+ */
+@FunctionalInterface
+public interface RuntimeEventHandler {
+    void handle(RuntimeEvent event) throws Exception;
+}
+
+/**
+ * Asynchronous runtime event handler.
+ *
+ * python_analog: RuntimeEventHandler where return type is Awaitable[None]
+ */
+@FunctionalInterface
+public interface AsyncRuntimeEventHandler {
+    CompletableFuture<Void> handleAsync(RuntimeEvent event);
+}
+
 @Component
 public class RuntimeEventBus {
 
@@ -691,6 +724,8 @@ public class RuntimeEventBus {
     /**
      * Handler entries: (event type filter, handler).
      * {@code null} type means "subscribe to all events".
+     * Handler may be {@link RuntimeEventHandler} (sync) or
+     * {@link AsyncRuntimeEventHandler} (async).
      *
      * python_analog: self._handlers: list[tuple[RuntimeEventType | None, RuntimeEventHandler]]
      */
@@ -703,32 +738,40 @@ public class RuntimeEventBus {
         this.asyncExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
-    // --- subscribe ---
+    // --- subscribe (sync) ---
 
     /**
-     * Subscribe to runtime events of a specific type.
+     * Subscribe a synchronous handler to events of a specific type.
      *
-     * @param handler   the callback; runs synchronously in publish(),
-     *                  so keep it fast or spawn your own thread
+     * @param handler   the callback; runs synchronously in publish()
      * @param eventType the event class to filter on; null means "all events"
      * @return a Runnable that, when called, unsubscribes the handler
      *
      * python_analog: def subscribe(self, handler, event_type=None) -> Callable[[], None]
      */
-    public Runnable subscribe(
-        Consumer<RuntimeEvent> handler,
-        Class<? extends RuntimeEvent> eventType
-    ) {
+    public Runnable subscribe(RuntimeEventHandler handler, Class<? extends RuntimeEvent> eventType) {
         HandlerEntry entry = new HandlerEntry(eventType, handler);
         handlers.add(entry);
-
         return () -> handlers.remove(entry);
     }
 
+    public Runnable subscribe(RuntimeEventHandler handler) {
+        return subscribe(handler, null);
+    }
+
+    // --- subscribe (async) ---
+
     /**
-     * Convenience overload: subscribe to a specific handler without filtering.
+     * Subscribe an asynchronous handler to events of a specific type.
+     * The returned CompletableFuture will be awaited by publish().
      */
-    public Runnable subscribe(Consumer<RuntimeEvent> handler) {
+    public Runnable subscribe(AsyncRuntimeEventHandler handler, Class<? extends RuntimeEvent> eventType) {
+        HandlerEntry entry = new HandlerEntry(eventType, handler);
+        handlers.add(entry);
+        return () -> handlers.remove(entry);
+    }
+
+    public Runnable subscribe(AsyncRuntimeEventHandler handler) {
         return subscribe(handler, null);
     }
 
@@ -736,18 +779,26 @@ public class RuntimeEventBus {
 
     /**
      * Publish an event to all matching subscribers, in registration order.
-     * Calls each handler synchronously (the caller blocks for each).
+     * Sync handlers are called inline; async handlers are awaited via
+     * {@code CompletableFuture.join()} so the caller blocks until completion.
      *
      * python_analog: async def publish(self, event) -> None
-     *   (Python version awaits async handlers; Java version runs
-     *    handlers synchronously in the calling thread)
+     *   for event_type, handler in self._handlers:
+     *       if event_type is not None and not isinstance(event, event_type): continue
+     *       result = handler(event)
+     *       if inspect.isawaitable(result): await result
      */
     public void publish(RuntimeEvent event) {
         for (HandlerEntry entry : handlers) {
             if (entry.typeFilter() == null
                 || entry.typeFilter().isInstance(event)) {
                 try {
-                    entry.handler().accept(event);
+                    Object h = entry.handler();
+                    if (h instanceof AsyncRuntimeEventHandler async) {
+                        async.handleAsync(event).join();  // await async handler
+                    } else {
+                        ((RuntimeEventHandler) h).handle(event);
+                    }
                 } catch (Exception ex) {
                     log.error("runtime event handler failed for {}", event.getClass().getSimpleName(), ex);
                 }
@@ -770,13 +821,13 @@ public class RuntimeEventBus {
 
     /**
      * A single subscriber entry holding an optional type filter
-     * and the handler Consumer.
+     * and the handler (sync or async).
      *
      * python_analog: _HandlerEntry = tuple[RuntimeEventType | None, RuntimeEventHandler]
      */
     private record HandlerEntry(
         Class<? extends RuntimeEvent> typeFilter,  // null = all events
-        Consumer<RuntimeEvent> handler
+        Object handler  // RuntimeEventHandler | AsyncRuntimeEventHandler
     ) {}
 }
 ```
@@ -881,6 +932,10 @@ public class RuntimeEventPublisher {
      * Publish a SessionTurnStarted event.
      *
      * python_analog: async def session_turn_started(self, msg, session_key)
+     * Note: Python method is async because bus.publish() is async.
+     *       In Java, publish() blocks until all handlers complete
+     *       (including async handlers via CompletableFuture.join()),
+     *       so this method is synchronous.
      */
     public void sessionTurnStarted(InboundMessage msg, String sessionKey) {
         RuntimeEventContext ctx = context(
@@ -893,6 +948,7 @@ public class RuntimeEventPublisher {
      * Publish a TurnRunStatusChanged event.
      *
      * python_analog: async def run_status_changed(self, msg, session_key, status, *, started_at)
+     * Note: See sessionTurnStarted() for sync/async rationale.
      */
     public void runStatusChanged(
         InboundMessage msg,
@@ -910,6 +966,7 @@ public class RuntimeEventPublisher {
      * Publish a TurnCompleted event, consuming the stored latency and runtime.
      *
      * python_analog: async def turn_completed(self, *, channel, chat_id, session_key, metadata)
+     * Note: See sessionTurnStarted() for sync/async rationale.
      */
     public void turnCompleted(
         String channel,
@@ -963,18 +1020,21 @@ public final class RuntimeEventPublishers {
      * @return the existing or newly-created publisher
      */
     public static RuntimeEventPublisher ensure(RuntimeEventOwner owner) {
-        RuntimeEventPublisher publisher = owner.getRuntimeEventPublisher();
-        if (publisher != null) {
+        Object pubObj = owner.getRuntimeEventPublisher();
+        if (pubObj instanceof RuntimeEventPublisher publisher) {
             return publisher;
         }
 
-        RuntimeEventBus bus = owner.getRuntimeEvents();
-        if (!(bus instanceof RuntimeEventBus)) {
+        Object busObj = owner.getRuntimeEvents();
+        RuntimeEventBus bus;
+        if (busObj instanceof RuntimeEventBus existing) {
+            bus = existing;
+        } else {
             bus = new RuntimeEventBus();
             owner.setRuntimeEvents(bus);
         }
 
-        publisher = new RuntimeEventPublisher(bus);
+        RuntimeEventPublisher publisher = new RuntimeEventPublisher(bus);
         owner.setRuntimeEventPublisher(publisher);
         return publisher;
     }
@@ -1205,7 +1265,7 @@ class RuntimeEventBusTest {
     @Test
     void subscribeAndPublish() {
         List<RuntimeEvent> received = new CopyOnWriteArrayList<>();
-        bus.subscribe(received::add, SessionTurnStarted.class);
+        bus.subscribe((RuntimeEventHandler) received::add, SessionTurnStarted.class);
 
         RuntimeEventContext ctx = new RuntimeEventContext("ws", "c1", "ws:c1", Map.of());
         bus.publish(new SessionTurnStarted(ctx));
@@ -1218,8 +1278,8 @@ class RuntimeEventBusTest {
     void typeFilterOnlyMatchesCorrectType() {
         List<RuntimeEvent> all = new CopyOnWriteArrayList<>();
         List<RuntimeEvent> turnOnly = new CopyOnWriteArrayList<>();
-        bus.subscribe(all::add);
-        bus.subscribe(turnOnly::add, TurnCompleted.class);
+        bus.subscribe((RuntimeEventHandler) all::add);
+        bus.subscribe((RuntimeEventHandler) turnOnly::add, TurnCompleted.class);
 
         RuntimeEventContext ctx = new RuntimeEventContext("ws", "c1", "ws:c1", Map.of());
         bus.publish(new TurnCompleted(ctx, 100, null));
@@ -1233,7 +1293,7 @@ class RuntimeEventBusTest {
     @Test
     void unsubscribeRemovesHandler() {
         List<RuntimeEvent> received = new CopyOnWriteArrayList<>();
-        Runnable unsub = bus.subscribe(received::add);
+        Runnable unsub = bus.subscribe((RuntimeEventHandler) received::add);
         unsub.run();
 
         RuntimeEventContext ctx = new RuntimeEventContext("ws", "c1", "ws:c1", Map.of());
@@ -1243,9 +1303,9 @@ class RuntimeEventBusTest {
 
     @Test
     void handlerExceptionDoesNotCrashBus() {
-        bus.subscribe(e -> { throw new RuntimeException("boom"); });
+        bus.subscribe((RuntimeEventHandler) (e -> { throw new RuntimeException("boom"); }));
         List<RuntimeEvent> received = new CopyOnWriteArrayList<>();
-        bus.subscribe(received::add);
+        bus.subscribe((RuntimeEventHandler) received::add);
 
         RuntimeEventContext ctx = new RuntimeEventContext("ws", "c1", "ws:c1", Map.of());
         bus.publish(new TurnCompleted(ctx, 100, null));
@@ -1257,10 +1317,10 @@ class RuntimeEventBusTest {
     @Test
     void publishNowaitRunsAsynchronously() throws Exception {
         CountDownLatch done = new CountDownLatch(1);
-        bus.subscribe(e -> {
+        bus.subscribe((RuntimeEventHandler) (e -> {
             try { Thread.sleep(50); } catch (InterruptedException ignored) {}
             done.countDown();
-        });
+        }));
 
         RuntimeEventContext ctx = new RuntimeEventContext("ws", "c1", "ws:c1", Map.of());
         long start = System.nanoTime();
@@ -1322,6 +1382,7 @@ mvn test -Dtest=MessageBusTest,RuntimeEventBusTest,BusProgressCallbackTest
 # [x] 虚拟线程阻塞/唤醒语义
 # [x] sessionKey() 默认值 + override
 # [x] OutboundMessage 所有可选字段默认值
+# [x] RuntimeEventBus 异步 handler 正确等待完成
 # [x] RuntimeEventBus 类型过滤正确
 # [x] RuntimeEventBus unsubscribe 正确
 # [x] RuntimeEventBus handler 异常隔离
@@ -1345,10 +1406,10 @@ mvn test -Dtest=MessageBusTest,RuntimeEventBusTest,BusProgressCallbackTest
 | TurnCompleted.java | ~15 |
 | GoalStateChanged.java | ~15 |
 | RuntimeModelChanged.java | ~12 |
-| RuntimeEventBus.java | ~100 |
-| RuntimeEventPublisher.java | ~100 |
+| RuntimeEventBus.java (含 RuntimeEventHandler + AsyncRuntimeEventHandler) | ~130 |
+| RuntimeEventPublisher.java | ~105 |
 | RuntimeEventPublishers.java | ~45 |
 | MessageBusTest.java | ~120 |
 | RuntimeEventBusTest.java | ~100 |
 | BusProgressCallbackTest.java | ~60 |
-| **合计** | **~880** |
+| **合计** | **~940** |

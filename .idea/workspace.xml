@@ -7,8 +7,12 @@
     <list default="true" id="5610b32b-70ed-4b99-b96d-70407299bfe1" name="Changes" comment="mvp版本重构-构建技术方案">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/port-to-java/00-master-blueprint.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/00-master-blueprint.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/port-to-java/01-file-mapping.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/00-file-mapping.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/port-to-java/packages/01-root.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/01-root.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/02-config.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/02-config.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/03-bus.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/03-bus.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/04-providers.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/04-providers.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/05-providers-impl.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/05-providers-impl.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/06-agent-tools-core.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/06-agent-tools-core.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/07-agent-tools-impl.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/07-agent-tools-impl.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -127,7 +131,15 @@
       <option name="project" value="LOCAL" />
       <updated>1782038360792</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="mvp版本重构-构建技术方案">
+      <option name="closed" value="true" />
+      <created>1782042562081</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1782042562081</updated>
+    </task>
+    <option name="localTasksCounter" value="9" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">

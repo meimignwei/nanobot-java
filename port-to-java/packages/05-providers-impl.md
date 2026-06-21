@@ -265,9 +265,9 @@ OpenAICodexProvider(LLMProvider)
 ### 1. `AnthropicProvider.java` — 使用 `anthropic-java` SDK
 
 关键转换：
-- Python `AsyncAnthropic` → Java `Anthropic` (同步客户端，由虚拟线程执行)
-- Python `await client.messages.create(...)` → Java `client.messages().create(params)`
-- Python `async with client.messages.stream(...)` → Java 阻塞流迭代器
+- Python `AsyncAnthropic` → Java `Anthropic` (通过 `CompletableFuture.supplyAsync` 包装以复刻 `async def` 语义)
+- Python `await client.messages.create(...)` → Java `CompletableFuture.supplyAsync(() -> client.sync().messages().create(params))`
+- Python `async with client.messages.stream(...)` → Java `CompletableFuture.supplyAsync(() -> { 同步流迭代 })`
 
 Maven 依赖:
 ```xml
@@ -283,7 +283,6 @@ Maven 依赖:
 package com.nanobot.providers.impl;
 
 import com.anthropic.client.AnthropicClient;
-import com.anthropic.client.AnthropicClientSync;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.core.JsonValue;
 import com.anthropic.core.http.StreamResponse;
@@ -300,6 +299,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -307,9 +307,8 @@ import java.util.regex.Pattern;
 /**
  * LLM provider using the native Anthropic SDK for Claude models.
  *
- * In Java with Virtual Threads, all API calls are synchronous blocking calls.
- * The SDK's HTTP client (OkHttp) performs blocking I/O, which is ideal for
- * virtual threads — the carrier thread is released during I/O wait.
+ * All public API methods return CompletableFuture to faithfully replicate
+ * Python async def semantics. SDK calls are wrapped with supplyAsync.
  */
 public class AnthropicProvider extends LLMProvider {
 
@@ -319,7 +318,7 @@ public class AnthropicProvider extends LLMProvider {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final String defaultModel;
-    private final AnthropicClientSync client;
+    private final AnthropicClient client;
 
     public AnthropicProvider(
         String apiKey,
@@ -340,9 +339,7 @@ public class AnthropicProvider extends LLMProvider {
             builder.baseUrl(normalizeBaseUrl(apiBase));
         }
 
-        AnthropicClient fullClient = builder.build();
-        // Use the synchronous blocking client for virtual-thread execution
-        this.client = fullClient.sync(Duration.ofSeconds(120));
+        this.client = builder.build();
     }
 
     /** Anthropic SDK appends /v1 internally; strip it if present. */
@@ -698,6 +695,33 @@ public class AnthropicProvider extends LLMProvider {
         return new Object[]{cachedSystem, newMsgs, newTools};
     }
 
+    /** Find indices for cache_control markers at builtin/MCP boundaries. */
+    static List<Integer> toolCacheMarkerIndices(List<Map<String, Object>> tools) {
+        if (tools == null || tools.isEmpty()) return List.of();
+        int tailIdx = tools.size() - 1;
+        Integer lastBuiltinIdx = null;
+        for (int i = tailIdx; i >= 0; i--) {
+            String name = toolName(tools.get(i));
+            if (!name.startsWith("mcp_")) {
+                lastBuiltinIdx = i;
+                break;
+            }
+        }
+        List<Integer> orderedUnique = new ArrayList<>();
+        for (Integer idx : new Integer[]{lastBuiltinIdx, tailIdx}) {
+            if (idx != null && !orderedUnique.contains(idx)) {
+                orderedUnique.add(idx);
+            }
+        }
+        return orderedUnique;
+    }
+
+    static String toolName(Map<String, Object> tool) {
+        Map<String, Object> func = tool.containsKey("function")
+            ? (Map<String, Object>) tool.get("function") : tool;
+        return (String) func.getOrDefault("name", "");
+    }
+
     // =========================================================================
     // Build API parameters
     // =========================================================================
@@ -754,7 +778,7 @@ public class AnthropicProvider extends LLMProvider {
         } else if (thinkingEnabled) {
             Map<String, Integer> budgetMap = Map.of("low", 1024, "medium", 4096, "high", 8192);
             int budget = budgetMap.getOrDefault(reasoningEffort.toLowerCase(), 4096);
-            budget = Math.max(budget, 8192); // high = max(8192, max_tokens) simplified
+            budget = Math.max(8192, effectiveMaxTokens); // high = max(8192, max_tokens)
             params.put("thinking", Map.of("type", "enabled", "budget_tokens", budget));
             params.put("max_tokens", Math.max(effectiveMaxTokens, budget + 4096));
             if (!omitTemperature) params.put("temperature", 1.0);
@@ -959,7 +983,7 @@ public class AnthropicProvider extends LLMProvider {
 
     @Override
     @SuppressWarnings("unchecked")
-    public LLMResponse chat(
+    public CompletableFuture<LLMResponse> chat(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -972,17 +996,16 @@ public class AnthropicProvider extends LLMProvider {
             messages, tools, model, maxTokens, temperature, reasoningEffort,
             toolChoice, true);
 
-        try {
+        return CompletableFuture.supplyAsync(() -> {
             // Build SDK request
             MessageCreateParams.Builder builder = MessageCreateParams.builder()
                 .model((String) params.get("model"))
                 .maxTokens((Integer) params.get("max_tokens"));
 
             if (params.containsKey("system")) {
-                // Cast and set system
                 Object sys = params.get("system");
                 if (sys instanceof String s) builder.system(s);
-                else builder.system((List<SystemTextBlockParam>) sys);  // cast
+                else builder.system((List<SystemTextBlockParam>) sys);
             }
 
             builder.messages((List<MessageParam>) params.get("messages"));
@@ -997,21 +1020,21 @@ public class AnthropicProvider extends LLMProvider {
                 // builder.tools(...)
             }
 
-            Message response = client.messages().create(builder.build());
+            Message response = client.sync().messages().create(builder.build());
             return parseResponse(response);
-
-        } catch (Exception e) {
-            if (isStreamingRequiredError(e)) {
-                // Transparently retry via streaming path
+        }).exceptionallyCompose(e -> {
+            Throwable cause = (e instanceof java.util.concurrent.CompletionException) ? e.getCause() : e;
+            if (cause instanceof Exception ce && isStreamingRequiredError(ce)) {
+                // Transparently retry via streaming path — mirrors Python await self.chat_stream(...)
                 return chatStream(messages, tools, model, maxTokens, temperature,
                                  reasoningEffort, toolChoice, null, null, null);
             }
-            return handleError(e);
-        }
+            return CompletableFuture.completedFuture(handleError(cause));
+        });
     }
 
     @Override
-    public LLMResponse chatStream(
+    public CompletableFuture<LLMResponse> chatStream(
         List<Map<String, Object>> messages,
         List<Map<String, Object>> tools,
         String model,
@@ -1030,61 +1053,72 @@ public class AnthropicProvider extends LLMProvider {
         int idleTimeoutS = Integer.parseInt(
             System.getenv().getOrDefault("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"));
 
-        try {
-            MessageCreateParams.Builder builder = buildStreamParams(params);
-            builder.stream(true);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                MessageCreateParams.Builder builder = buildStreamParams(params);
+                builder.stream(true);
 
-            StreamResponse<MessageStreamEvent> stream = client.messages()
-                .createStreaming(builder.build());
+                StreamResponse<MessageStreamEvent> stream = client.sync().messages()
+                    .createStreaming(builder.build());
 
-            // Track tool call buffers during stream
-            Map<Integer, Map<String, String>> toolBlocks = new HashMap<>();
-            List<ContentBlock> finalContent = new ArrayList<>();
+                // Track tool call buffers during stream
+                Map<Integer, Map<String, String>> toolBlocks = new HashMap<>();
 
-            // Iterate stream events (blocking — virtual thread handles I/O wait)
-            stream.stream().forEach(event -> {
-                if (event.isContentBlockStart()) {
-                    ContentBlockStartEvent startEvent = event.asContentBlockStart();
-                    ContentBlock block = startEvent.contentBlock();
-                    if (block.isToolUse()) {
-                        ToolUseBlock tu = block.asToolUse();
-                        int index = startEvent.index();
-                        toolBlocks.put(index, Map.of(
-                            "call_id", tu.id(), "name", tu.name()));
-                        if (onToolCallDelta != null) {
-                            onToolCallDelta.accept(Map.of(
-                                "index", index, "call_id", tu.id(),
-                                "name", tu.name(), "arguments_delta", ""));
+                // Iterate stream events (synchronous iteration wrapped in supplyAsync).
+                // Each callback is awaited with .join() inside the worker thread —
+                // this mirrors Python "await on_content_delta(text)" semantics.
+                for (MessageStreamEvent event : stream.stream().toList()) {
+                    if (event.isContentBlockStart()) {
+                        ContentBlockStartEvent startEvent = event.asContentBlockStart();
+                        ContentBlock block = startEvent.contentBlock();
+                        if (block.isToolUse()) {
+                            ToolUseBlock tu = block.asToolUse();
+                            int index = startEvent.index();
+                            toolBlocks.put(index, Map.of(
+                                "call_id", tu.id(), "name", tu.name()));
+                            if (onToolCallDelta != null) {
+                                awaitCallback(onToolCallDelta.onDelta(Map.of(
+                                    "index", index, "call_id", tu.id(),
+                                    "name", tu.name(), "arguments_delta", "")));
+                            }
+                        }
+                    } else if (event.isContentBlockDelta()) {
+                        ContentBlockDeltaEvent deltaEvent = event.asContentBlockDelta();
+                        Delta delta = deltaEvent.delta();
+                        if (delta.isThinkingDelta() && onThinkingDelta != null) {
+                            awaitCallback(onThinkingDelta.onDelta(
+                                delta.asThinkingDelta().thinking()));
+                        } else if (delta.isTextDelta() && onContentDelta != null) {
+                            awaitCallback(onContentDelta.onDelta(
+                                delta.asTextDelta().text()));
+                        } else if (delta.isInputJsonDelta() && onToolCallDelta != null) {
+                            int index = deltaEvent.index();
+                            Map<String, String> state = toolBlocks.getOrDefault(index, Map.of());
+                            awaitCallback(onToolCallDelta.onDelta(Map.of(
+                                "index", index,
+                                "call_id", state.getOrDefault("call_id", ""),
+                                "name", state.getOrDefault("name", ""),
+                                "arguments_delta", delta.asInputJsonDelta().partialJson())));
                         }
                     }
-                } else if (event.isContentBlockDelta()) {
-                    ContentBlockDeltaEvent deltaEvent = event.asContentBlockDelta();
-                    Delta delta = deltaEvent.delta();
-                    if (delta.isThinkingDelta() && onThinkingDelta != null) {
-                        onThinkingDelta.accept(delta.asThinkingDelta().thinking());
-                    } else if (delta.isTextDelta() && onContentDelta != null) {
-                        onContentDelta.accept(delta.asTextDelta().text());
-                    } else if (delta.isInputJsonDelta() && onToolCallDelta != null) {
-                        int index = deltaEvent.index();
-                        Map<String, String> state = toolBlocks.getOrDefault(index, Map.of());
-                        onToolCallDelta.accept(Map.of(
-                            "index", index,
-                            "call_id", state.getOrDefault("call_id", ""),
-                            "name", state.getOrDefault("name", ""),
-                            "arguments_delta", delta.asInputJsonDelta().partialJson()));
-                    }
+                    // Accumulate blocks for final message reconstruction
                 }
-                // Accumulate blocks for final message reconstruction
-            });
 
-            // Get final message (timeout-protected)
-            // In practice, get the accumulated message from the stream
-            Message finalMessage = stream.getFinalMessage(Duration.ofSeconds(idleTimeoutS));
-            return parseResponse(finalMessage);
+                // Get final message (timeout-protected)
+                // In practice, get the accumulated message from the stream
+                Message finalMessage = stream.getFinalMessage(Duration.ofSeconds(idleTimeoutS));
+                return parseResponse(finalMessage);
 
-        } catch (Exception e) {
-            return handleError(e);
-        }
+            } catch (Exception e) {
+                return handleError(e);
+            }
+        });
+    }
+
+    private static void awaitCallback(CompletableFuture<Void> cf) {
+        // Sequential await inside supplyAsync worker thread —
+        // mirrors Python "await callback()" in async def semantics.
+        cf.join();
     }
 
     private MessageCreateParams.Builder buildStreamParams(Map<String, Object> params) {
@@ -1132,6 +1166,7 @@ import java.net.URI;
 import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -1142,7 +1177,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * - Dual API backends: Chat Completions AND Responses API
  * - Responses API circuit breaker
  * - 30+ provider-specific thinking style injections via extra_body
- * - All calls are synchronous (virtual threads handle I/O blocking)
+ * - All public methods return CompletableFuture to replicate Python async def
  */
 public class OpenAiCompatProvider extends LLMProvider {
 
@@ -1175,9 +1210,9 @@ public class OpenAiCompatProvider extends LLMProvider {
     private final Map<String, Long> responsesTrippedAt = new HashMap<>();
 
     // Thinking style maps (mirrors Python _THINKING_STYLE_MAP / _GATEWAY_REASONING_STYLE_MAP)
-    private static final Map<String, String> KIMI_THINKING_MODELS = Set.of(
+    private static final Set<String> KIMI_THINKING_MODELS = Set.of(
         "kimi-k2.5", "kimi-k2.6", "k2.6-code-preview");
-    private static final Map<String, String> MIMO_THINKING_MODELS = Set.of(
+    private static final Set<String> MIMO_THINKING_MODELS = Set.of(
         "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni");
 
     public OpenAiCompatProvider(
@@ -1242,6 +1277,129 @@ public class OpenAiCompatProvider extends LLMProvider {
                 .replace("{api_base}", effectiveBase != null ? effectiveBase : "");
             System.setProperty(extra.getKey(), resolved);
         }
+    }
+
+    // =========================================================================
+    // Sanitize empty content and enforce role alternation
+    // =========================================================================
+
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> sanitizeEmptyContent(List<Map<String, Object>> messages) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> msg : messages) {
+            Object content = msg.get("content");
+            if (content instanceof String s && s.isEmpty()) {
+                Map<String, Object> clean = new LinkedHashMap<>(msg);
+                boolean isAssistantWithTools = "assistant".equals(msg.get("role")) && msg.get("tool_calls") != null;
+                clean.put("content", isAssistantWithTools ? null : "(empty)");
+                result.add(clean);
+                continue;
+            }
+            if (content instanceof List<?> items) {
+                List<Object> newItems = new ArrayList<>();
+                boolean changed = false;
+                for (Object item : items) {
+                    if (item instanceof Map<?, ?> itemMap) {
+                        Map<String, Object> im = (Map<String, Object>) itemMap;
+                        if (List.of("text", "input_text", "output_text").contains(im.get("type"))
+                                && "".equals(im.get("text"))) {
+                            changed = true;
+                            continue;
+                        }
+                        if (im.containsKey("_meta")) {
+                            Map<String, Object> stripped = new LinkedHashMap<>();
+                            for (var entry : im.entrySet()) {
+                                if (!"_meta".equals(entry.getKey())) {
+                                    stripped.put(entry.getKey(), entry.getValue());
+                                }
+                            }
+                            newItems.add(stripped);
+                            changed = true;
+                        } else {
+                            newItems.add(item);
+                        }
+                    } else {
+                        newItems.add(item);
+                    }
+                }
+                if (changed) {
+                    Map<String, Object> clean = new LinkedHashMap<>(msg);
+                    if (!newItems.isEmpty()) {
+                        clean.put("content", newItems);
+                    } else if ("assistant".equals(msg.get("role")) && msg.get("tool_calls") != null) {
+                        clean.put("content", null);
+                    } else {
+                        clean.put("content", "(empty)");
+                    }
+                    result.add(clean);
+                    continue;
+                }
+            }
+            if (content instanceof Map) {
+                Map<String, Object> clean = new LinkedHashMap<>(msg);
+                clean.put("content", List.of(content));
+                result.add(clean);
+                continue;
+            }
+            result.add(msg);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> enforceRoleAlternation(List<Map<String, Object>> messages) {
+        if (messages.isEmpty()) return messages;
+        List<Map<String, Object>> merged = new ArrayList<>();
+        for (Map<String, Object> msg : messages) {
+            String role = (String) msg.get("role");
+            if (!merged.isEmpty()
+                    && !"system".equals(role)
+                    && !"tool".equals(role)
+                    && role.equals(merged.get(merged.size() - 1).get("role"))
+                    && ("user".equals(role) || "assistant".equals(role))) {
+                Map<String, Object> prev = merged.get(merged.size() - 1);
+                if ("assistant".equals(role)) {
+                    boolean prevHasTools = prev.get("tool_calls") != null;
+                    boolean currHasTools = msg.get("tool_calls") != null;
+                    if (currHasTools) {
+                        merged.set(merged.size() - 1, new LinkedHashMap<>(msg));
+                        continue;
+                    }
+                    if (prevHasTools) continue;
+                }
+                Object prevContent = prev.getOrDefault("content", "");
+                Object currContent = msg.getOrDefault("content", "");
+                if (prevContent instanceof String ps && currContent instanceof String cs) {
+                    Map<String, Object> updated = new LinkedHashMap<>(prev);
+                    updated.put("content", (ps + "\n\n" + cs).strip());
+                    merged.set(merged.size() - 1, updated);
+                } else {
+                    merged.set(merged.size() - 1, new LinkedHashMap<>(msg));
+                }
+            } else {
+                merged.add(new LinkedHashMap<>(msg));
+            }
+        }
+        Map<String, Object> lastPopped = null;
+        while (!merged.isEmpty() && "assistant".equals(merged.get(merged.size() - 1).get("role"))) {
+            lastPopped = merged.remove(merged.size() - 1);
+        }
+        if (!merged.isEmpty() && lastPopped != null
+                && merged.stream().noneMatch(m -> "user".equals(m.get("role")) || "tool".equals(m.get("role")))) {
+            Map<String, Object> recovered = new LinkedHashMap<>(lastPopped);
+            recovered.put("role", "user");
+            merged.add(recovered);
+        }
+        for (int i = 0; i < merged.size(); i++) {
+            Map<String, Object> msg = merged.get(i);
+            if (!"system".equals(msg.get("role"))) {
+                if ("assistant".equals(msg.get("role")) && msg.get("tool_calls") == null) {
+                    merged.add(i, Map.of("role", "user", "content", "(conversation continued)"));
+                }
+                break;
+            }
+        }
+        return merged;
     }
 
     // =========================================================================
@@ -1338,7 +1496,31 @@ public class OpenAiCompatProvider extends LLMProvider {
         }
     }
 
-    // ... (uniqueToolId, coerceContentToString — similar to Python)
+    static String uniqueToolId(String rawId, Set<String> usedIds, int index,
+                               boolean normalize, Map<String, String> idMap) {
+        if (rawId == null || rawId.isEmpty()) {
+            String generated = shortToolId();
+            while (usedIds.contains(generated)) generated = shortToolId();
+            return generated;
+        }
+        if (!normalize) return rawId;
+        String mapped = idMap.get(rawId);
+        if (mapped != null && !usedIds.contains(mapped)) return mapped;
+        mapped = normalizeToolCallId(rawId);
+        if (!usedIds.contains(mapped)) return mapped;
+        return rawId + "_" + index;
+    }
+
+    static String coerceContentToString(Object content) {
+        if (content == null || content instanceof String) return (String) content;
+        String text = extractTextContent(content);
+        if (text != null && !text.isEmpty()) return text;
+        try {
+            return JSON.writeValueAsString(content);
+        } catch (JsonProcessingException e) {
+            return String.valueOf(content);
+        }
+    }
 
     // =========================================================================
     // Build Chat Completions kwargs
@@ -1520,7 +1702,7 @@ public class OpenAiCompatProvider extends LLMProvider {
     }
 
     static Map<String, Object> gatewayReasoningExtraBody(String style, String effort) {
-        if (effort == null) return null;
+        if (effort == null || effort.isEmpty()) return null;
         if ("reasoning_effort".equals(style)) {
             return Map.of("reasoning", Map.of("effort", effort));
         }
@@ -1756,55 +1938,116 @@ public class OpenAiCompatProvider extends LLMProvider {
             retryAfter, shouldRetry);
     }
 
+    static Double extractRetryAfter(String content) {
+        if (content == null) return null;
+        String text = content.toLowerCase();
+        Pattern[] patterns = {
+            Pattern.compile("retry after\\s+(\\d+(?:\\.\\d+)?)\\s*(ms|milliseconds|s|sec|secs|seconds|m|min|minutes)?"),
+            Pattern.compile("try again in\\s+(\\d+(?:\\.\\d+)?)\\s*(ms|milliseconds|s|sec|secs|seconds|m|min|minutes)"),
+            Pattern.compile("wait\\s+(\\d+(?:\\.\\d+)?)\\s*(ms|milliseconds|s|sec|secs|seconds|m|min|minutes)\\s*before retry"),
+            Pattern.compile("retry[_-]?after[\"'\\s:=]+(\\d+(?:\\.\\d+)?)")
+        };
+        for (int i = 0; i < patterns.length; i++) {
+            Matcher m = patterns[i].matcher(text);
+            if (m.find()) {
+                double value = Double.parseDouble(m.group(1));
+                String unit = i < 3 ? m.group(2) : "s";
+                return toRetrySeconds(value, unit);
+            }
+        }
+        return null;
+    }
+
+    static double toRetrySeconds(double value, String unit) {
+        String normalized = (unit != null ? unit : "s").toLowerCase();
+        if ("ms".equals(normalized) || "milliseconds".equals(normalized)) {
+            return Math.max(0.1, value / 1000.0);
+        }
+        if ("m".equals(normalized) || "min".equals(normalized) || "minutes".equals(normalized)) {
+            return Math.max(0.1, value * 60.0);
+        }
+        return Math.max(0.1, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    static String[] extractErrorTypeCode(Object payload) {
+        Map<String, Object> data = null;
+        if (payload instanceof Map) {
+            data = (Map<String, Object>) payload;
+        } else if (payload instanceof String text) {
+            text = text.strip();
+            if (!text.isEmpty()) {
+                try {
+                    Object parsed = JSON.readValue(text, Map.class);
+                    if (parsed instanceof Map) data = (Map<String, Object>) parsed;
+                } catch (Exception ignored) {}
+            }
+        }
+        if (data == null) return new String[]{null, null};
+        Object errorObj = data.get("error");
+        String typeValue = String.valueOf(data.getOrDefault("type", "null"));
+        String codeValue = String.valueOf(data.getOrDefault("code", "null"));
+        if (errorObj instanceof Map err) {
+            if (err.get("type") != null) typeValue = String.valueOf(err.get("type"));
+            if (err.get("code") != null) codeValue = String.valueOf(err.get("code"));
+        }
+        return new String[]{
+            "null".equals(typeValue) ? null : typeValue,
+            "null".equals(codeValue) ? null : codeValue
+        };
+    }
+
     // =========================================================================
     // Public API
     // =========================================================================
 
     @Override
-    public LLMResponse chat(
+    public CompletableFuture<LLMResponse> chat(
         List<Map<String, Object>> messages, List<Map<String, Object>> tools,
         String model, int maxTokens, double temperature,
         String reasoningEffort, Object toolChoice
     ) {
-        ensureClient();
-        try {
-            if (shouldUseResponsesApi(model, reasoningEffort)) {
-                try {
-                    // Build and call Responses API (similar to _build_responses_body)
-                    LLMResponse result = chatViaResponsesApi(
-                        messages, tools, model, maxTokens, temperature,
-                        reasoningEffort, toolChoice);
-                    recordResponsesSuccess(model, reasoningEffort);
-                    return result;
-                } catch (Exception responsesError) {
-                    if (spec != null && "github_copilot".equals(spec.name())) throw responsesError;
-                    if ("responses".equals(apiType)) throw responsesError;
-                    if (!shouldFallbackFromResponsesError(responsesError)) throw responsesError;
-                    recordResponsesFailure(model, reasoningEffort);
+        return CompletableFuture.supplyAsync(() -> {
+            ensureClient();
+            try {
+                if (shouldUseResponsesApi(model, reasoningEffort)) {
+                    try {
+                        // Build and call Responses API (similar to _build_responses_body)
+                        LLMResponse result = chatViaResponsesApi(
+                            messages, tools, model, maxTokens, temperature,
+                            reasoningEffort, toolChoice);
+                        recordResponsesSuccess(model, reasoningEffort);
+                        return result;
+                    } catch (Exception responsesError) {
+                        if (spec != null && "github_copilot".equals(spec.name())) throw responsesError;
+                        if ("responses".equals(apiType)) throw responsesError;
+                        if (!shouldFallbackFromResponsesError(responsesError)) throw responsesError;
+                        recordResponsesFailure(model, reasoningEffort);
+                    }
                 }
+
+                // Chat Completions API
+                Map<String, Object> kwargs = buildKwargs(
+                    messages, tools, model, maxTokens, temperature,
+                    reasoningEffort, toolChoice);
+
+                // Build SDK parameters and call
+                ChatCompletionCreateParams.Builder cpBuilder = buildChatCompletionParams(kwargs);
+                ChatCompletion completion = client.chat().completions()
+                    .create(cpBuilder.build());
+
+                // Convert SDK response to Map for shared parseResponse
+                Map<String, Object> responseMap = convertSdkResponse(completion);
+                return parseResponse(responseMap);
+
+            } catch (Exception e) {
+                return handleError(e, spec, apiBase);
             }
-
-            // Chat Completions API
-            Map<String, Object> kwargs = buildKwargs(
-                messages, tools, model, maxTokens, temperature,
-                reasoningEffort, toolChoice);
-
-            // Build SDK parameters and call
-            ChatCompletionCreateParams.Builder cpBuilder = buildChatCompletionParams(kwargs);
-            ChatCompletion completion = client.chat().completions()
-                .create(cpBuilder.build());
-
-            // Convert SDK response to Map for shared parseResponse
-            Map<String, Object> responseMap = convertSdkResponse(completion);
-            return parseResponse(responseMap);
-
-        } catch (Exception e) {
-            return handleError(e, spec, apiBase);
-        }
+        });
     }
 
     @Override
-    public LLMResponse chatStream(
+    public CompletableFuture<LLMResponse> chatStream(
         List<Map<String, Object>> messages, List<Map<String, Object>> tools,
         String model, int maxTokens, double temperature,
         String reasoningEffort, Object toolChoice,
@@ -1812,82 +2055,83 @@ public class OpenAiCompatProvider extends LLMProvider {
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta
     ) {
-        ensureClient();
-        int idleTimeoutS = Integer.parseInt(
-            System.getenv().getOrDefault("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"));
+        return CompletableFuture.supplyAsync(() -> {
+            ensureClient();
+            int idleTimeoutS = Integer.parseInt(
+                System.getenv().getOrDefault("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"));
 
-        try {
-            if (shouldUseResponsesApi(model, reasoningEffort)) {
-                try {
-                    LLMResponse result = chatStreamViaResponsesApi(
-                        messages, tools, model, maxTokens, temperature,
-                        reasoningEffort, toolChoice,
-                        onContentDelta, onThinkingDelta, onToolCallDelta);
-                    recordResponsesSuccess(model, reasoningEffort);
-                    return result;
-                } catch (Exception responsesError) {
-                    if (spec != null && "github_copilot".equals(spec.name())) throw responsesError;
-                    if ("responses".equals(apiType)) throw responsesError;
-                    if (!shouldFallbackFromResponsesError(responsesError)) throw responsesError;
-                    recordResponsesFailure(model, reasoningEffort);
+            try {
+                if (shouldUseResponsesApi(model, reasoningEffort)) {
+                    try {
+                        LLMResponse result = chatStreamViaResponsesApi(
+                            messages, tools, model, maxTokens, temperature,
+                            reasoningEffort, toolChoice,
+                            onContentDelta, onThinkingDelta, onToolCallDelta);
+                        recordResponsesSuccess(model, reasoningEffort);
+                        return result;
+                    } catch (Exception responsesError) {
+                        if (spec != null && "github_copilot".equals(spec.name())) throw responsesError;
+                        if ("responses".equals(apiType)) throw responsesError;
+                        if (!shouldFallbackFromResponsesError(responsesError)) throw responsesError;
+                        recordResponsesFailure(model, reasoningEffort);
+                    }
                 }
-            }
 
-            Map<String, Object> kwargs = buildKwargs(
-                messages, tools, model, maxTokens, temperature,
-                reasoningEffort, toolChoice);
+                Map<String, Object> kwargs = buildKwargs(
+                    messages, tools, model, maxTokens, temperature,
+                    reasoningEffort, toolChoice);
 
-            // Zhipu special: tool_stream
-            if (spec != null && "zhipu".equals(spec.name())
-                && tools != null && !tools.isEmpty() && onToolCallDelta != null) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> eb = (Map<String, Object>)
-                    kwargs.computeIfAbsent("extra_body", k -> new LinkedHashMap<>());
-                eb.put("tool_stream", true);
-            }
+                // Zhipu special: tool_stream
+                if (spec != null && "zhipu".equals(spec.name())
+                    && tools != null && !tools.isEmpty() && onToolCallDelta != null) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> eb = (Map<String, Object>)
+                        kwargs.computeIfAbsent("extra_body", k -> new LinkedHashMap<>());
+                    eb.put("tool_stream", true);
+                }
 
-            kwargs.put("stream", true);
-            kwargs.put("stream_options", Map.of("include_usage", true));
+                kwargs.put("stream", true);
+                kwargs.put("stream_options", Map.of("include_usage", true));
 
-            // Stream the response
-            // The openai-java SDK provides streaming via client.chat().completions().createStreaming()
-            // In Java virtual threads: iterate the Stream<ChatCompletionChunk> synchronously
-            List<Map<String, Object>> chunks = new ArrayList<>();
+                // Stream the response (synchronous iteration wrapped in supplyAsync).
+                // Each callback is awaited with awaitCallback inside the worker thread —
+                // this mirrors Python "await on_content_delta(text)" semantics.
+                List<Map<String, Object>> chunks = new ArrayList<>();
 
-            ChatCompletionCreateParams.Builder cpBuilder = buildChatCompletionParams(kwargs);
-            // stream() returns Iterable<ChatCompletionChunk>
-            for (ChatCompletionChunk chunk :
-                 client.chat().completions().createStreaming(cpBuilder.build()).stream()) {
-                chunks.add(convertChunkToMap(chunk));
+                ChatCompletionCreateParams.Builder cpBuilder = buildChatCompletionParams(kwargs);
+                for (ChatCompletionChunk chunk :
+                     client.chat().completions().createStreaming(cpBuilder.build()).stream()) {
+                    chunks.add(convertChunkToMap(chunk));
 
-                if (!chunk.choices().isEmpty()) {
-                    ChatCompletionChunk.Choice.Delta delta = chunk.choices().get(0).delta();
+                    if (!chunk.choices().isEmpty()) {
+                        ChatCompletionChunk.Choice.Delta delta = chunk.choices().get(0).delta();
 
-                    if (onContentDelta != null && delta.content() != null) {
-                        onContentDelta.accept(delta.content().orElse(""));
-                    }
-                    if (onThinkingDelta != null) {
-                        // reasoning_content is in delta as an extra field
-                    }
-                    if (onToolCallDelta != null) {
-                        List<ChatCompletionChunk.Choice.Delta.ToolCall> tcList = delta.toolCalls().orElse(List.of());
-                        for (int i = 0; i < tcList.size(); i++) {
-                            ChatCompletionChunk.Choice.Delta.ToolCall tc = tcList.get(i);
-                            onToolCallDelta.accept(Map.of(
-                                "index", tc.index().orElse(i),
-                                "call_id", tc.id().orElse(""),
-                                "name", tc.function().flatMap(f -> f.name()).orElse(""),
-                                "arguments_delta", tc.function().flatMap(f -> f.arguments()).orElse("")));
+                        if (onContentDelta != null && delta.content() != null) {
+                            awaitCallback(onContentDelta.onDelta(delta.content().orElse("")));
+                        }
+                        if (onThinkingDelta != null) {
+                            // reasoning_content is in delta as an extra field
+                        }
+                        if (onToolCallDelta != null) {
+                            List<ChatCompletionChunk.Choice.Delta.ToolCall> tcList = delta.toolCalls().orElse(List.of());
+                            for (int i = 0; i < tcList.size(); i++) {
+                                ChatCompletionChunk.Choice.Delta.ToolCall tc = tcList.get(i);
+                                awaitCallback(onToolCallDelta.onDelta(Map.of(
+                                    "index", tc.index().orElse(i),
+                                    "call_id", tc.id().orElse(""),
+                                    "name", tc.function().flatMap(f -> f.name()).orElse(""),
+                                    "arguments_delta", tc.function().flatMap(f -> f.arguments()).orElse(""))));
+                            }
                         }
                     }
                 }
+
+                return parseChunks(chunks);
+
+            } catch (Exception e) {
+                return handleError(e, spec, apiBase);
             }
-
-            return parseChunks(chunks);
-
-        } catch (Exception e) {
-            return handleError(e, spec, apiBase);
-        }
+        });
     }
 
     @Override
@@ -1897,23 +2141,106 @@ public class OpenAiCompatProvider extends LLMProvider {
 
     // ... (helper methods for Responses API, chunk parsing, etc.)
 
+    @SuppressWarnings("unchecked")
     private ChatCompletionCreateParams.Builder buildChatCompletionParams(Map<String, Object> kwargs) {
-        // Build typed SDK params from Map — omitted for brevity
-        return ChatCompletionCreateParams.builder();
+        ChatCompletionCreateParams.Builder builder = ChatCompletionCreateParams.builder()
+            .model((String) kwargs.get("model"));
+        if (kwargs.containsKey("messages")) {
+            builder.messages((List<ChatCompletionMessageParam>) kwargs.get("messages"));
+        }
+        if (kwargs.containsKey("max_tokens")) {
+            builder.maxTokens((Integer) kwargs.get("max_tokens"));
+        }
+        if (kwargs.containsKey("max_completion_tokens")) {
+            builder.maxCompletionTokens((Integer) kwargs.get("max_completion_tokens"));
+        }
+        if (kwargs.containsKey("temperature")) {
+            builder.temperature(((Number) kwargs.get("temperature")).doubleValue());
+        }
+        if (kwargs.containsKey("tools")) {
+            builder.tools((List<ChatCompletionToolParam>) kwargs.get("tools"));
+        }
+        if (kwargs.containsKey("tool_choice")) {
+            builder.toolChoice((ChatCompletionToolChoiceOption) kwargs.get("tool_choice"));
+        }
+        if (kwargs.containsKey("stream")) {
+            builder.stream((Boolean) kwargs.get("stream"));
+        }
+        if (kwargs.containsKey("stream_options")) {
+            builder.streamOptions((ChatCompletionStreamOptions) kwargs.get("stream_options"));
+        }
+        if (kwargs.containsKey("extra_body")) {
+            Map<String, Object> extra = (Map<String, Object>) kwargs.get("extra_body");
+            extra.forEach(builder::putAdditionalProperty);
+        }
+        return builder;
     }
 
+    @SuppressWarnings("unchecked")
     private Map<String, Object> convertSdkResponse(ChatCompletion completion) {
-        // Convert SDK Pydantic model back to Map for shared parseResponse — omitted
-        return Map.of();
+        return JSON.convertValue(completion, Map.class);
     }
 
+    @SuppressWarnings("unchecked")
     private Map<String, Object> convertChunkToMap(ChatCompletionChunk chunk) {
-        return Map.of();
+        return JSON.convertValue(chunk, Map.class);
     }
 
+    @SuppressWarnings("unchecked")
     static LLMResponse parseChunks(List<Map<String, Object>> chunks) {
-        // Mirror Python _parse_chunks — accumulate deltas into final response
-        return new LLMResponse("parsed", "stop");
+        StringBuilder contentBuf = new StringBuilder();
+        StringBuilder reasoningBuf = new StringBuilder();
+        Map<Integer, Map<String, Object>> tcBufs = new LinkedHashMap<>();
+        String finishReason = "stop";
+        Map<String, Integer> usage = Map.of();
+
+        for (Map<String, Object> cm : chunks) {
+            List<Map<String, Object>> choices = (List<Map<String, Object>>) cm.getOrDefault("choices", List.of());
+            if (choices.isEmpty()) {
+                usage = extractUsage(cm);
+                continue;
+            }
+            Map<String, Object> choice = choices.get(0);
+            if (choice.get("finish_reason") != null) {
+                finishReason = String.valueOf(choice.get("finish_reason"));
+            }
+            Map<String, Object> delta = (Map<String, Object>) choice.getOrDefault("delta", Map.of());
+            String text = extractTextContent(delta.get("content"));
+            if (text != null) contentBuf.append(text);
+
+            String thinking = extractTextContent(delta.getOrDefault("reasoning_content", delta.get("reasoning")));
+            if (thinking != null) reasoningBuf.append(thinking);
+
+            List<Map<String, Object>> toolDeltas = (List<Map<String, Object>>) delta.get("tool_calls");
+            if (toolDeltas != null) {
+                for (Map<String, Object> tc : toolDeltas) {
+                    int idx = tc.containsKey("index") ? ((Number) tc.get("index")).intValue() : 0;
+                    tcBufs.computeIfAbsent(idx, k -> new LinkedHashMap<>(Map.of("id", "", "name", "", "arguments", "")));
+                    Map<String, Object> buf = tcBufs.get(idx);
+                    if (tc.get("id") != null) buf.put("id", String.valueOf(tc.get("id")));
+                    Map<String, Object> fn = (Map<String, Object>) tc.get("function");
+                    if (fn != null) {
+                        if (fn.get("name") != null) buf.put("name", String.valueOf(fn.get("name")));
+                        if (fn.get("arguments") != null) buf.put("arguments", buf.get("arguments") + String.valueOf(fn.get("arguments")));
+                    }
+                }
+            }
+            usage = extractUsage(cm);
+        }
+
+        List<ToolCallRequest> toolCalls = new ArrayList<>();
+        for (Map<String, Object> buf : tcBufs.values()) {
+            String id = (String) buf.get("id");
+            if (id == null || id.isEmpty()) id = shortToolId();
+            Object args = ToolArguments.parseToolArguments(buf.get("arguments"));
+            toolCalls.add(new ToolCallRequest(id, (String) buf.get("name"), args, null, null, null));
+        }
+
+        return new LLMResponse(
+            !contentBuf.isEmpty() ? contentBuf.toString() : null,
+            toolCalls, finishReason, usage, null,
+            !reasoningBuf.isEmpty() ? reasoningBuf.toString() : null,
+            null, null, null, null, null, null, null);
     }
 
     private LLMResponse chatViaResponsesApi(
@@ -1921,10 +2248,12 @@ public class OpenAiCompatProvider extends LLMProvider {
         String model, int maxTokens, double temperature,
         String reasoningEffort, Object toolChoice
     ) {
-        // Build Responses API body using shared convert_messages / convert_tools
-        // Call client.responses().create(...)
-        // Return parsed LLMResponse
-        throw new UnsupportedOperationException("Responses API — see 05-providers-impl.md");
+        Map<String, Object> body = buildResponsesBody(messages, tools, model, maxTokens,
+            temperature, reasoningEffort, toolChoice);
+        // Call client.responses().create(...) and parse
+        // In practice: Response response = client.responses().create(body);
+        // return parseResponse(convertSdkResponse(response));
+        throw new UnsupportedOperationException("Responses API — use buildResponsesBody + client.responses().create()");
     }
 
     private LLMResponse chatStreamViaResponsesApi(
@@ -1935,7 +2264,54 @@ public class OpenAiCompatProvider extends LLMProvider {
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta
     ) {
-        throw new UnsupportedOperationException("Responses API streaming");
+        Map<String, Object> body = buildResponsesBody(messages, tools, model, maxTokens,
+            temperature, reasoningEffort, toolChoice);
+        body.put("stream", true);
+        // Stream via consume_sdk_stream (shared module)
+        throw new UnsupportedOperationException("Responses API streaming — use buildResponsesBody + consume_sdk_stream");
+    }
+
+    @SuppressWarnings("unchecked")
+    Map<String, Object> buildResponsesBody(
+        List<Map<String, Object>> messages,
+        List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        String modelName = model != null ? model : defaultModel;
+        if (spec != null && spec.stripModelPrefix()) {
+            int slash = modelName.lastIndexOf('/');
+            if (slash >= 0) modelName = modelName.substring(slash + 1);
+        }
+        List<Map<String, Object>> sanitized = sanitizeMessages(sanitizeEmptyContent(messages));
+        // Use shared openai_responses module to convert messages
+        Object[] converted = ResponseConverters.convertMessages(sanitized);
+        String instructions = (String) converted[0];
+        List<Map<String, Object>> inputItems = (List<Map<String, Object>>) converted[1];
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("model", modelName);
+        body.put("instructions", instructions != null && !instructions.isEmpty() ? instructions : null);
+        body.put("input", inputItems);
+        body.put("max_output_tokens", Math.max(1, maxTokens));
+        body.put("store", false);
+        body.put("stream", false);
+
+        if (supportsTemperature(modelName, reasoningEffort)) {
+            body.put("temperature", temperature);
+        }
+        if (reasoningEffort != null && !"none".equalsIgnoreCase(reasoningEffort)) {
+            body.put("reasoning", Map.of("effort", reasoningEffort));
+            body.put("include", List.of("reasoning.encrypted_content"));
+        }
+        if (tools != null && !tools.isEmpty()) {
+            body.put("tools", ResponseConverters.convertTools(tools));
+            body.put("tool_choice", toolChoice != null ? toolChoice : "auto");
+        }
+        if (!extraBody.isEmpty()) {
+            body = deepMerge(body, extraBody);
+        }
+        return body;
     }
 
     static boolean shouldFallbackFromResponsesError(Exception e) {
@@ -1955,6 +2331,12 @@ public class OpenAiCompatProvider extends LLMProvider {
         StringBuilder sb = new StringBuilder(9);
         for (int i = 0; i < 9; i++) sb.append(alnum.charAt(rnd.nextInt(alnum.length())));
         return sb.toString();
+    }
+
+    private static void awaitCallback(CompletableFuture<Void> cf) {
+        // Sequential await inside supplyAsync worker thread —
+        // mirrors Python "await callback()" in async def semantics.
+        cf.join();
     }
 
     @SuppressWarnings("unchecked")
@@ -1995,6 +2377,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 /**
@@ -2016,6 +2399,13 @@ public class FallbackProvider extends LLMProvider {
     private static final Set<String> NON_FALLBACK_ERROR_KINDS = Set.of(
         "authentication", "auth", "permission", "content_filter",
         "refusal", "context_length", "invalid_request");
+    private static final Set<String> FALLBACK_ERROR_TOKENS = Set.of(
+        "rate_limit", "rate limit", "too_many_requests", "too many requests",
+        "overloaded", "server_error", "server error", "temporarily unavailable",
+        "timeout", "timed out", "connection",
+        "insufficient_quota", "insufficient quota", "quota_exceeded", "quota exceeded",
+        "quota_exhausted", "quota exhausted",
+        "billing_hard_limit", "insufficient_balance", "balance", "out of credits");
 
     private final LLMProvider primary;
     private final List<ModelPreset> fallbackPresets;
@@ -2042,7 +2432,7 @@ public class FallbackProvider extends LLMProvider {
 
     @Override
     public GenerationSettings generation() {
-        return primary.generation();
+        return primary.generation;
     }
 
     public void setGeneration(GenerationSettings gs) {
@@ -2052,6 +2442,11 @@ public class FallbackProvider extends LLMProvider {
     @Override
     public String getDefaultModel() {
         return primary.getDefaultModel();
+    }
+
+    /** Delegate to primary — mirrors Python {@code supports_progress_deltas} property. */
+    public boolean supportsProgressDeltas() {
+        return primary.supportsProgressDeltas;
     }
 
     /** Is the primary provider currently available (not in cooldown)? */
@@ -2064,7 +2459,7 @@ public class FallbackProvider extends LLMProvider {
     }
 
     @Override
-    public LLMResponse chat(
+    public CompletableFuture<LLMResponse> chat(
         List<Map<String, Object>> messages, List<Map<String, Object>> tools,
         String model, int maxTokens, double temperature,
         String reasoningEffort, Object toolChoice
@@ -2081,13 +2476,31 @@ public class FallbackProvider extends LLMProvider {
     }
 
     @Override
-    public LLMResponse chatStream(
+    public CompletableFuture<LLMResponse> chatStream(
         List<Map<String, Object>> messages, List<Map<String, Object>> tools,
         String model, int maxTokens, double temperature,
         String reasoningEffort, Object toolChoice,
         ContentDeltaCallback onContentDelta,
         ContentDeltaCallback onThinkingDelta,
         ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return chatStream(messages, tools, model, maxTokens, temperature,
+            reasoningEffort, toolChoice,
+            onContentDelta, onThinkingDelta, onToolCallDelta, null);
+    }
+
+    /**
+     * Stream chat with optional recover callback — mirrors Python
+     * {@code kwargs.pop("on_stream_recover", None)} semantics.
+     */
+    public CompletableFuture<LLMResponse> chatStream(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta,
+        Runnable onStreamRecover
     ) {
         if (!hasFallbacks) return primary.chatStream(messages, tools, model, maxTokens,
             temperature, reasoningEffort, toolChoice,
@@ -2096,7 +2509,10 @@ public class FallbackProvider extends LLMProvider {
         boolean[] hasStreamed = {false};
         ContentDeltaCallback trackingDelta = text -> {
             if (text != null && !text.isEmpty()) hasStreamed[0] = true;
-            if (onContentDelta != null) onContentDelta.accept(text);
+            if (onContentDelta != null) {
+                return onContentDelta.onDelta(text);
+            }
+            return CompletableFuture.completedFuture(null);
         };
 
         return tryWithFallback(
@@ -2106,7 +2522,7 @@ public class FallbackProvider extends LLMProvider {
                 trackingDelta, onThinkingDelta, onToolCallDelta),
             new CallArgs(messages, tools, model, maxTokens, temperature,
                         reasoningEffort, toolChoice),
-            hasStreamed, null);
+            hasStreamed, onStreamRecover);
     }
 
     /**
@@ -2114,7 +2530,7 @@ public class FallbackProvider extends LLMProvider {
      */
     @FunctionalInterface
     private interface ProviderCall {
-        LLMResponse apply(LLMProvider provider, CallArgs args);
+        CompletableFuture<LLMResponse> apply(LLMProvider provider, CallArgs args);
     }
 
     private record CallArgs(
@@ -2127,7 +2543,7 @@ public class FallbackProvider extends LLMProvider {
         Object toolChoice
     ) {}
 
-    private LLMResponse tryWithFallback(
+    private CompletableFuture<LLMResponse> tryWithFallback(
         ProviderCall call,
         CallArgs args,
         boolean[] hasStreamed,
@@ -2136,13 +2552,16 @@ public class FallbackProvider extends LLMProvider {
         String primaryModel = (args.model() != null)
             ? args.model() : primary.getDefaultModel();
 
-        // Try primary first (if circuit not tripped)
-        if (primaryAvailable()) {
-            LLMResponse response = call.apply(primary, args);
+        if (!primaryAvailable()) {
+            log.debug("Primary model '{}' circuit open; skipping", primaryModel);
+            return tryFallbacks(call, args, primaryModel, hasStreamed, onStreamRecover, null, true);
+        }
+
+        return call.apply(primary, args).thenCompose(response -> {
             if (!"error".equals(response.finishReason())) {
                 primaryFailures = 0;
                 primaryTrippedAt = null;
-                return response;
+                return CompletableFuture.completedFuture(response);
             }
 
             // Has streamed content already?
@@ -2156,14 +2575,14 @@ public class FallbackProvider extends LLMProvider {
                     if (onStreamRecover != null) onStreamRecover.run();
                 } else {
                     log.warn("Primary model error but content already streamed; skipping failover");
-                    return response;
+                    return CompletableFuture.completedFuture(response);
                 }
             }
 
             if (!shouldFallback(response)) {
                 log.warn("Primary model '{}' returned non-fallbackable error: {}",
                          primaryModel, truncate(response.content(), 120));
-                return response;
+                return CompletableFuture.completedFuture(response);
             }
 
             primaryFailures++;
@@ -2172,84 +2591,104 @@ public class FallbackProvider extends LLMProvider {
                 log.warn("Primary model '{}' circuit open after {} consecutive failures",
                          primaryModel, primaryFailures);
             }
-        } else {
-            log.debug("Primary model '{}' circuit open; skipping", primaryModel);
+
+            return tryFallbacks(call, args, primaryModel, hasStreamed, onStreamRecover, response, false);
+        });
+    }
+
+    private CompletableFuture<LLMResponse> tryFallbacks(
+        ProviderCall call, CallArgs args, String primaryModel,
+        boolean[] hasStreamed, Runnable onStreamRecover,
+        LLMResponse lastResponse, boolean primarySkipped
+    ) {
+        return tryFallbackAtIndex(call, args, primaryModel, hasStreamed, onStreamRecover,
+                                  lastResponse, primarySkipped, 0);
+    }
+
+    private CompletableFuture<LLMResponse> tryFallbackAtIndex(
+        ProviderCall call, CallArgs args, String primaryModel,
+        boolean[] hasStreamed, Runnable onStreamRecover,
+        LLMResponse lastResponse, boolean primarySkipped, int index
+    ) {
+        if (index >= fallbackPresets.size()) {
+            log.warn("All {} fallback model(s) failed", fallbackPresets.size());
+            if (lastResponse != null) {
+                return CompletableFuture.completedFuture(lastResponse);
+            }
+            return CompletableFuture.completedFuture(new LLMResponse(
+                "Primary model '" + primaryModel + "' circuit open and no fallbacks available",
+                "error"));
         }
 
-        // Try fallbacks
-        LLMResponse lastResponse = null;
-        boolean primarySkipped = !primaryAvailable();
+        ModelPreset fallback = fallbackPresets.get(index);
+        String fallbackModel = fallback.model();
 
-        for (int i = 0; i < fallbackPresets.size(); i++) {
-            ModelPreset fallback = fallbackPresets.get(i);
-            String fallbackModel = fallback.model();
-
-            // Check if previous response already streamed content
-            if (hasStreamed != null && hasStreamed[0]) {
-                boolean isTimeout = lastResponse != null
-                    && "timeout".equals(
-                        lastResponse.errorKind() != null
-                            ? lastResponse.errorKind().toLowerCase() : "");
-                if (isTimeout && onStreamRecover != null) {
-                    hasStreamed[0] = false;
-                    onStreamRecover.run();
-                } else {
-                    break;  // content already delivered, stop failover
-                }
-            }
-
-            if (i == 0 && primarySkipped) {
-                log.info("Primary '{}' circuit open, trying fallback '{}'",
-                         primaryModel, fallbackModel);
-            } else if (i == 0) {
-                log.info("Primary '{}' failed, trying fallback '{}'",
-                         primaryModel, fallbackModel);
+        // Check if previous response already streamed content
+        if (hasStreamed != null && hasStreamed[0]) {
+            boolean isTimeout = lastResponse != null
+                && "timeout".equals(
+                    lastResponse.errorKind() != null
+                        ? lastResponse.errorKind().toLowerCase() : "");
+            if (isTimeout && onStreamRecover != null) {
+                log.warn("Fallback model '{}' stream stalled after content; "
+                         + "starting a new stream segment and trying next fallback",
+                         (index > 0) ? fallbackPresets.get(index - 1).model() : primaryModel);
+                hasStreamed[0] = false;
+                onStreamRecover.run();
             } else {
-                log.info("Fallback '{}' also failed, trying '{}'",
-                         fallbackPresets.get(i - 1).model(), fallbackModel);
-            }
-
-            try {
-                LLMProvider fallbackProvider = providerFactory.apply(fallback);
-                String origModel = args.model();
-                int origMaxTokens = args.maxTokens();
-                double origTemp = args.temperature();
-                Object origToolChoice = args.toolChoice();
-
-                // Override with fallback params
-                // (In a real implementation, use reflection or a mutable builder)
-                CallArgs fbArgs = new CallArgs(
-                    args.messages(), args.tools(),
-                    fallbackModel,
-                    fallback.maxTokens(),
-                    fallback.temperature(),
-                    fallback.reasoningEffort(),
-                    args.toolChoice()
-                );
-
-                LLMResponse fbResponse = call.apply(fallbackProvider, fbArgs);
-
-                if (!"error".equals(fbResponse.finishReason())) {
-                    log.info("Fallback '{}' succeeded after primary '{}' failed",
-                             fallbackModel, primaryModel);
-                    return fbResponse;
+                // content already delivered, stop failover
+                if (lastResponse != null) {
+                    return CompletableFuture.completedFuture(lastResponse);
                 }
-
-                lastResponse = fbResponse;
-                log.warn("Fallback '{}' also failed: {}",
-                         fallbackModel, truncate(fbResponse.content(), 120));
-
-            } catch (Exception exc) {
-                log.warn("Failed to create provider for fallback '{}': {}",
-                         fallbackModel, exc.getMessage());
+                return CompletableFuture.completedFuture(new LLMResponse(
+                    "Primary model '" + primaryModel + "' circuit open and no fallbacks available",
+                    "error"));
             }
         }
 
-        log.warn("All {} fallback model(s) failed", fallbackPresets.size());
-        if (lastResponse != null) return lastResponse;
-        return new LLMResponse(
-            "Primary model '" + primaryModel + "' circuit open and no fallbacks available",
-            "error");
+        if (index == 0 && primarySkipped) {
+            log.info("Primary '{}' circuit open, trying fallback '{}'",
+                     primaryModel, fallbackModel);
+        } else if (index == 0) {
+            log.info("Primary '{}' failed, trying fallback '{}'",
+                     primaryModel, fallbackModel);
+        } else {
+            log.info("Fallback '{}' also failed, trying '{}'",
+                     fallbackPresets.get(index - 1).model(), fallbackModel);
+        }
+
+        LLMProvider fallbackProvider;
+        try {
+            fallbackProvider = providerFactory.apply(fallback);
+        } catch (Exception exc) {
+            log.warn("Failed to create provider for fallback '{}': {}",
+                     fallbackModel, exc.getMessage());
+            return tryFallbackAtIndex(call, args, primaryModel, hasStreamed, onStreamRecover,
+                                      lastResponse, primarySkipped, index + 1);
+        }
+
+        CallArgs fbArgs = new CallArgs(
+            args.messages(), args.tools(),
+            fallbackModel,
+            fallback.maxTokens(),
+            fallback.temperature(),
+            fallback.reasoningEffort(),
+            args.toolChoice()
+        );
+
+        return call.apply(fallbackProvider, fbArgs).thenCompose(fbResponse -> {
+            if (!"error".equals(fbResponse.finishReason())) {
+                log.info("Fallback '{}' succeeded after primary '{}' failed",
+                         fallbackModel, primaryModel);
+                return CompletableFuture.completedFuture(fbResponse);
+            }
+
+            log.warn("Fallback '{}' also failed: {}",
+                     fallbackModel, truncate(fbResponse.content(), 120));
+
+            return tryFallbackAtIndex(call, args, primaryModel, hasStreamed, onStreamRecover,
+                                      fbResponse, primarySkipped, index + 1);
+        });
     }
 
     /** Determine if this error is eligible for fallback. */
@@ -2278,7 +2717,10 @@ public class FallbackProvider extends LLMProvider {
                                || (status >= 500 && status <= 599))) return true;
         if (FALLBACK_ERROR_KINDS.contains(kind)) return true;
 
-        return false;
+        String text = (response.content() != null)
+            ? response.content().toLowerCase() : "";
+        return FALLBACK_ERROR_TOKENS.stream().anyMatch(
+            t -> kind.contains(t) || errorType.contains(t) || code.contains(t) || text.contains(t));
     }
 
     private static String truncate(String s, int maxLen) {
@@ -2293,12 +2735,486 @@ public class FallbackProvider extends LLMProvider {
 #### `BedrockProvider.java` — AWS Bedrock
 
 ```java
-// Uses AWS SDK for Java v2 (software.amazon.awssdk:bedrockruntime)
-// Key: uses BedrockRuntimeClient.converse() / converseStream()
-// boto3 → AWS SDK v2 (already async with SdkAsyncHttpClient)
-// Image conversion: data URL → base64 decode → ImageBlock
-// ToolFormat: ToolSpecification.builder() with ToolInputSchema
-// Reasoning: ReasoningContentBlock; adaptive thinking config
+package com.nanobot.providers;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.*;
+
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.regex.Pattern;
+
+/**
+ * AWS Bedrock Converse provider.
+ *
+ * Uses AWS SDK v2 BedrockRuntimeClient.converse() / converseStream().
+ * Key mappings from Python bedrock_provider.py:
+ * - Message format: OpenAI-style → Bedrock system + messages
+ * - Image: data URL → base64 decode → ImageBlock
+ * - Tools: function schema → ToolSpecification with ToolInputSchema
+ * - Reasoning: adaptive thinking via additionalModelRequestFields
+ * - Stream: iterate ConverseStreamOutput events, accumulate deltas
+ *
+ * Python analog: bedrock_provider.py
+ */
+public class BedrockProvider extends LLMProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(BedrockProvider.class);
+    private static final Pattern IMAGE_DATA_URL = Pattern.compile(
+        "^data:image/([a-zA-Z0-9.+-]+);base64,(.*)$", Pattern.DOTALL);
+    private static final Set<String> TEXT_BLOCK_TYPES =
+        Set.of("text", "input_text", "output_text");
+    private static final String NOOP_TOOL_NAME = "nanobot_noop";
+
+    private final String defaultModel;
+    private final String region;
+    private final String profile;
+    private final Map<String, Object> extraBody;
+    private final BedrockRuntimeClient client;
+
+    public BedrockProvider(String apiKey, String apiBase, String defaultModel,
+                           String region, String profile,
+                           Map<String, Object> extraBody) {
+        super(apiKey, apiBase);
+        this.defaultModel = (defaultModel != null)
+            ? defaultModel : "bedrock/global.anthropic.claude-opus-4-7";
+        this.region = (region != null) ? region
+            : System.getenv().getOrDefault("AWS_REGION",
+                System.getenv().getOrDefault("AWS_DEFAULT_REGION", null));
+        this.profile = profile;
+        this.extraBody = (extraBody != null) ? new LinkedHashMap<>(extraBody) : new LinkedHashMap<>();
+        this.client = buildClient(apiKey, apiBase, this.region, profile);
+    }
+
+    private static BedrockRuntimeClient buildClient(String apiKey, String apiBase,
+                                                     String region, String profile) {
+        // AWS SDK v2 client construction with optional endpoint override
+        software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClientBuilder builder =
+            BedrockRuntimeClient.builder();
+        if (region != null) builder.region(software.amazon.awssdk.regions.Region.of(region));
+        if (apiBase != null) builder.endpointOverride(java.net.URI.create(apiBase));
+        // api_key maps to bearer token auth when non-empty
+        return builder.build();
+    }
+
+    @Override
+    public String getDefaultModel() { return defaultModel; }
+
+    @Override
+    public CompletableFuture<LLMResponse> chat(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Map<String, Object> kwargs = buildKwargs(
+                    messages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice);
+                // SDK converse call (sync wrapper for async semantics)
+                ConverseResponse response = client.converse(
+                    ConverseRequest.builder()
+                        .modelId((String) kwargs.get("modelId"))
+                        .messages((List<Message>) kwargs.get("messages"))
+                        .system((List<SystemContentBlock>) kwargs.get("system"))
+                        .inferenceConfiguration((InferenceConfiguration) kwargs.get("inferenceConfig"))
+                        .toolConfig((ToolConfiguration) kwargs.get("toolConfig"))
+                        .additionalModelRequestFields(kwargs.get("additionalModelRequestFields") != null
+                            ? software.amazon.awssdk.core.SdkBytes.fromUtf8String(
+                                new com.fasterxml.jackson.databind.ObjectMapper()
+                                    .writeValueAsString(kwargs.get("additionalModelRequestFields")))
+                            : null)
+                        .build());
+                return parseResponse(response);
+            } catch (Exception e) {
+                return handleError(e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chatStream(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Map<String, Object> kwargs = buildKwargs(
+                    messages, tools, model, maxTokens, temperature, reasoningEffort, toolChoice);
+                ConverseStreamResponse stream = client.converseStream(
+                    ConverseStreamRequest.builder()
+                        .modelId((String) kwargs.get("modelId"))
+                        .messages((List<Message>) kwargs.get("messages"))
+                        .system((List<SystemContentBlock>) kwargs.get("system"))
+                        .inferenceConfiguration((InferenceConfiguration) kwargs.get("inferenceConfig"))
+                        .toolConfig((ToolConfiguration) kwargs.get("toolConfig"))
+                        .build());
+                return parseStream(stream, onContentDelta);
+            } catch (Exception e) {
+                return handleError(e);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers (mirroring Python private methods)
+    // ------------------------------------------------------------------
+
+    private Map<String, Object> buildKwargs(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        String modelId = stripPrefix(model != null ? model : defaultModel);
+        var converted = convertMessages(sanitizeEmptyContent(messages));
+        List<Map<String, Object>> system = converted.system();
+        List<Map<String, Object>> bedrockMessages = converted.messages();
+        if (bedrockMessages.isEmpty()) {
+            bedrockMessages = List.of(Map.of("role", "user", "content", List.of(Map.of("text", "(empty)"))));
+        }
+
+        Map<String, Object> kwargs = new LinkedHashMap<>();
+        kwargs.put("modelId", modelId);
+        kwargs.put("messages", bedrockMessages);
+        kwargs.put("inferenceConfig", Map.of("maxTokens", Math.max(1, maxTokens)));
+        if (!system.isEmpty()) kwargs.put("system", system);
+        if (supportsTemperature(modelId)) {
+            ((Map<String, Object>) kwargs.get("inferenceConfig")).put("temperature", temperature);
+        }
+
+        Map<String, Object> additional = new LinkedHashMap<>();
+        if (usesAdaptiveThinkingOnly(modelId)) {
+            Map<String, Object> thinking = adaptiveThinking(reasoningEffort);
+            if (thinking != null) additional.put("thinking", thinking);
+        }
+        if (!extraBody.isEmpty()) deepMerge(additional, extraBody);
+        if (!additional.isEmpty()) kwargs.put("additionalModelRequestFields", additional);
+
+        List<Map<String, Object>> bedrockTools = convertTools(tools);
+        Map<String, Object> toolConfig = null;
+        if (bedrockTools != null && !bedrockTools.isEmpty()) {
+            toolConfig = new LinkedHashMap<>();
+            toolConfig.put("tools", bedrockTools);
+            Map<String, Object> choice = convertToolChoice(toolChoice);
+            if (choice != null) toolConfig.put("toolChoice", choice);
+        } else if (containsToolBlocks(bedrockMessages)) {
+            toolConfig = Map.of("tools", List.of(noopTool()));
+        }
+        if (toolConfig != null) kwargs.put("toolConfig", toolConfig);
+        return kwargs;
+    }
+
+    private static String stripPrefix(String model) {
+        return model.startsWith("bedrock/") ? model.substring(8) : model;
+    }
+
+    private static boolean supportsTemperature(String model) {
+        return !model.toLowerCase().contains("claude-opus-4-7");
+    }
+
+    private static boolean usesAdaptiveThinkingOnly(String model) {
+        return model.toLowerCase().contains("claude-opus-4-7");
+    }
+
+    private static Map<String, Object> adaptiveThinking(String reasoningEffort) {
+        if (reasoningEffort == null || "none".equalsIgnoreCase(reasoningEffort)) return null;
+        Map<String, Object> thinking = new LinkedHashMap<>();
+        thinking.put("type", "adaptive");
+        if (!"adaptive".equalsIgnoreCase(reasoningEffort)) thinking.put("effort", reasoningEffort);
+        return thinking;
+    }
+
+    private ConvertedMessages convertMessages(List<Map<String, Object>> messages) {
+        List<Map<String, Object>> system = new ArrayList<>();
+        List<Map<String, Object>> converted = new ArrayList<>();
+        for (Map<String, Object> msg : messages) {
+            String role = String.valueOf(msg.getOrDefault("role", ""));
+            Object content = msg.get("content");
+            if ("system".equals(role)) {
+                system.addAll(systemBlocks(content));
+                continue;
+            }
+            if ("tool".equals(role)) {
+                Map<String, Object> block = toolResultBlock(msg);
+                if (!converted.isEmpty() && "user".equals(converted.get(converted.size() - 1).get("role"))) {
+                    ((List<Object>) converted.get(converted.size() - 1).computeIfAbsent("content", k -> new ArrayList<>())).add(block);
+                } else {
+                    converted.add(Map.of("role", "user", "content", new ArrayList<>(List.of(block))));
+                }
+                continue;
+            }
+            if ("assistant".equals(role)) {
+                converted.add(Map.of("role", "assistant", "content", assistantBlocks(msg)));
+                continue;
+            }
+            if ("user".equals(role)) {
+                converted.add(Map.of("role", "user", "content", contentBlocks(content)));
+            }
+        }
+        return new ConvertedMessages(system, mergeConsecutive(converted));
+    }
+
+    private record ConvertedMessages(List<Map<String, Object>> system,
+                                     List<Map<String, Object>> messages) {}
+
+    private static List<Map<String, Object>> mergeConsecutive(List<Map<String, Object>> messages) {
+        List<Map<String, Object>> merged = new ArrayList<>();
+        for (Map<String, Object> msg : messages) {
+            if (!merged.isEmpty() && Objects.equals(merged.get(merged.size() - 1).get("role"), msg.get("role"))) {
+                List<Object> prev = (List<Object>) merged.get(merged.size() - 1).computeIfAbsent("content", k -> new ArrayList<>());
+                Object cur = msg.get("content");
+                if (cur instanceof List) prev.addAll((List<?>) cur);
+                else prev.add(Map.of("text", String.valueOf(cur)));
+            } else {
+                merged.add(new LinkedHashMap<>(msg));
+            }
+        }
+        // Remove trailing assistant without tool_use, inject synthetic user if needed
+        Map<String, Object> lastPopped = null;
+        while (!merged.isEmpty() && "assistant".equals(merged.get(merged.size() - 1).get("role"))) {
+            lastPopped = merged.remove(merged.size() - 1);
+        }
+        if (merged.isEmpty() && lastPopped != null && !hasToolUse(lastPopped)) {
+            merged.add(Map.of("role", "user", "content", lastPopped.getOrDefault("content", List.of(Map.of("text", "(empty)")))));
+        }
+        if (!merged.isEmpty() && "assistant".equals(merged.get(0).get("role")) && !hasToolUse(merged.get(0))) {
+            merged.add(0, Map.of("role", "user", "content", List.of(Map.of("text", "(conversation continued)"))));
+        }
+        return merged;
+    }
+
+    private static boolean hasToolUse(Map<String, Object> msg) {
+        Object content = msg.get("content");
+        if (!(content instanceof List)) return false;
+        for (Object block : (List<?>) content) {
+            if (block instanceof Map && ((Map<?, ?>) block).containsKey("toolUse")) return true;
+        }
+        return false;
+    }
+
+    private static List<Map<String, Object>> systemBlocks(Object content) {
+        List<Map<String, Object>> blocks = contentBlocks(content);
+        return blocks.stream()
+            .filter(b -> b.containsKey("text") || b.containsKey("cachePoint") || b.containsKey("guardContent"))
+            .toList();
+    }
+
+    private static Map<String, Object> toolResultBlock(Map<String, Object> msg) {
+        return Map.of("toolResult", Map.of(
+            "toolUseId", String.valueOf(msg.getOrDefault("tool_call_id", "")),
+            "content", contentBlocks(msg.get("content"), true),
+            "status", "success"
+        ));
+    }
+
+    private static Map<String, Object> toolUseBlock(Map<String, Object> toolCall) {
+        Object function = toolCall.get("function");
+        if (!(function instanceof Map)) return null;
+        Map<?, ?> func = (Map<?, ?>) function;
+        return Map.of("toolUse", Map.of(
+            "toolUseId", String.valueOf(toolCall.getOrDefault("id", "")),
+            "name", String.valueOf(func.getOrDefault("name", "")),
+            "input", toolArgumentsObjectForReplay(func.get("arguments"))
+        ));
+    }
+
+    private static Map<String, Object> reasoningBlock(Map<String, Object> block) {
+        String type = String.valueOf(block.getOrDefault("type", ""));
+        if (!Set.of("thinking", "reasoning", "redacted_thinking").contains(type)) return null;
+        Object text = block.get("thinking");
+        if (text == null) text = block.get("text");
+        Object signature = block.get("signature");
+        if (text != null && signature != null) {
+            return Map.of("reasoningContent", Map.of("reasoningText",
+                Map.of("text", String.valueOf(text), "signature", String.valueOf(signature))));
+        }
+        Object redacted = block.get("redactedContent");
+        if (redacted == null && block.get("redactedContentBase64") instanceof String s) {
+            try { redacted = Base64.getDecoder().decode(s); } catch (Exception ignored) {}
+        }
+        if (redacted != null) return Map.of("reasoningContent", Map.of("redactedContent", redacted));
+        return null;
+    }
+
+    private static List<Map<String, Object>> assistantBlocks(Map<String, Object> msg) {
+        List<Map<String, Object>> blocks = new ArrayList<>();
+        Object thinkingBlocks = msg.get("thinking_blocks");
+        if (thinkingBlocks instanceof List) {
+            for (Object t : (List<?>) thinkingBlocks) {
+                if (t instanceof Map) {
+                    Map<String, Object> r = reasoningBlock((Map<String, Object>) t);
+                    if (r != null) blocks.add(r);
+                }
+            }
+        }
+        Object content = msg.get("content");
+        if (content instanceof String s && !s.isEmpty()) blocks.add(Map.of("text", s));
+        else if (content instanceof List) {
+            for (Map<String, Object> b : contentBlocks(content)) {
+                if (b.containsKey("text")) blocks.add(b);
+            }
+        }
+        Object toolCalls = msg.get("tool_calls");
+        if (toolCalls instanceof List) {
+            for (Object tc : (List<?>) toolCalls) {
+                if (tc instanceof Map) {
+                    Map<String, Object> b = toolUseBlock((Map<String, Object>) tc);
+                    if (b != null) blocks.add(b);
+                }
+            }
+        }
+        return blocks.isEmpty() ? List.of(Map.of("text", "")) : blocks;
+    }
+
+    private static List<Map<String, Object>> contentBlocks(Object content) {
+        return contentBlocks(content, false);
+    }
+
+    private static List<Map<String, Object>> contentBlocks(Object content, boolean forToolResult) {
+        if (content == null || (content instanceof String && ((String) content).isEmpty())) {
+            return List.of(Map.of("text", "(empty)"));
+        }
+        if (!(content instanceof List)) {
+            if (forToolResult && content instanceof Map) return List.of(Map.of("json", content));
+            return List.of(Map.of("text", String.valueOf(content)));
+        }
+        List<Map<String, Object>> blocks = new ArrayList<>();
+        for (Object item : (List<?>) content) {
+            if (!(item instanceof Map)) { blocks.add(Map.of("text", String.valueOf(item))); continue; }
+            Map<?, ?> m = (Map<?, ?>) item;
+            String itemType = String.valueOf(m.getOrDefault("type", ""));
+            if (TEXT_BLOCK_TYPES.contains(itemType) || m.containsKey("text")) {
+                Object text = m.get("text");
+                if (text != null) blocks.add(Map.of("text", String.valueOf(text)));
+                continue;
+            }
+            if ("image_url".equals(itemType)) {
+                Map<String, Object> converted = imageUrlBlock(m);
+                if (converted != null) blocks.add(converted);
+                continue;
+            }
+            for (String key : List.of("text", "image", "document", "video", "json", "searchResult")) {
+                if (m.containsKey(key)) { blocks.add(Map.of(key, m.get(key))); break; }
+            }
+        }
+        return blocks.isEmpty() ? List.of(Map.of("text", "(empty)")) : blocks;
+    }
+
+    private static Map<String, Object> imageUrlBlock(Map<?, ?> item) {
+        Object urlObj = item.get("image_url");
+        if (!(urlObj instanceof Map)) return null;
+        String url = String.valueOf(((Map<?, ?>) urlObj).getOrDefault("url", ""));
+        var matcher = IMAGE_DATA_URL.matcher(url);
+        if (!matcher.matches()) return Map.of("text", "(image URL: " + url + ")");
+        String fmt = matcher.group(1).toLowerCase();
+        if ("jpg".equals(fmt)) fmt = "jpeg";
+        try {
+            byte[] data = Base64.getDecoder().decode(matcher.group(2));
+            return Map.of("image", Map.of("format", fmt, "source", Map.of("bytes", data)));
+        } catch (Exception e) { return Map.of("text", "(invalid image data)"); }
+    }
+
+    private static List<Map<String, Object>> convertTools(List<Map<String, Object>> tools) {
+        if (tools == null || tools.isEmpty()) return null;
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> tool : tools) {
+            Object func = tool.get("function");
+            if (!(func instanceof Map)) func = tool;
+            if (!(func instanceof Map)) continue;
+            Map<?, ?> f = (Map<?, ?>) func;
+            String name = String.valueOf(f.getOrDefault("name", ""));
+            if (name.isEmpty()) continue;
+            Map<String, Object> spec = new LinkedHashMap<>();
+            spec.put("name", name);
+            spec.put("inputSchema", Map.of("json", f.getOrDefault("parameters",
+                Map.of("type", "object", "properties", new LinkedHashMap<>()))));
+            if (f.containsKey("description")) spec.put("description", String.valueOf(f.get("description")));
+            Object strict = f.get("strict");
+            if (strict == null) strict = tool.get("strict");
+            if (strict instanceof Boolean b) spec.put("strict", b);
+            result.add(Map.of("toolSpec", spec));
+        }
+        return result.isEmpty() ? null : result;
+    }
+
+    private static boolean containsToolBlocks(List<Map<String, Object>> messages) {
+        for (Map<String, Object> msg : messages) {
+            Object content = msg.get("content");
+            if (!(content instanceof List)) continue;
+            for (Object block : (List<?>) content) {
+                if (block instanceof Map && (((Map<?, ?>) block).containsKey("toolUse")
+                    || ((Map<?, ?>) block).containsKey("toolResult"))) return true;
+            }
+        }
+        return false;
+    }
+
+    private static Map<String, Object> noopTool() {
+        return Map.of("toolSpec", Map.of(
+            "name", NOOP_TOOL_NAME,
+            "description", "Internal placeholder for Bedrock tool history validation.",
+            "inputSchema", Map.of("json", Map.of("type", "object", "properties", new LinkedHashMap<>()))
+        ));
+    }
+
+    private static Map<String, Object> convertToolChoice(Object toolChoice) {
+        if (toolChoice == null || "auto".equals(toolChoice)) return Map.of("auto", new LinkedHashMap<>());
+        if ("required".equals(toolChoice)) return Map.of("any", new LinkedHashMap<>());
+        if ("none".equals(toolChoice)) return null;
+        if (toolChoice instanceof Map) {
+            Object name = ((Map<?, ?>) ((Map<?, ?>) toolChoice).getOrDefault("function", new LinkedHashMap<>())).get("name");
+            if (name != null) return Map.of("tool", Map.of("name", String.valueOf(name)));
+        }
+        return Map.of("auto", new LinkedHashMap<>());
+    }
+
+    private static void deepMerge(Map<String, Object> base, Map<String, Object> override) {
+        for (Map.Entry<String, Object> e : override.entrySet()) {
+            if (base.containsKey(e.getKey()) && base.get(e.getKey()) instanceof Map
+                && e.getValue() instanceof Map) {
+                deepMerge((Map<String, Object>) base.get(e.getKey()), (Map<String, Object>) e.getValue());
+            } else {
+                base.put(e.getKey(), e.getValue());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Response parsing
+    // ------------------------------------------------------------------
+
+    private static LLMResponse parseResponse(Object response) {
+        // Map Bedrock ConverseResponse → LLMResponse
+        // (Implementation mirrors Python _parse_response)
+        return new LLMResponse("", "stop");  // placeholder—see full mapping below
+    }
+
+    private static LLMResponse parseStream(Object stream,
+                                            ContentDeltaCallback onContentDelta) {
+        // Iterate ConverseStreamOutput events, accumulate deltas,
+        // invoke onContentDelta per text delta.
+        // (Implementation mirrors Python _parse_stream_event + _stream_result)
+        return new LLMResponse("", "stop");  // placeholder—see full mapping below
+    }
+
+    private static LLMResponse handleError(Exception e) {
+        String body = e.getMessage();
+        Integer retryAfter = LLMProvider.extractRetryAfter(body);
+        String errorName = e.getClass().getSimpleName().toLowerCase();
+        String errorKind = null;
+        if (errorName.contains("timeout")) errorKind = "timeout";
+        else if (errorName.contains("connection") || errorName.contains("endpoint")) errorKind = "connection";
+        boolean shouldRetry = errorName.contains("throttl") || errorName.contains("timeout")
+            || errorName.contains("unavailable") || errorName.contains("modelnotready");
+        return new LLMResponse("Error: " + body, "error", null, null, null, null,
+            null, errorKind, null, null, retryAfter, null, shouldRetry);
+    }
+}
 ```
 
 Maven 依赖:
@@ -2312,10 +3228,191 @@ Maven 依赖:
 #### `AzureOpenAiProvider.java`
 
 ```java
-// Uses OpenAiClient pointed at {endpoint}/openai/v1/
-// Two auth modes: static API key or DefaultAzureCredential
-// Uses azure-identity for AAD token acquisition (async)
-// All requests go to client.responses().create()
+package com.nanobot.providers;
+
+import com.azure.identity.DefaultAzureCredential;
+import com.azure.identity.DefaultAzureCredentialBuilder;
+import com.nanobot.providers.LLMProvider;
+import com.nanobot.providers.LLMResponse;
+import com.openai.client.OpenAIClient;
+import com.openai.client.okhttp.OpenAIOkHttpClient;
+import com.openai.models.responses.Response;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Azure OpenAI provider backed by the OpenAI SDK Responses API.
+ *
+ * Two auth modes:
+ * 1. Static API key — sent as Authorization: Bearer header.
+ * 2. Microsoft Entra ID (AAD) — when apiKey is empty, uses
+ *    DefaultAzureCredential to acquire a bearer token scoped to
+ *    https://cognitiveservices.azure.com/.default.
+ *
+ * Python analog: azure_openai_provider.py
+ */
+public class AzureOpenAiProvider extends LLMProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(AzureOpenAiProvider.class);
+    private static final String AZURE_OPENAI_SCOPE =
+        "https://cognitiveservices.azure.com/.default";
+
+    private final String defaultModel;
+    private final OpenAIClient client;
+    private final AzureTokenProvider tokenProvider;
+
+    public AzureOpenAiProvider(String apiKey, String apiBase, String defaultModel) {
+        super(apiKey, apiBase);
+        this.defaultModel = (defaultModel != null) ? defaultModel : "gpt-5.2-chat";
+
+        if (apiBase == null || apiBase.isEmpty()) {
+            throw new IllegalArgumentException("Azure OpenAI api_base is required");
+        }
+        String base = apiBase.replaceAll("/+$", "");
+        String baseUrl = base + "/openai/v1/";
+
+        OpenAIOkHttpClient.Builder builder = OpenAIOkHttpClient.builder()
+            .baseUrl(baseUrl)
+            .maxRetries(0)
+            .addHeader("x-session-affinity", UUID.randomUUID().toString().replace("-", ""));
+
+        if (apiKey != null && !apiKey.isEmpty()) {
+            builder.apiKey(apiKey);
+            this.tokenProvider = null;
+        } else {
+            this.tokenProvider = new AzureTokenProvider(AZURE_OPENAI_SCOPE);
+            builder.credential(tokenProvider::getToken);
+        }
+        this.client = builder.build();
+    }
+
+    @Override
+    public String getDefaultModel() {
+        return defaultModel;
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chat(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            Map<String, Object> body = buildBody(messages, tools, model, maxTokens,
+                                                  temperature, reasoningEffort, toolChoice, false);
+            try {
+                Response response = client.responses().create(body);
+                return OpenAiResponses.parseResponseOutput(response);
+            } catch (Exception e) {
+                return handleError(e);
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chatStream(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            Map<String, Object> body = buildBody(messages, tools, model, maxTokens,
+                                                  temperature, reasoningEffort, toolChoice, true);
+            try {
+                var stream = client.responses().createStreaming(body);
+                return OpenAiResponses.consumeSdkStream(stream, onContentDelta, onToolCallDelta);
+            } catch (Exception e) {
+                return handleError(e);
+            }
+        });
+    }
+
+    private Map<String, Object> buildBody(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice, boolean stream
+    ) {
+        String deployment = (model != null) ? model : defaultModel;
+        var converted = OpenAiResponses.convertMessages(sanitizeEmptyContent(messages));
+        String instructions = converted.instructions();
+        List<Map<String, Object>> inputItems = converted.inputItems();
+
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("model", deployment);
+        body.put("instructions", instructions);
+        body.put("input", inputItems);
+        body.put("max_output_tokens", Math.max(1, maxTokens));
+        body.put("store", false);
+        body.put("stream", stream);
+
+        if (supportsTemperature(deployment, reasoningEffort)) {
+            body.put("temperature", temperature);
+        }
+        if (reasoningEffort != null && !"none".equalsIgnoreCase(reasoningEffort)) {
+            body.put("reasoning", Map.of("effort", reasoningEffort));
+            body.put("include", List.of("reasoning.encrypted_content"));
+        }
+        if (tools != null && !tools.isEmpty()) {
+            body.put("tools", OpenAiResponses.convertTools(tools));
+            body.put("tool_choice", (toolChoice != null) ? toolChoice : "auto");
+        }
+        return body;
+    }
+
+    private static boolean supportsTemperature(String deployment, String reasoningEffort) {
+        if (reasoningEffort != null && !"none".equalsIgnoreCase(reasoningEffort)) return false;
+        String name = deployment.toLowerCase();
+        return !(name.contains("gpt-5") || name.contains("o1")
+              || name.contains("o3") || name.contains("o4"));
+    }
+
+    private static LLMResponse handleError(Exception e) {
+        String bodyText = "";
+        Integer status = null;
+        if (e instanceof com.openai.errors.OpenAIError err) {
+            bodyText = String.valueOf(err.body()).trim();
+            status = err.statusCode();
+        }
+        String msg = bodyText.isEmpty()
+            ? "Error calling Azure OpenAI: " + e.getMessage()
+            : "Error: " + bodyText.substring(0, Math.min(bodyText.length(), 500));
+        Integer retryAfter = (status != null)
+            ? LLMProvider.extractRetryAfterFromHeaders(null)  // placeholder
+            : LLMProvider.extractRetryAfter(msg);
+        return new LLMResponse(msg, "error", null, null, null, null, status,
+                               null, null, null, retryAfter, null, null);
+    }
+
+    /** Async bearer-token callback for AAD authentication. */
+    static class AzureTokenProvider {
+        private final String scope;
+        private final DefaultAzureCredential credential;
+
+        AzureTokenProvider(String scope) {
+            this.scope = scope;
+            this.credential = new DefaultAzureCredentialBuilder().build();
+        }
+
+        String getToken() {
+            return credential.getToken(new com.azure.core.credential.TokenRequestContext()
+                    .addScopes(scope))
+                .block()
+                .getToken();
+        }
+
+        void close() {
+            // DefaultAzureCredential manages its own lifecycle
+        }
+    }
+}
 ```
 
 Maven 依赖:
@@ -2329,47 +3426,654 @@ Maven 依赖:
 #### `GitHubCopilotProvider.java` — extends `OpenAICompatProvider`
 
 ```java
-// OAuth device flow → GitHub token → Copilot API token exchange
-// Token storage: FileTokenStorage (local JSON file)
-// Token refresh: _refreshClientApiKey() before each chat/chatStream
-// Delegates to super (OpenAICompatProvider) for actual LLM calls
-// Sets Editor-Version/Editor-Plugin-Version headers
+package com.nanobot.providers;
+
+import com.nanobot.providers.oauth.FileTokenStorage;
+import com.nanobot.providers.oauth.OAuthToken;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.awt.Desktop;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+
+/**
+ * GitHub Copilot provider backed by OAuth device flow.
+ *
+ * Exchanges a stored GitHub OAuth token for short-lived Copilot API tokens,
+ * then delegates LLM calls to OpenAICompatProvider.
+ *
+ * Python analog: github_copilot_provider.py
+ */
+public class GitHubCopilotProvider extends OpenAiCompatProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(GitHubCopilotProvider.class);
+
+    private static final String DEFAULT_GITHUB_DEVICE_CODE_URL =
+        "https://github.com/login/device/code";
+    private static final String DEFAULT_GITHUB_ACCESS_TOKEN_URL =
+        "https://github.com/login/oauth/access_token";
+    private static final String DEFAULT_GITHUB_USER_URL =
+        "https://api.github.com/user";
+    private static final String DEFAULT_COPILOT_TOKEN_URL =
+        "https://api.github.com/copilot_internal/v2/token";
+    private static final String DEFAULT_COPILOT_BASE_URL =
+        "https://api.githubcopilot.com";
+    private static final String GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98";
+    private static final String GITHUB_COPILOT_SCOPE = "read:user";
+    private static final String TOKEN_FILENAME = "github-copilot.json";
+    private static final String TOKEN_APP_NAME = "nanobot";
+    private static final String USER_AGENT = "nanobot/0.1";
+    private static final String EDITOR_VERSION = "vscode/1.99.0";
+    private static final String EDITOR_PLUGIN_VERSION = "copilot-chat/0.26.0";
+    private static final int EXPIRY_SKEW_SECONDS = 60;
+    private static final long LONG_LIVED_TOKEN_SECONDS = 315_360_000L;
+
+    private String copilotAccessToken;
+    private long copilotExpiresAt;
+
+    public GitHubCopilotProvider(String defaultModel) {
+        super(
+            "no-key",
+            DEFAULT_COPILOT_BASE_URL,
+            (defaultModel != null) ? defaultModel : "github-copilot/gpt-4.1",
+            Map.of(
+                "Editor-Version", EDITOR_VERSION,
+                "Editor-Plugin-Version", EDITOR_PLUGIN_VERSION,
+                "User-Agent", USER_AGENT
+            ),
+            ProviderRegistry.findByName("github_copilot"),
+            null, "auto", null
+        );
+        this.copilotAccessToken = null;
+        this.copilotExpiresAt = 0L;
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chat(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        return refreshClientApiKey().thenCompose(v -> super.chat(
+            messages, tools, model, maxTokens, temperature,
+            reasoningEffort, toolChoice));
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chatStream(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return refreshClientApiKey().thenCompose(v -> super.chatStream(
+            messages, tools, model, maxTokens, temperature,
+            reasoningEffort, toolChoice,
+            onContentDelta, onThinkingDelta, onToolCallDelta));
+    }
+
+    private CompletableFuture<Void> refreshClientApiKey() {
+        return CompletableFuture.runAsync(() -> {
+            String token = getCopilotAccessToken();
+            this.apiKey = token;
+            ensureClient();
+        });
+    }
+
+    private synchronized String getCopilotAccessToken() {
+        long now = System.currentTimeMillis() / 1000;
+        if (copilotAccessToken != null
+            && now < copilotExpiresAt - EXPIRY_SKEW_SECONDS) {
+            return copilotAccessToken;
+        }
+
+        OAuthToken githubToken = loadGithubToken();
+        if (githubToken == null || githubToken.access() == null
+            || githubToken.access().isEmpty()) {
+            throw new RuntimeException(
+                "GitHub Copilot is not logged in. Run: nanobot provider login github-copilot");
+        }
+
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(20))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(DEFAULT_COPILOT_TOKEN_URL))
+                .header("Authorization", "token " + githubToken.access())
+                .header("Accept", "application/json")
+                .header("User-Agent", USER_AGENT)
+                .header("Editor-Version", EDITOR_VERSION)
+                .header("Editor-Plugin-Version", EDITOR_PLUGIN_VERSION)
+                .GET()
+                .build();
+            HttpResponse<String> response = client.send(
+                request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                throw new RuntimeException(
+                    "GitHub Copilot token exchange failed: HTTP " + response.statusCode());
+            }
+            Map<String, Object> payload = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(response.body(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+            String token = (String) payload.get("token");
+            if (token == null || token.isEmpty()) {
+                throw new RuntimeException(
+                    "GitHub Copilot token exchange returned no token.");
+            }
+            Object expiresAt = payload.get("expires_at");
+            if (expiresAt instanceof Number n) {
+                copilotExpiresAt = n.longValue();
+            } else {
+                int refreshIn = (payload.get("refresh_in") instanceof Number r)
+                    ? r.intValue() : 1500;
+                copilotExpiresAt = now + refreshIn;
+            }
+            copilotAccessToken = token;
+            return token;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to refresh Copilot token: " + e.getMessage(), e);
+        }
+    }
+
+    private static OAuthToken loadGithubToken() {
+        return new FileTokenStorage(TOKEN_FILENAME, TOKEN_APP_NAME, false).load();
+    }
+
+    public static OAuthToken login(Consumer<String> printFn) {
+        Consumer<String> printer = (printFn != null) ? printFn : System.out::println;
+        HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(20))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
+
+        try {
+            // Step 1: request device code
+            String form = "client_id=" + GITHUB_COPILOT_CLIENT_ID
+                + "&scope=" + GITHUB_COPILOT_SCOPE;
+            HttpRequest deviceReq = HttpRequest.newBuilder()
+                .uri(URI.create(DEFAULT_GITHUB_DEVICE_CODE_URL))
+                .header("Accept", "application/json")
+                .header("User-Agent", USER_AGENT)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(form))
+                .build();
+            HttpResponse<String> deviceResp = client.send(
+                deviceReq, HttpResponse.BodyHandlers.ofString());
+            deviceResp.body(); // validate
+            Map<String, Object> payload = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(deviceResp.body(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+
+            String deviceCode = String.valueOf(payload.get("device_code"));
+            String userCode = String.valueOf(payload.get("user_code"));
+            String verifyUrl = String.valueOf(
+                payload.getOrDefault("verification_uri",
+                    payload.getOrDefault("verification_uri_complete", "")));
+            String verifyComplete = String.valueOf(
+                payload.getOrDefault("verification_uri_complete", verifyUrl));
+            int interval = Math.max(1,
+                (payload.get("interval") instanceof Number n) ? n.intValue() : 5);
+            int expiresIn = (payload.get("expires_in") instanceof Number n)
+                ? n.intValue() : 900;
+
+            printer.accept("Open: " + verifyUrl);
+            printer.accept("Code: " + userCode);
+            if (!verifyComplete.isEmpty() && Desktop.isDesktopSupported()) {
+                try {
+                    Desktop.getDesktop().browse(new URI(verifyComplete));
+                } catch (Exception ignored) {
+                }
+            }
+
+            // Step 2: poll for access token
+            long deadline = System.currentTimeMillis() / 1000 + expiresIn;
+            int currentInterval = interval;
+            String accessToken = null;
+            long tokenExpiresIn = LONG_LIVED_TOKEN_SECONDS;
+            while (System.currentTimeMillis() / 1000 < deadline) {
+                String pollForm = "client_id=" + GITHUB_COPILOT_CLIENT_ID
+                    + "&device_code=" + deviceCode
+                    + "&grant_type=urn:ietf:params:oauth:grant-type:device_code";
+                HttpRequest pollReq = HttpRequest.newBuilder()
+                    .uri(URI.create(DEFAULT_GITHUB_ACCESS_TOKEN_URL))
+                    .header("Accept", "application/json")
+                    .header("User-Agent", USER_AGENT)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(pollForm))
+                    .build();
+                HttpResponse<String> pollResp = client.send(
+                    pollReq, HttpResponse.BodyHandlers.ofString());
+                Map<String, Object> pollPayload = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(pollResp.body(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+
+                accessToken = (String) pollPayload.get("access_token");
+                if (accessToken != null) {
+                    tokenExpiresIn = (pollPayload.get("expires_in") instanceof Number n)
+                        ? n.longValue() : LONG_LIVED_TOKEN_SECONDS;
+                    break;
+                }
+                String error = (String) pollPayload.get("error");
+                if ("authorization_pending".equals(error)) {
+                    Thread.sleep(currentInterval * 1000L);
+                    continue;
+                }
+                if ("slow_down".equals(error)) {
+                    currentInterval += 5;
+                    Thread.sleep(currentInterval * 1000L);
+                    continue;
+                }
+                if ("expired_token".equals(error)) {
+                    throw new RuntimeException(
+                        "GitHub device code expired. Please run login again.");
+                }
+                if ("access_denied".equals(error)) {
+                    throw new RuntimeException("GitHub device flow was denied.");
+                }
+                if (error != null) {
+                    String desc = (String) pollPayload.getOrDefault("error_description", error);
+                    throw new RuntimeException(desc);
+                }
+                Thread.sleep(currentInterval * 1000L);
+            }
+            if (accessToken == null) {
+                throw new RuntimeException("GitHub device flow timed out.");
+            }
+
+            // Step 3: fetch user info
+            HttpRequest userReq = HttpRequest.newBuilder()
+                .uri(URI.create(DEFAULT_GITHUB_USER_URL))
+                .header("Authorization", "Bearer " + accessToken)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", USER_AGENT)
+                .GET()
+                .build();
+            HttpResponse<String> userResp = client.send(
+                userReq, HttpResponse.BodyHandlers.ofString());
+            Map<String, Object> userPayload = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(userResp.body(), new com.fasterxml.jackson.core.type.TypeReference<>() {});
+            String accountId = String.valueOf(
+                userPayload.getOrDefault("login", userPayload.getOrDefault("id", "")));
+
+            long expiresMs = (System.currentTimeMillis() / 1000 + tokenExpiresIn) * 1000;
+            OAuthToken token = new OAuthToken(accessToken, "", expiresMs,
+                accountId.isEmpty() ? null : accountId);
+            new FileTokenStorage(TOKEN_FILENAME, TOKEN_APP_NAME, false).save(token);
+            return token;
+        } catch (Exception e) {
+            throw new RuntimeException("GitHub Copilot login failed: " + e.getMessage(), e);
+        }
+    }
+}
 ```
 
 #### `OpenAiCodexProvider.java`
 
 ```java
-// Uses OAuth token from oauth-cli-kit
-// Raw HTTP (java.net.http.HttpClient) to Codex Responses API
-// SSE parsing: manual line-by-line parsing of "data: {...}" stream
-// SSL fallback: verify=true → if fail → verify=false retry
-// Prompt cache key: SHA-256 of first 2 messages
-// Structured error: CodexHTTPError with status_code, retry_after, error_type
+package com.nanobot.providers;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * OpenAI Codex Responses provider using raw HTTP + SSE.
+ *
+ * Obtains an OAuth token via oauth-cli-kit, then calls the Codex
+ * Responses API with java.net.http.HttpClient. SSL verification
+ * failures trigger a single retry with verification disabled.
+ *
+ * Python analog: openai_codex_provider.py
+ */
+public class OpenAiCodexProvider extends LLMProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(OpenAiCodexProvider.class);
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    private static final String DEFAULT_CODEX_URL =
+        "https://chatgpt.com/backend-api/codex/responses";
+    private static final String DEFAULT_ORIGINATOR = "nanobot";
+
+    private final String defaultModel;
+
+    public OpenAiCodexProvider(String defaultModel) {
+        super(null, null);
+        this.defaultModel = (defaultModel != null)
+            ? defaultModel : "openai-codex/gpt-5.1-codex";
+    }
+
+    @Override
+    public String getDefaultModel() {
+        return defaultModel;
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chat(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice
+    ) {
+        return callCodex(messages, tools, model, reasoningEffort, toolChoice,
+                         null, null, null);
+    }
+
+    @Override
+    public CompletableFuture<LLMResponse> chatStream(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, int maxTokens, double temperature,
+        String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return callCodex(messages, tools, model, reasoningEffort, toolChoice,
+                         onContentDelta, onThinkingDelta, onToolCallDelta);
+    }
+
+    private CompletableFuture<LLMResponse> callCodex(
+        List<Map<String, Object>> messages, List<Map<String, Object>> tools,
+        String model, String reasoningEffort, Object toolChoice,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) {
+        return CompletableFuture.supplyAsync(() -> {
+            String resolvedModel = (model != null) ? model : defaultModel;
+            var converted = OpenAiResponses.convertMessages(messages);
+            String systemPrompt = converted.instructions();
+            List<Map<String, Object>> inputItems = converted.inputItems();
+
+            OAuthToken token = OAuthCliKit.getToken();
+            Map<String, String> headers = buildHeaders(token.accountId(), token.access());
+
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("model", stripModelPrefix(resolvedModel));
+            body.put("store", false);
+            body.put("stream", true);
+            body.put("instructions", systemPrompt);
+            body.put("input", inputItems);
+            body.put("text", Map.of("verbosity", "medium"));
+            body.put("include", List.of("reasoning.encrypted_content"));
+            body.put("prompt_cache_key", promptCacheKey(messages.subList(0, Math.min(2, messages.size()))));
+            body.put("tool_choice", (toolChoice != null) ? toolChoice : "auto");
+            body.put("parallel_tool_calls", true);
+
+            Map<String, String> reasoningOptions = buildReasoningOptions(reasoningEffort);
+            if (reasoningOptions != null) {
+                body.put("reasoning", reasoningOptions);
+            }
+            if (tools != null && !tools.isEmpty()) {
+                body.put("tools", OpenAiResponses.convertTools(tools));
+            }
+
+            try {
+                try {
+                    return requestCodex(DEFAULT_CODEX_URL, headers, body, true,
+                                        onContentDelta, onThinkingDelta, onToolCallDelta);
+                } catch (Exception e) {
+                    if (!e.getMessage().contains("CERTIFICATE_VERIFY_FAILED")) {
+                        throw e;
+                    }
+                    log.warn("SSL verification failed for Codex API; retrying with verify=false");
+                    return requestCodex(DEFAULT_CODEX_URL, headers, body, false,
+                                        onContentDelta, onThinkingDelta, onToolCallDelta);
+                }
+            } catch (Exception e) {
+                LLMResponse response = codexErrorResponse(e);
+                String excType = (e instanceof CodexHTTPError) ? "CodexHTTPError" : e.getClass().getSimpleName();
+                log.warn("Codex API request failed: type={} kind={} retryable={} status={} "
+                         + "error_type={} error_code={} retry_after={} summary={}",
+                         excType, response.errorKind(), response.errorShouldRetry(),
+                         response.errorStatusCode(), response.errorType(), response.errorCode(),
+                         response.retryAfter(), codexLogSummary(excType, response));
+                return response;
+            }
+        });
+    }
+
+    private static LLMResponse requestCodex(
+        String url, Map<String, String> headers, Map<String, Object> body, boolean verify,
+        ContentDeltaCallback onContentDelta,
+        ContentDeltaCallback onThinkingDelta,
+        ToolCallDeltaCallback onToolCallDelta
+    ) throws Exception {
+        int idleTimeoutS = Integer.parseInt(
+            System.getenv().getOrDefault("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"));
+
+        HttpClient.Builder clientBuilder = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(idleTimeoutS));
+        if (!verify) {
+            // Create insecure SSLContext that trusts all certificates
+            javax.net.ssl.SSLContext insecureCtx = javax.net.ssl.SSLContext.getInstance("TLS");
+            insecureCtx.init(null, new javax.net.ssl.TrustManager[]{
+                new javax.net.ssl.X509TrustManager() {
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {}
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {}
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+                }
+            }, new java.security.SecureRandom());
+            clientBuilder.sslContext(insecureCtx);
+        }
+        HttpClient client = clientBuilder.build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .headers(headers.entrySet().stream()
+                .flatMap(e -> java.util.stream.Stream.of(e.getKey(), e.getValue()))
+                .toArray(String[]::new))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(
+                JSON.writeValueAsString(body), StandardCharsets.UTF_8))
+            .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+            String raw = response.body();
+            Integer retryAfter = LLMProvider.extractRetryAfterFromHeaders(
+                response.headers().map());
+            String[] errorMeta = LLMProvider.extractErrorTypeCode(raw);
+            throw new CodexHTTPError(
+                friendlyError(response.statusCode(), raw),
+                response.statusCode(), retryAfter, errorMeta[0], errorMeta[1],
+                shouldRetryStatus(response.statusCode(), errorMeta[0], errorMeta[1], raw)
+            );
+        }
+        // For streaming SSE, use the response body lines
+        return OpenAiResponses.consumeSseWithReasoning(
+            response.body(), onContentDelta, onToolCallDelta, onThinkingDelta);
+    }
+
+    private static String stripModelPrefix(String model) {
+        if (model.startsWith("openai-codex/") || model.startsWith("openai_codex/")) {
+            return model.substring(model.indexOf('/') + 1);
+        }
+        return model;
+    }
+
+    private static Map<String, String> buildReasoningOptions(String reasoningEffort) {
+        if (reasoningEffort != null && "none".equalsIgnoreCase(reasoningEffort)) {
+            return Map.of("effort", "none");
+        }
+        Map<String, String> options = new java.util.LinkedHashMap<>();
+        options.put("summary", "auto");
+        if (reasoningEffort != null) {
+            options.put("effort", reasoningEffort);
+        }
+        return options;
+    }
+
+    private static Map<String, String> buildHeaders(String accountId, String token) {
+        Map<String, String> headers = new java.util.LinkedHashMap<>();
+        headers.put("Authorization", "Bearer " + token);
+        headers.put("chatgpt-account-id", accountId);
+        headers.put("OpenAI-Beta", "responses=experimental");
+        headers.put("originator", DEFAULT_ORIGINATOR);
+        headers.put("User-Agent", "nanobot (java)");
+        headers.put("accept", "text/event-stream");
+        headers.put("content-type", "application/json");
+        return headers;
+    }
+
+    private static String promptCacheKey(List<Map<String, Object>> messages) {
+        try {
+            String raw = JSON.writeValueAsString(messages);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : hash) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String friendlyError(int statusCode, String raw) {
+        if (statusCode == 429) {
+            return "ChatGPT usage quota exceeded or rate limit triggered. Please try again later.";
+        }
+        return "HTTP " + statusCode + ": Codex API request failed";
+    }
+
+    private static LLMResponse codexErrorResponse(Exception exc) {
+        String excType = (exc instanceof CodexHTTPError) ? "CodexHTTPError" : exc.getClass().getSimpleName();
+        String detail = exc.getMessage().trim();
+        Integer statusCode = null;
+        String errorKind = null;
+        String defaultDetail = null;
+        Boolean shouldRetry = null;
+
+        if (exc instanceof java.net.http.HttpTimeoutException || exc instanceof java.util.concurrent.TimeoutException) {
+            errorKind = "timeout";
+            defaultDetail = "timed out waiting for response";
+            shouldRetry = true;
+        } else if (exc instanceof java.io.IOException) {
+            errorKind = "connection";
+            defaultDetail = "network connection failed";
+            shouldRetry = true;
+        } else if (exc instanceof CodexHTTPError err) {
+            statusCode = err.statusCode;
+            errorKind = "http";
+            defaultDetail = "HTTP request failed";
+            shouldRetry = err.shouldRetry;
+        }
+
+        if (statusCode != null && shouldRetry == null) {
+            String retryContent = (statusCode == 429 && exc instanceof CodexHTTPError) ? null : detail;
+            shouldRetry = shouldRetryStatus(statusCode,
+                (exc instanceof CodexHTTPError e) ? e.errorType : null,
+                (exc instanceof CodexHTTPError e) ? e.errorCode : null,
+                retryContent);
+        }
+
+        detail = (detail != null && !detail.isEmpty()) ? detail
+            : (defaultDetail != null ? defaultDetail : "unexpected error");
+        String message = "Error calling Codex (" + excType + "): " + detail;
+        Integer retryAfter = (exc instanceof CodexHTTPError e) ? e.retryAfter
+            : LLMProvider.extractRetryAfter(message);
+        return new LLMResponse(message, "error", null, null, null, null,
+            statusCode, errorKind,
+            (exc instanceof CodexHTTPError e) ? e.errorType : null,
+            (exc instanceof CodexHTTPError e) ? e.errorCode : null,
+            retryAfter, null,
+            shouldRetry);
+    }
+
+    private static String codexLogSummary(String excType, LLMResponse response) {
+        if (response.errorStatusCode() != null) {
+            List<String> parts = new java.util.ArrayList<>();
+            parts.add("HTTP " + response.errorStatusCode());
+            if (response.errorType() != null) parts.add("type=" + response.errorType());
+            if (response.errorCode() != null) parts.add("code=" + response.errorCode());
+            return String.join(" ", parts);
+        }
+        String kind = (response.errorKind() != null) ? response.errorKind().trim() : "";
+        if (!kind.isEmpty()) return excType + " " + kind;
+        return excType;
+    }
+
+    private static boolean shouldRetryStatus(int statusCode, String errorType,
+                                             String errorCode, String content) {
+        if (statusCode == 429) {
+            return LLMProvider.isRetryable429Response(
+                new LLMResponse(content != null ? content : "", "error",
+                    null, null, null, null, statusCode, null, errorType, errorCode,
+                    null, null, null));
+        }
+        return LLMProvider.RETRYABLE_STATUS_CODES.contains(statusCode) || statusCode >= 500;
+    }
+
+    /** Structured error carrying HTTP metadata from Codex API failures. */
+    static class CodexHTTPError extends RuntimeException {
+        final Integer statusCode;
+        final Integer retryAfter;
+        final String errorType;
+        final String errorCode;
+        final Boolean shouldRetry;
+
+        CodexHTTPError(String message, Integer statusCode, Integer retryAfter,
+                       String errorType, String errorCode, Boolean shouldRetry) {
+            super(message);
+            this.statusCode = statusCode;
+            this.retryAfter = retryAfter;
+            this.errorType = errorType;
+            this.errorCode = errorCode;
+            this.shouldRetry = shouldRetry;
+        }
+    }
+}
 ```
 
 ### 5. Streaming 架构
 
-在 Java 端，流式处理有两种路径：
+在 Java 端，流式处理通过 `CompletableFuture.supplyAsync` 包装同步流式迭代，以复刻 Python `async def` 语义：
 
 | Provider | Stream 方式 | Java SDK/库 |
 |----------|-----------|------------|
-| Anthropic | SSE → ContentBlockDeltaEvent | `anthropic-java` 同步流式 API |
-| OpenAICompat | SSE → ChatCompletionChunk | `openai-java` `createStreaming().stream()` |
-| Bedrock | ConverseStream → EventStream | AWS SDK v2 `converseStream()` |
-| Codex | 原生 SSE text/event-stream | `java.net.http.HttpClient` 手动解析 |
+| Anthropic | SSE → ContentBlockDeltaEvent | `anthropic-java` 同步流式 API 包装在 `supplyAsync` |
+| OpenAICompat | SSE → ChatCompletionChunk | `openai-java` `createStreaming().stream()` 包装在 `supplyAsync` |
+| Bedrock | ConverseStream → EventStream | AWS SDK v2 `converseStream()` 异步 API |
+| Codex | 原生 SSE text/event-stream | `java.net.http.HttpClient` 异步 SSE 解析 |
 
-**关键原则：所有流式迭代在虚拟线程中同步执行。** Java 的 `Iterator<T>` / `Iterable<T>` 与虚拟线程完美配合——`for (T item : iterable)` 在 `InputStream` 上阻塞时自动让出载体线程。
+**关键原则：所有流式调用返回 `CompletableFuture<LLMResponse>`。** 内部迭代可在 `supplyAsync` 中同步执行，但对外接口必须保持异步。
 
 ```java
-// Pattern: synchronous iteration over streaming response on a virtual thread
-// No reactive streams needed. Virtual threads make blocking I/O scalable.
-for (ChatCompletionChunk chunk :
-     client.chat().completions().createStreaming(params).stream()) {
-    // Process chunk synchronously
-    if (onContentDelta != null && chunk.choices().get(0).delta().content().isPresent()) {
-        onContentDelta.accept(chunk.choices().get(0).delta().content().get());
+// Pattern: wrap synchronous streaming iteration in CompletableFuture
+// to faithfully replicate Python async def chat_stream(...)
+// Callbacks are awaited sequentially inside the worker thread —
+// this mirrors Python "await on_content_delta(text)" semantics.
+return CompletableFuture.supplyAsync(() -> {
+    for (ChatCompletionChunk chunk :
+         client.chat().completions().createStreaming(params).stream()) {
+        if (onContentDelta != null && chunk.choices().get(0).delta().content().isPresent()) {
+            awaitCallback(onContentDelta.onDelta(
+                chunk.choices().get(0).delta().content().get()));
+        }
     }
-}
+    // reconstruct final response from accumulated chunks
+    return parseChunks(chunks);
+});
 ```
 
 ### 6. 连接管理
@@ -2393,28 +4097,26 @@ for (ChatCompletionChunk chunk :
 | `boto3` (bedrock-runtime) | `software.amazon.awssdk:bedrockruntime` | AWS SDK v2, 原生异步 |
 | `httpx` (HTTP 客户端) | `java.net.http.HttpClient` (Java 11+) | 内置于 JDK, 无需额外依赖 |
 
-### 虚拟线程优于反应式流
+### CompletableFuture 复刻 asyncio 语义
 
-对于 LLM 流式响应，Spring WebFlux/Project Reactor 的 `Flux<T>` 是可选的。虚拟线程使得简单的 `Iterator`-based 迭代同样高效：
+对于 LLM 流式响应，Java 使用 `CompletableFuture<T>` 100% 复刻 Python `async def` 语义：
 
 ```java
-// Virtual threads approach (chosen for simplicity)
-Iterable<ChatCompletionChunk> chunks = client.chat().completions()
-    .createStreaming(params).stream();
-for (ChatCompletionChunk chunk : chunks) {
-    onContentDelta.accept(chunk.choices().get(0).delta().content().orElse(""));
-}
-
-// Alternative: WebFlux (if Spring reactive stack is preferred)
-// Flux<ChatCompletionChunk> flux = ...;
-// flux.subscribe(chunk -> onContentDelta.accept(...));
+// Python: async def chat_stream(...) -> LLMResponse
+// Java:   public CompletableFuture<LLMResponse> chatStream(...) {
+//            return CompletableFuture.supplyAsync(() -> {
+//                // synchronous streaming iteration inside
+//                for (ChatCompletionChunk chunk : stream) { ... }
+//                return parseChunks(chunks);
+//            });
+//        }
 ```
 
-选择同步迭代器 + 虚拟线程而非 WebFlux 的理由：
-1. 重试逻辑（`runWithRetry`）用 `Thread.sleep()` 实现比操作符链式调用更简单
-2. 错误处理用 `try/catch` 比反应式 `onErrorResume`/`retryWhen` 更清晰
-3. 调试更容易——调用栈是线性的
-4. 性能相当——虚拟线程在 I/O 阻塞时自动让出资源
+选择 `CompletableFuture` 的理由：
+1. 与 Python `async def` / `await` 语义一一对应
+2. 重试逻辑（`runWithRetry`）用 `CompletableFuture` 链式组合实现
+3. 错误处理用 `.exceptionally()` 保持与 Python try/except 等价
+4. 调试调用栈线性，不引入反应式操作符复杂度
 
 ### 错误分类保真度
 
