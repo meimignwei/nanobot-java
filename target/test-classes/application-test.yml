@@ -1,9 +1,0 @@
-nanobot:
-  agents:
-    defaults:
-      workspace: /tmp/nanobot-test/workspace
-  providers:
-    openrouter:
-      api-key: sk-or-test-key
-    anthropic:
-      api-key: sk-ant-test-key
