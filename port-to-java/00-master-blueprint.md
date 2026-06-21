@@ -4,6 +4,15 @@
 >
 > 当本文档与 `nanobot/` 目录下的 Python 源码有出入时，**源码即真相**。
 
+## 源码路径
+
+| 角色 | 路径 |
+|------|------|
+| Python 源码（权威） | `/Users/mmw/PycharmProjects/nanobot/nanobot/` |
+| Java 工程根目录 | `/Users/mmw/IdeaProjects/nanobot-java/` |
+| Java 源码目录 | `port-to-java/` → 最终为 `src/main/java/com/nanobot/` |
+| Python 总行数 | **63,569 行** (165 个 .py 文件) |
+
 ## 1. 目标
 
 将 nanobot Python 代码库 **100% 复刻**为 Java 21 + Spring Boot 3.2+ 实现。Java 包结构与 Python `nanobot/` 目录树严格一一对应，前端直接复用现有 React SPA（零改动）。
@@ -385,6 +394,7 @@ nanobot-java/
 
 | 序号 | 包 | 文档 |
 |------|-----|------|
+| — | **完整文件映射** (含行数/复杂度/依赖) | **[01-file-mapping.md](01-file-mapping.md)** |
 | 01 | root (配置入口) | [packages/01-root.md](packages/01-root.md) |
 | 02 | config | [packages/02-config.md](packages/02-config.md) |
 | 03 | bus | [packages/03-bus.md](packages/03-bus.md) |

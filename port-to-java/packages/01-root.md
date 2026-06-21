@@ -1,55 +1,102 @@
-# 01 — Root 包：项目入口与主应用编排
+# 01 — Root 包：项目入口与 SDK 门面
 
-**对标 Python：** `nanobot/__main__.py` (8行), `nanobot/nanobot.py` (~120行), `nanobot/__init__.py` (48行)
+**对标 Python：** `nanobot/__main__.py` (8行), `nanobot/nanobot.py` (113行), `nanobot/__init__.py` (48行)
 
 ## Python 源码分析
 
-### `__main__.py` — 入口点启动
+### `__main__.py` — 模块入口点
 
 ```python
-from nanobot.cli.commands import main
-import sys
+"""
+Entry point for running nanobot as a module: python -m nanobot
+"""
+
+from nanobot.cli.commands import app
+
 if __name__ == "__main__":
-    sys.exit(main())
+    app()
 ```
 
-直接委托到 `cli.commands.main()`。前面有 security 模块的 PTH 文件检查。
+导入 Typer 实例 `app` 并直接调用。Typer 内部处理命令行解析和 `sys.exit`。没有 PTH 文件检查——那是独立的安全加固逻辑，不在此文件。
 
-### `nanobot.py` — Nanobot 应用编排器
+### `nanobot.py` — Nanobot SDK 门面
 
-核心类 `Nanobot` 负责将整个应用组装起来。关键方法：
+**定位：薄门面，不是编排器。** 真正的组件装配在 `AgentLoop.from_config()` 中。
 
-```
-class Nanobot:
-    __init__(self, config: Config)
-        - 创建 MessageBus
-        - 创建 SessionManager
-        - 创建 MemoryStore / Consolidator
-        - 创建 ToolRegistry → ToolLoader → AgentLoop
-        - 创建 ChannelManager
-        - 创建 CronService
-        - 创建 API Server
-        - 用于 WebUI 的 GatewayServices
-
-    from_config(config_path=None, preset=None)  ← 静态工厂
-        → load_config() → Nanobot(config)
-
-    async start()
-        - 启动 ChannelManager (所有 channel)
-        - 启动 API Server
-        - 启动 CronService
-
-    async stop()
-```
-
-### `__init__.py` — 版本与重导出
+完整源码结构：
 
 ```python
-__version__ = "..."  # 从 pyproject.toml 读取
-from nanobot.nanobot import Nanobot  # 重导出
+@dataclass(slots=True)
+class RunResult:
+    content: str
+    tools_used: list[str]
+    messages: list[dict[str, Any]]
+
+class Nanobot:
+    def __init__(self, loop: AgentLoop) -> None:       # 只接受 AgentLoop
+        self._loop = loop
+
+    @classmethod
+    def from_config(cls, config_path=None, *, workspace=None) -> Nanobot:
+        # 1. load_config(config_path) → Config
+        # 2. resolve_config_env_vars()
+        # 3. 可选覆盖 workspace
+        # 4. AgentLoop.from_config(config, image_generation_provider_configs=...)
+        # 5. return cls(loop)
+
+    async def run(self, message, *, session_key="sdk:default", hooks=None) -> RunResult:
+        # 1. 创建 SDKCaptureHook 收集 tools_used + messages
+        # 2. 临时挂载 hooks 到 loop._extra_hooks
+        # 3. await loop.process_direct(message, session_key=session_key)
+        # 4. 恢复原始 hooks
+        # 5. 返回 RunResult(content, tools_used, messages)
+
+    async def aclose(self) -> None:
+        await self._loop.close_mcp()
+
+    async def __aenter__(self) -> Nanobot: ...
+    async def __aexit__(self, *exc) -> None: ...
 ```
+
+关键点：
+- `__init__` 不做任何组件创建，只存一个 `_loop: AgentLoop` 引用
+- `from_config()` 是 SDK 入口，委托 `AgentLoop.from_config()` 完成装配
+- 无 `start()` / `stop()` 方法——生命周期由调用方管理
+- `run()` 通过 hook 机制注入 `SDKCaptureHook` 收集结果
+- `aclose()` 仅释放 MCP 连接
+
+### `__init__.py` — 包初始化与惰性导出
+
+```python
+__logo__ = "🐈"
+
+def _resolve_version() -> str:
+    # 1. 优先 importlib.metadata.version("nanobot-ai")
+    # 2. 回退 pyproject.toml (tomllib)
+    # 3. 最终兜底 "0.2.1"
+
+__version__ = _resolve_version()
+
+_LAZY_EXPORTS = {"Nanobot": ".nanobot", "RunResult": ".nanobot"}
+
+def __getattr__(name: str):
+    # 惰性加载：首次访问时才 import 对应模块
+    # 加载后缓存到 globals()
+
+__all__ = ["Nanobot", "RunResult"]
+```
+
+关键点：
+- 使用 `__getattr__` 惰性加载，不是直接 import
+- 版本获取有三级回退链
+- 导出 `Nanobot` 和 `RunResult` 两个符号
+- `__logo__` 是独立的包级属性
 
 ## Java 实现方案
+
+### 设计原则
+
+`Nanobot` 在 Python 中是薄 SDK 门面，Java 中保持相同定位。真正的装配逻辑在 `AgentLoop` 中（对标 Python `AgentLoop.from_config()`）。
 
 ### 1. 入口类 `NanobotApplication.java`
 
@@ -58,313 +105,228 @@ package com.nanobot;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 @SpringBootApplication
-@EnableConfigurationProperties(NanobotProperties.class)
 public class NanobotApplication {
-
     public static void main(String[] args) {
         SpringApplication.run(NanobotApplication.class, args);
     }
 }
 ```
 
-Spring Boot 自动处理：
-- `--help` 参数
-- `--spring.profiles.active=prod` 切换配置
-- 环境变量绑定（`NANOBOT_*` → `nanobot.*` 属性路径）
+对标 `__main__.py`。Spring Boot 自动处理 `--help`、环境变量绑定。
 
-### 2. 应用编排器 `Nanobot.java`
+### 2. 包信息 `package-info.java`
+
+```java
+/**
+ * nanobot-java — Java port of the nanobot AI agent framework.
+ *
+ * <p>Lazy exports equivalent to nanobot/__init__.py:
+ * <ul>
+ *   <li>{@link com.nanobot.Nanobot} — SDK facade</li>
+ *   <li>{@link com.nanobot.RunResult} — run result</li>
+ * </ul>
+ */
+@Version("0.2.1")
+package com.nanobot;
+
+// 版本号通过 Maven pom.xml 的 ${project.version} 注入
+// __logo__ = "🐈" 在 application.yml 中配置: nanobot.bot-icon: "🐈"
+```
+
+### 3. SDK 门面 `Nanobot.java`
 
 ```java
 package com.nanobot;
 
-import com.nanobot.agent.*;
-import com.nanobot.agent.tools.*;
-import com.nanobot.bus.*;
-import com.nanobot.channels.*;
-import com.nanobot.config.*;
-import com.nanobot.cron.*;
-import com.nanobot.providers.*;
-import com.nanobot.session.*;
-import com.nanobot.utils.*;
-import com.nanobot.webui.*;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
-import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
+import com.nanobot.agent.AgentLoop;
+import com.nanobot.agent.hook.AgentHook;
+import com.nanobot.agent.hook.SDKCaptureHook;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
 
-@Component
-@RequiredArgsConstructor
+/**
+ * Programmatic SDK facade — thin wrapper, NOT an orchestrator.
+ *
+ * <p>The real assembly (MessageBus, SessionManager, providers, tools, etc.)
+ * lives in {@link AgentLoop#fromConfig}.
+ */
 public class Nanobot implements AutoCloseable {
 
-    private final NanobotProperties properties;
+    private final AgentLoop loop;
+
+    /** Package-private: use {@link #fromConfig} to create instances. */
+    Nanobot(AgentLoop loop) {
+        this.loop = loop;
+    }
+
+    /** Create from a config file. Delegates to AgentLoop.fromConfig(). */
+    public static Nanobot fromConfig(Path configPath, Path workspace) {
+        // 对标 Python: Nanobot.from_config(config_path, workspace=...)
+        // 内部调用 AgentLoop.fromConfig(config, imageGenProviderConfigs)
+        // 返回 new Nanobot(loop)
+        Config config = ConfigLoader.load(configPath);
+        ConfigLoader.resolveEnvVars(config);
+        if (workspace != null) {
+            config.agents.defaults.workspace = workspace.toAbsolutePath().toString();
+        }
+        AgentLoop loop = AgentLoop.fromConfig(config,
+            ImageGenerationProviderConfigs.from(config));
+        return new Nanobot(loop);
+    }
+
+    /** Run the agent and collect results. */
+    public RunResult run(String message, String sessionKey, List<AgentHook> hooks) {
+        SDKCaptureHook capture = new SDKCaptureHook();
+        List<AgentHook> prev = loop.getExtraHooks();
+        List<AgentHook> baseHooks = hooks != null
+            ? new ArrayList<>(hooks) : new ArrayList<>(prev != null ? prev : List.of());
+        List<AgentHook> combined = new ArrayList<>();
+        combined.add(capture);
+        combined.addAll(baseHooks);
+        loop.setExtraHooks(combined);
+        try {
+            OutboundMessage response = loop.processDirect(message, sessionKey);
+            String content = response != null ? response.content : "";
+            return new RunResult(content, capture.toolsUsed(), capture.messages());
+        } finally {
+            loop.setExtraHooks(prev);
+        }
+    }
+
+    @Override
+    public void close() {
+        loop.closeMcp();
+    }
+}
+```
+
+### 4. `RunResult` record
+
+```java
+package com.nanobot;
+
+import java.util.List;
+import java.util.Map;
+
+public record RunResult(
+    String content,
+    List<String> toolsUsed,
+    List<Map<String, Object>> messages
+) {}
+```
+
+对标 Python:
+```python
+@dataclass(slots=True)
+class RunResult:
+    content: str
+    tools_used: list[str]
+    messages: list[dict[str, Any]]
+```
+
+### 5. 真正的主装配：`NanobotServer.java`（对标 Python 中不存在于 `nanobot.py` 的启动逻辑）
+
+Python 中，CLI `gateway`/`serve` 命令创建 AgentLoop 并启动 channels/cron/api。这些逻辑不在 `nanobot.py` 中，而在 `cli/commands.py` 的 `gateway()` / `serve()` 函数里。
+
+Java 中拆分为独立的 `NanobotServer`：
+
+```java
+package com.nanobot;
+
+import com.nanobot.agent.AgentLoop;
+import com.nanobot.bus.MessageBus;
+import com.nanobot.channels.ChannelManager;
+import com.nanobot.cron.CronService;
+import com.nanobot.api.OpenAiApiServer;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import org.springframework.stereotype.Component;
+
+@Component
+public class NanobotServer {
+
     private final MessageBus bus;
-    private final SessionManager sessionManager;
-    private final MemoryStore memoryStore;
-    private final Consolidator consolidator;
-    private final ToolRegistry toolRegistry;
-    private final ToolLoader toolLoader;
     private final AgentLoop agentLoop;
     private final ChannelManager channelManager;
     private final CronService cronService;
     private final OpenAiApiServer apiServer;
-    private final GatewayServices gatewayServices;
 
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    public NanobotServer(MessageBus bus, AgentLoop agentLoop,
+                         ChannelManager channelManager, CronService cronService,
+                         OpenAiApiServer apiServer) {
+        this.bus = bus;
+        this.agentLoop = agentLoop;
+        this.channelManager = channelManager;
+        this.cronService = cronService;
+        this.apiServer = apiServer;
+    }
 
     @PostConstruct
     public void start() {
-        // 1. 加载 tools
-        ToolContext toolCtx = buildToolContext();
-        toolLoader.load(toolCtx, toolRegistry, "core");
-
-        // 2. 启动 agent loop
-        executor.submit(agentLoop::run);
-
-        // 3. 启动所有 channels
+        Thread.startVirtualThread(agentLoop::run);  // agent loop 在虚拟线程中运行
         channelManager.startAll();
-
-        // 4. 启动 API server
         apiServer.start();
-
-        // 5. 启动 cron service
         cronService.start();
     }
 
     @PreDestroy
-    @Override
-    public void close() {
+    public void stop() {
         channelManager.stopAll();
         apiServer.stop();
         cronService.stop();
-        executor.shutdown();
-    }
-
-    private ToolContext buildToolContext() {
-        ToolContext ctx = new ToolContext(
-            properties,
-            bus,
-            sessionManager,
-            // ... 其他依赖
-        );
-        return ctx;
-    }
-
-    // 对标 Python Nanobot.from_config()
-    public static Nanobot fromConfig(String configPath, String preset) {
-        // 由 Spring 容器管理，此方法提供程序化创建
-        // 实际使用 SpringApplication.run() 即可
-        throw new UnsupportedOperationException("Use Spring Boot autoconfiguration");
     }
 }
-```
-
-### 3. Spring 配置类 `NanobotAutoConfiguration.java`
-
-将 Nanobot 的各部分装配为 Spring Bean：
-
-```java
-package com.nanobot;
-
-import com.nanobot.agent.*;
-import com.nanobot.agent.tools.*;
-import com.nanobot.bus.*;
-import com.nanobot.channels.*;
-import com.nanobot.config.*;
-import com.nanobot.cron.*;
-import com.nanobot.providers.*;
-import com.nanobot.session.*;
-import com.nanobot.webui.*;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-
-@Configuration
-public class NanobotAutoConfiguration {
-
-    @Bean
-    @ConditionalOnMissingBean
-    public AppPaths appPaths(NanobotProperties properties) {
-        return new AppPaths(properties);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public MessageBus messageBus() {
-        return new MessageBus();
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public SessionManager sessionManager(AppPaths appPaths) {
-        return new SessionManager(appPaths);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public MemoryStore memoryStore(SessionManager sessionManager, AppPaths appPaths) {
-        return new MemoryStore(sessionManager, appPaths);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public ToolRegistry toolRegistry() {
-        return new ToolRegistry();
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public ToolLoader toolLoader() {
-        return new ToolLoader();
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public LLMProvider llmProvider(NanobotProperties properties) {
-        ProviderFactory factory = new ProviderFactory(properties);
-        return factory.makeProvider(null, null);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public AgentLoop agentLoop(
-            MessageBus bus,
-            LLMProvider provider,
-            ToolRegistry toolRegistry,
-            SessionManager sessionManager,
-            MemoryStore memoryStore,
-            NanobotProperties properties) {
-        return new AgentLoop(bus, provider, toolRegistry,
-                             sessionManager, memoryStore, properties);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public ChannelManager channelManager(
-            NanobotProperties properties,
-            MessageBus bus,
-            SessionManager sessionManager,
-            CronService cronService) {
-        return new ChannelManager(properties, bus, sessionManager, cronService);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public OpenAiApiServer openAiApiServer(NanobotProperties properties) {
-        return new OpenAiApiServer(properties);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public CronService cronService(NanobotProperties properties, MessageBus bus) {
-        return new CronService(properties, bus);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public GatewayServices gatewayServices(
-            NanobotProperties properties,
-            SessionManager sessionManager,
-            CronService cronService) {
-        return buildGatewayServices(properties, sessionManager, cronService);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public Nanobot nanobot(/* 所有依赖注入 */) {
-        return new Nanobot(/* ... */);
-    }
-}
-```
-
-### 4. `application.yml` 基础配置
-
-```yaml
-spring:
-  application:
-    name: nanobot-java
-  threads:
-    virtual:
-      enabled: true
-
-server:
-  port: 0  # 由 NanobotProperties.api.port 覆盖
-
-logging:
-  level:
-    com.nanobot: INFO
-    com.nanobot.agent: DEBUG
-
-nanobot:
-  agents:
-    defaults:
-      workspace: ~/.nanobot-java/workspace
-      model: anthropic/claude-sonnet-4-6
-      provider: auto
-      max-tokens: 8192
-      context-window-tokens: 65536
-      temperature: 0.1
-      max-tool-iterations: 200
-      provider-retry-mode: standard
-      bot-name: nanobot-java
-      bot-icon: "🐈"
-      timezone: UTC
-      session-ttl-minutes: 0
-      max-messages: 120
-      consolidation-ratio: 0.5
-  channels:
-    send-progress: true
-    send-tool-hints: false
-    show-reasoning: true
-    extract-document-text: true
-    send-max-retries: 3
-  api:
-    host: 127.0.0.1
-    port: 8900
-    timeout: 120.0
-  gateway:
-    host: 127.0.0.1
-    port: 18790
 ```
 
 ## 关键设计决策
 
-### 异步 → 虚拟线程
+### Nanobot 的定位
 
-Python 的 `async def start()` 在 Java 中变为普通的同步方法，由虚拟线程执行。`executor.submit(agentLoop::run)` 启动的虚拟线程会自动在阻塞 I/O 时让出 CPU。
+`Nanobot` 是**薄 SDK 门面**，不能是 Spring `@Component`。它是给外部调用方（如测试、脚本、SDK 用户）用的编程接口。
 
-### 静态工厂 vs Spring Bean
+### 装配逻辑归属
 
-Python 的 `Nanobot.from_config()` 静态工厂在 Java 中由 Spring 的 `@Configuration` + `@Bean` 工厂方法替代，同样支持依赖注入和延迟初始化。
+- `Nanobot.from_config()` → Java `Nanobot.fromConfig()` — SDK 使用的便捷工厂
+- `AgentLoop.from_config()` → Java `AgentLoop.fromConfig()` — 真正的组件装配
+- CLI `gateway()` / `serve()` → Java `NanobotServer` — 服务端生命周期管理
 
-### 生命周期管理
+### Python → Java 映射总结
 
-Python 的 `async start()` / `async stop()` → Java `@PostConstruct` / `@PreDestroy`（Spring 管理）+ `AutoCloseable`（程序化使用）。
+| Python | Java | 职责 |
+|--------|------|------|
+| `__main__.py` → `app()` | `NanobotApplication.main()` | 入口点 |
+| `__init__.py` | `package-info.java` + Maven pom | 版本、logo、导出 |
+| `Nanobot.__init__(loop)` | `Nanobot(AgentLoop loop)` | 薄门面构造 |
+| `Nanobot.from_config()` | `Nanobot.fromConfig()` | SDK 工厂 |
+| `Nanobot.run()` | `Nanobot.run()` | SDK 调用 |
+| `Nanobot.aclose()` | `Nanobot.close()` | 资源释放 |
+| `RunResult` | `RunResult` record | 返回值 |
+| `SDKCaptureHook` | `SDKCaptureHook` | 结果收集 |
 
 ## 验证标准
 
 ```bash
 cd nanobot-java
-mvn clean package -DskipTests
-java -jar target/nanobot-java-1.0.0.jar --help
-# 预期输出: Spring Boot 启动信息 + nanobot 配置摘要
+mvn clean compile
+# 预期: 编译通过，无错误
 
-NANOBOT_AGENTS_DEFAULTS_MODEL=openai/gpt-5 java -jar target/nanobot-java-1.0.0.jar
-# 预期: 日志中显示 model = openai/gpt-5
+# 单元测试: Nanobot.fromConfig 能加载配置并创建实例
+mvn test -Dtest=NanobotTest
 ```
 
 ## 代码量估算
 
 | 文件 | 行数 |
 |------|------|
-| NanobotApplication.java | ~15 |
-| Nanobot.java | ~100 |
-| NanobotAutoConfiguration.java | ~120 |
-| package-info.java (__init__.py 对标) | ~5 |
-| application.yml | ~50 |
-| **合计** | **~290** |
+| NanobotApplication.java | ~12 |
+| Nanobot.java | ~60 |
+| RunResult.java | ~8 |
+| NanobotServer.java | ~50 |
+| package-info.java | ~12 |
+| **合计** | **~142** |
+
+> 对比原方案 ~290 行（含错误的 AutoConfiguration），修正后减少约一半。
