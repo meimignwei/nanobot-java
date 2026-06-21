@@ -19,7 +19,6 @@ com/nanobot/agent/context/ConsolidatorTest$2.class
 com/nanobot/providers/AnthropicProviderTest$ConvertTools.class
 com/nanobot/agent/tools/ToolRegistryTest$TestTool.class
 com/nanobot/providers/BedrockProviderTest.class
-com/nanobot/agent/loop/AgentLoopTest$1.class
 com/nanobot/providers/base/ErrorClassificationTest$IsTransientResponse.class
 com/nanobot/providers/base/ErrorClassificationTest$NormalizeErrorToken.class
 com/nanobot/agent/tools/SchemaValidatorTest$StringConstraints.class

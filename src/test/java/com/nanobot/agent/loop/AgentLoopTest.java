@@ -1,11 +1,5 @@
 package com.nanobot.agent.loop;
 
-import com.nanobot.agent.command.CommandRouter;
-import com.nanobot.agent.command.BuiltinCommands;
-import com.nanobot.agent.context.ContextBuilder;
-import com.nanobot.agent.context.Consolidator;
-import com.nanobot.agent.context.MemoryStore;
-import com.nanobot.agent.runner.AgentRunner;
 import com.nanobot.agent.session.SessionManager;
 import com.nanobot.bus.InboundMessage;
 import com.nanobot.bus.MessageBus;
@@ -19,9 +13,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -32,36 +23,52 @@ class AgentLoopTest {
     private AgentLoop loop;
     private TestMessageBus bus;
 
+    /** 创建 AgentLoop 的便捷工厂，注入测试 bus/provider/sessions。
+     *  对标 Python AgentLoop.__init__() 全参构造器。 */
+    private AgentLoop createLoop(MessageBus bus, LLMProvider provider,
+                                  Path workspace, SessionManager sessions,
+                                  String model, int maxIterations,
+                                  int contextWindowTokens) {
+        return new AgentLoop(
+                bus, provider, workspace,
+                model, maxIterations,
+                null, // maxConcurrentSubagents
+                contextWindowTokens,
+                null, // contextBlockLimit
+                16_000, // maxToolResultChars
+                "standard", // providerRetryMode
+                null, // toolHintMaxLength
+                true, // restrictToWorkspace
+                sessions,
+                null, // mcpServers
+                null, // channelsConfig
+                null, // timezone
+                60, // sessionTtlMinutes
+                0.5, // consolidationRatio
+                120, // maxMessages
+                false, // unifiedSession
+                null, // disabledSkills
+                null, // toolsConfig
+                null, // nanobotConfig
+                null, // providerSnapshotLoader
+                null, // providerSignature
+                null, // modelPresets
+                null, // modelPreset
+                null, // presetSnapshotLoader
+                null, // runtimeEvents
+                null  // runtimeModelPublisher
+        );
+    }
+
     @BeforeEach
     void setUp(@TempDir Path tempDir) {
         workspace = tempDir;
         sessions = new SessionManager(workspace);
         bus = new TestMessageBus();
         var provider = new StubProvider();
-        var runner = new AgentRunner(provider);
-        var store = new MemoryStore(workspace, 100);
-        var context = new ContextBuilder(workspace, null);
-        var commands = new CommandRouter();
-        BuiltinCommands.registerAll(commands);
-        var consolidator = new Consolidator(
-                store, new com.nanobot.agent.context.ConsolidatorProvider() {
-            @Override
-            public LLMResponse chat(String m, List<Map<String, Object>> msgs) {
-                return new LLMResponse("ok", List.of(), "stop", Map.of(), null, null, null, null, null, null, null, null, null);
-            }
-        }, "test", sessions, 128_000, 4096, 0.5, false,
-                (h, cm, ch, ci, si, ss, sm, sk, us) -> {
-                    var msgs = new java.util.ArrayList<Map<String, Object>>();
-                    msgs.add(Map.of("role", "system", "content", "test"));
-                    msgs.addAll(h);
-                    msgs.add(Map.of("role", "user", "content", cm));
-                    return msgs;
-                }, List::of);
 
-        loop = new AgentLoop(bus, runner, context, commands, consolidator,
-                sessions, workspace, "test-model", 10, 128_000, 16_000,
-                "standard", new ConcurrentHashMap<>(), new Semaphore(10),
-                new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+        loop = createLoop(bus, provider, workspace, sessions,
+                "test-model", 10, 128_000);
         loop.setRunning(true);
     }
 
@@ -130,12 +137,8 @@ class AgentLoopTest {
     @Test
     void replayTokenBudgetUsesHalfWindowAsFloor() {
         // With a small context window, should fall back to half
-        var smallLoop = new AgentLoop(bus, new AgentRunner(new StubProvider()),
-                new ContextBuilder(workspace, null),
-                new CommandRouter(), null, sessions, workspace,
-                "test", 10, 100, 16_000, "standard",
-                new ConcurrentHashMap<>(), new Semaphore(10),
-                new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+        var smallLoop = createLoop(bus, new StubProvider(),
+                workspace, sessions, "test", 10, 100);
         int budget = smallLoop.replayTokenBudget();
         // 100 - 1 - 1024 = -925, so floor should be max(128, 100/2) = 128
         assertThat(budget).isEqualTo(128);

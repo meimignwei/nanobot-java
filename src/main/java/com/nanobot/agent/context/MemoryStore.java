@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nanobot.utils.GitStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -60,12 +61,20 @@ public class MemoryStore {
     /** history 追加锁，保证游标和写入的原子性 */
     private final ReentrantLock appendLock = new ReentrantLock();
 
+    /** Git 版本控制存储——对标 Python self._git = GitStore(...) */
+    private final GitStore gitStore;
+
     private boolean corruptionLogged;
     private boolean oversizeLogged;
 
     public MemoryStore(Path workspace) {
         this(workspace, 1000);
     }
+
+    /** 被 git 追踪的文件列表（workspace 相对路径）。
+     *  对标 Python GitStore tracked_files。 */
+    private static final List<String> TRACKED_FILES = List.of(
+            "memory/MEMORY.md", "memory/history.jsonl", "SOUL.md", "USER.md");
 
     public MemoryStore(Path workspace, int maxHistoryEntries) {
         this.workspace = workspace;
@@ -77,7 +86,12 @@ public class MemoryStore {
         this.userFile = workspace.resolve("USER.md");
         this.cursorFile = memoryDir.resolve(".cursor");
         this.dreamCursorFile = memoryDir.resolve(".dream_cursor");
+        this.gitStore = new GitStore(workspace, TRACKED_FILES);
     }
+
+    /** 获取 GitStore 实例，供外部（Dream、memory 命令等）使用。
+     *  对标 Python MemoryStore.git property。 */
+    public GitStore git() { return gitStore; }
 
     // -- MEMORY.md --
     // 对应 Python MemoryStore.read_memory() / write_memory()

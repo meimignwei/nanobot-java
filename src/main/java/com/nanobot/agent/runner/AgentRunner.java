@@ -18,21 +18,46 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Run a tool-capable LLM loop without product-layer concerns.
- * Mirrors Python AgentRunner class (agent/runner.py 1544 lines).
+ * 工具调用 LLM 循环执行器——无产品层依赖的纯引擎核心。
+ * 完整对标 Python AgentRunner（agent/runner.py 1544 行）。
+ *
+ * <p>职责：
+ * <ul>
+ *   <li>迭代调用 LLM + 执行工具（最多 maxIterations 轮）</li>
+ *   <li>上下文治理：dropOrphan/backfill/microcompact/snipHistory/applyToolResultBudget</li>
+ *   <li>工具结果注入（mid-turn injections）与新消息追加重试</li>
+ *   <li>流式输出（streamContent）和 thinking 进度回调</li>
+ *   <li>错误重试（标准/fallback 模式）、空白回复重试、超长回复续写</li>
+ *   <li>安全：SSRF 违规检测、workspace 违规检测与升级</li>
+ *   <li>最终化（finalization）与 empty-final-response 处理</li>
+ *   <li>持久化 assistant 消息（含 tool_calls）和模型错误占位</li>
+ * </ul></p>
+ *
+ * <p>Python asyncio → Java Virtual Threads 映射：
+ * AgentRunner.run() 在调用方的虚拟线程中同步执行，不阻塞平台线程。</p>
  */
 public class AgentRunner {
 
     private static final Logger log = LoggerFactory.getLogger(AgentRunner.class);
 
+    // -- 上下文治理常量（对标 Python runner.py 顶层常量）--
+    /** LLM 返回空内容时的最大重试次数 */
     static final int MAX_EMPTY_RETRIES = 2;
+    /** 超长回复续写的最大尝试次数 */
     static final int MAX_LENGTH_RECOVERIES = 3;
+    /** 单轮最多注入工具结果次数 */
     static final int MAX_INJECTIONS_PER_TURN = 3;
+    /** 注入循环的最大迭代次数 */
     static final int MAX_INJECTION_CYCLES = 5;
+    /** 消息裁剪的安全缓冲 token 数 */
     static final int SNIP_SAFETY_BUFFER = 1024;
+    /** 微压缩时保留的最近消息数 */
     static final int MICROCOMPACT_KEEP_RECENT = 10;
+    /** 触发微压缩的最小字符数 */
     static final int MICROCOMPACT_MIN_CHARS = 500;
+    /** 重复 workspace violation 的上限，超过后升级处理 */
     static final int MAX_REPEAT_WORKSPACE_VIOLATIONS = 2;
+    /** 重复外部查找的上限 */
     static final int MAX_REPEAT_EXTERNAL_LOOKUPS = 2;
     static final String BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]";
     static final String DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
@@ -109,6 +134,13 @@ public class AgentRunner {
                 rctx.error, rctx.toolEvents, rctx.hadInjections);
     }
 
+    /**
+     * 核心执行循环——迭代调用 LLM + 执行工具。
+     * 完整对标 Python _run_core()（runner.py:323-739）。
+     *
+     * <p>每轮迭代执行：上下文治理 → LLM 调用 → 工具执行 → 结果注入 → 下一轮。
+     * maxIterations 耗尽或 LLM 返回 stop 时结束，进入 finalization。</p>
+     */
     // 对应 Python _run_core() (runner.py:323)
     AgentRunResult runCore(AgentRunSpec spec, AgentRunHookContext runCtx) throws InterruptedException {
         var messages = new ArrayList<>(spec.initialMessages());
@@ -118,7 +150,8 @@ public class AgentRunner {
         boolean hadInjections = false;
 
         for (int iteration = 0; iteration < spec.maxIterations(); iteration++) {
-            // Context governance
+            // 上下文治理：清理、回填、压缩、截断
+            // 对标 Python _run_core() 内的治理调用（runner.py:339-345）
             dropOrphanToolResults(messages);
             backfillMissingToolResults(messages);
             microcompact(messages);
