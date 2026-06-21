@@ -4,8 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="5610b32b-70ed-4b99-b96d-70407299bfe1" name="Changes" comment="mvp版本重构">
+    <list default="true" id="5610b32b-70ed-4b99-b96d-70407299bfe1" name="Changes" comment="mvp版本重构-构建技术方案">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/port-to-java/00-master-blueprint.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/00-master-blueprint.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/01-file-mapping.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/00-file-mapping.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/port-to-java/packages/01-root.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/01-root.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -16,38 +18,38 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "meimignwei"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;meimignwei&quot;
   }
-}]]></component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/meimignwei/nanobot-java.git",
-    "accountId": "8306b461-cb84-4444-bbdd-8663a7a8c073"
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/meimignwei/nanobot-java.git&quot;,
+    &quot;accountId&quot;: &quot;8306b461-cb84-4444-bbdd-8663a7a8c073&quot;
   }
-}]]></component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 2
-}]]></component>
+}</component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 2
+}</component>
   <component name="ProjectId" id="3FJZH1NSiLVkqKM8Y0yLq1KRAsr" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Maven.nanobot-java [clean].executor": "Run",
-    "Maven.nanobot-java [package].executor": "Run",
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "kotlin-language-version-configured": "true",
-    "last_opened_file_path": "/Users/mmw/IdeaProjects/nanobot-java/port-to-java"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Maven.nanobot-java [clean].executor&quot;: &quot;Run&quot;,
+    &quot;Maven.nanobot-java [package].executor&quot;: &quot;Run&quot;,
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;kotlin-language-version-configured&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/Users/mmw/IdeaProjects/nanobot-java/port-to-java&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$/port-to-java" />
@@ -117,13 +119,22 @@
       <option name="project" value="LOCAL" />
       <updated>1782034372479</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="mvp版本重构-构建技术方案">
+      <option name="closed" value="true" />
+      <created>1782038360792</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1782038360792</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="feat: enhance AgentLoop dispatch and state machine with runAgentLoop&#10;&#10;Port _dispatch with pending queue lifecycle/leftover re-publishing,&#10;add runAgentLoop() for LLM execution orchestration, enhance&#10;saveTurn with tool result truncation and image sanitization,&#10;add InboundMessage.withSessionKey(). 329 tests passing.&#10;&#10;Co-Authored-By: Claude Opus 4.7 &lt;noreply@anthropic.com&gt;" />
     <MESSAGE value="mvp版本" />
     <MESSAGE value="mvp版本重构" />
-    <option name="LAST_COMMIT_MESSAGE" value="mvp版本重构" />
+    <MESSAGE value="mvp版本重构-构建技术方案" />
+    <option name="LAST_COMMIT_MESSAGE" value="mvp版本重构-构建技术方案" />
   </component>
 </project>

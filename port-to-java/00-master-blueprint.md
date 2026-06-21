@@ -8,7 +8,8 @@
 
 | 角色 | 路径 |
 |------|------|
-| Python 源码（权威） | `/Users/mmw/PycharmProjects/nanobot/nanobot/` |
+| Python 源码仓库根目录（权威） | `/Users/mmw/PycharmProjects/nanobot/` |
+| Python 包目录 | `/Users/mmw/PycharmProjects/nanobot/nanobot/` |
 | Java 工程根目录 | `/Users/mmw/IdeaProjects/nanobot-java/` |
 | Java 源码目录 | `port-to-java/` → 最终为 `src/main/java/com/nanobot/` |
 | Python 总行数 | **63,569 行** (165 个 .py 文件) |
@@ -394,7 +395,7 @@ nanobot-java/
 
 | 序号 | 包 | 文档 |
 |------|-----|------|
-| — | **完整文件映射** (含行数/复杂度/依赖) | **[01-file-mapping.md](01-file-mapping.md)** |
+| — | **完整文件映射** (含行数/复杂度/依赖) | **[01-file-mapping.md](00-file-mapping.md)** |
 | 01 | root (配置入口) | [packages/01-root.md](packages/01-root.md) |
 | 02 | config | [packages/02-config.md](packages/02-config.md) |
 | 03 | bus | [packages/03-bus.md](packages/03-bus.md) |
