@@ -1265,8 +1265,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -1274,59 +1276,206 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nanobot.config.AppPaths;
 
 /**
- * Read/write WebUI sidebar collapsed state, persisted to disk.
+ * Persisted WebUI sidebar workspace state — UI-only metadata scoped to the
+ * active nanobot instance data directory.
  * 对标 Python sidebar_state.py.
  */
 public final class SidebarState {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final int MAX_STATE_FILE_BYTES = 128 * 1024;
+    private static final int WEBUI_SIDEBAR_STATE_SCHEMA_VERSION = 1;
+    private static final int MAX_STATE_FILE_BYTES = 256 * 1024;
+    private static final int MAX_LIST_ITEMS = 2_000;
+    private static final int MAX_MAP_ITEMS = 2_000;
+    private static final int MAX_KEY_LEN = 512;
+    private static final int MAX_TITLE_LEN = 160;
+    private static final int MAX_TAG_LEN = 40;
+    private static final Set<String> ALLOWED_DENSITIES = Set.of("comfortable", "compact");
+    private static final Set<String> ALLOWED_SORTS =
+        Set.of("updated_desc", "created_desc", "title_asc");
 
     private SidebarState() {}
 
+    // 对标 Python webui_sidebar_state_path()
     private static Path sidebarStatePath() {
         return AppPaths.webuiDir().resolve("sidebar-state.json");
     }
 
-    /**
-     * 对标 Python read_webui_sidebar_state().
-     */
+    // 对标 Python default_webui_sidebar_state()
+    static Map<String, Object> defaultState() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        state.put("schema_version", WEBUI_SIDEBAR_STATE_SCHEMA_VERSION);
+        state.put("pinned_keys", List.of());
+        state.put("archived_keys", List.of());
+        state.put("title_overrides", Map.of());
+        state.put("project_name_overrides", Map.of());
+        state.put("tags_by_key", Map.of());
+        state.put("collapsed_groups", Map.of());
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("density", "comfortable");
+        view.put("show_previews", false);
+        view.put("show_timestamps", false);
+        view.put("show_archived", false);
+        view.put("sort", "updated_desc");
+        state.put("view", view);
+        state.put("updated_at", null);
+        return state;
+    }
+
+    // 对标 Python normalize_webui_sidebar_state()
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> normalize(Map<String, Object> raw) {
+        Map<String, Object> state = defaultState();
+        if (raw == null) return state;
+        state.put("pinned_keys",
+            cleanStringList(raw.get("pinned_keys"), MAX_KEY_LEN));
+        state.put("archived_keys",
+            cleanStringList(raw.get("archived_keys"), MAX_KEY_LEN));
+        state.put("title_overrides",
+            cleanTitleOverrides(raw.get("title_overrides")));
+        state.put("project_name_overrides",
+            cleanTitleOverrides(raw.get("project_name_overrides")));
+        state.put("tags_by_key",
+            cleanTagsByKey(raw.get("tags_by_key")));
+        state.put("collapsed_groups",
+            cleanBoolMap(raw.get("collapsed_groups")));
+        state.put("view", cleanView(raw.get("view")));
+        Object updatedAt = raw.get("updated_at");
+        state.put("updated_at", updatedAt instanceof String s ? s : null);
+        return state;
+    }
+
+    // 对标 Python _clean_string()
+    static String cleanString(Object value, int maxLen) {
+        if (!(value instanceof String s)) return null;
+        String cleaned = s.strip();
+        return cleaned.isEmpty() ? null : cleaned.substring(0, Math.min(cleaned.length(), maxLen));
+    }
+
+    // 对标 Python _clean_string_list()
+    @SuppressWarnings("unchecked")
+    static List<String> cleanStringList(Object value, int maxLen) {
+        if (!(value instanceof List<?> list)) return List.of();
+        List<String> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        int limit = Math.min(list.size(), MAX_LIST_ITEMS);
+        for (int i = 0; i < limit; i++) {
+            String cleaned = cleanString(list.get(i), maxLen);
+            if (cleaned == null || seen.contains(cleaned)) continue;
+            seen.add(cleaned);
+            out.add(cleaned);
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    // 对标 Python _clean_bool_map()
+    @SuppressWarnings("unchecked")
+    static Map<String, Boolean> cleanBoolMap(Object value) {
+        if (!(value instanceof Map<?, ?> map)) return Map.of();
+        Map<String, Boolean> out = new LinkedHashMap<>();
+        int count = 0;
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            if (count++ >= MAX_MAP_ITEMS) break;
+            String key = cleanString(e.getKey(), MAX_KEY_LEN);
+            if (key == null) continue;
+            out.put(key, Boolean.TRUE.equals(e.getValue()));
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    // 对标 Python _clean_title_overrides()
+    @SuppressWarnings("unchecked")
+    static Map<String, String> cleanTitleOverrides(Object value) {
+        if (!(value instanceof Map<?, ?> map)) return Map.of();
+        Map<String, String> out = new LinkedHashMap<>();
+        int count = 0;
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            if (count++ >= MAX_MAP_ITEMS) break;
+            String key = cleanString(e.getKey(), MAX_KEY_LEN);
+            String title = cleanString(e.getValue(), MAX_TITLE_LEN);
+            if (key == null || title == null) continue;
+            out.put(key, title);
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    // 对标 Python _clean_tags_by_key()
+    @SuppressWarnings("unchecked")
+    static Map<String, List<String>> cleanTagsByKey(Object value) {
+        if (!(value instanceof Map<?, ?> map)) return Map.of();
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        int count = 0;
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            if (count++ >= MAX_MAP_ITEMS) break;
+            String key = cleanString(e.getKey(), MAX_KEY_LEN);
+            if (key == null) continue;
+            List<String> tags = cleanStringList(e.getValue(), MAX_TAG_LEN);
+            if (tags.size() > 12) tags = tags.subList(0, 12);
+            if (!tags.isEmpty()) out.put(key, tags);
+        }
+        return Collections.unmodifiableMap(out);
+    }
+
+    // 对标 Python _clean_view()
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> cleanView(Object value) {
+        Map<String, Object> defaultView =
+            (Map<String, Object>) defaultState().get("view");
+        if (!(value instanceof Map<?, ?> raw)) return defaultView;
+        Map<String, Object> out = new LinkedHashMap<>();
+        Object density = raw.get("density");
+        out.put("density",
+            ALLOWED_DENSITIES.contains(density) ? density : defaultView.get("density"));
+        out.put("show_previews",
+            raw.get("show_previews") instanceof Boolean b ? b : defaultView.get("show_previews"));
+        out.put("show_timestamps",
+            raw.get("show_timestamps") instanceof Boolean b ? b : defaultView.get("show_timestamps"));
+        out.put("show_archived",
+            raw.get("show_archived") instanceof Boolean b ? b : defaultView.get("show_archived"));
+        Object sort = raw.get("sort");
+        out.put("sort",
+            ALLOWED_SORTS.contains(sort) ? sort : defaultView.get("sort"));
+        return out;
+    }
+
+    // 对标 Python read_webui_sidebar_state()
+    @SuppressWarnings("unchecked")
     public static Map<String, Object> readWebuiSidebarState() {
         Path path = sidebarStatePath();
         if (!Files.isRegularFile(path)) {
-            return new LinkedHashMap<>();
+            return defaultState();
         }
         try {
-            long size = Files.size(path);
-            if (size > MAX_STATE_FILE_BYTES) {
-                return new LinkedHashMap<>();
+            if (Files.size(path) > MAX_STATE_FILE_BYTES) {
+                return defaultState();
             }
             String content = Files.readString(path, StandardCharsets.UTF_8);
-            return MAPPER.readValue(content,
+            Map<String, Object> raw = MAPPER.readValue(content,
                 new TypeReference<LinkedHashMap<String, Object>>() {});
+            return normalize(raw);
         } catch (IOException e) {
-            return new LinkedHashMap<>();
+            return defaultState();
         }
     }
 
-    /**
-     * 对标 Python write_webui_sidebar_state().
-     */
-    public static Map<String, Object> writeWebuiSidebarState(Map<String, Object> state) {
-        if (state.size() > 100) {
-            throw new IllegalArgumentException("sidebar state too large");
-        }
+    // 对标 Python write_webui_sidebar_state()
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> writeWebuiSidebarState(Map<String, Object> raw) {
+        Map<String, Object> state = normalize(raw);
+        state.put("updated_at",
+            DateTimeFormatter.ISO_INSTANT.format(Instant.now().atZone(ZoneOffset.UTC)));
+
         Path path = sidebarStatePath();
         Path tmp = path.resolveSibling("sidebar-state.json.tmp");
         try {
             String encoded = MAPPER.writeValueAsString(state);
             if (encoded.getBytes(StandardCharsets.UTF_8).length > MAX_STATE_FILE_BYTES) {
-                throw new IllegalArgumentException("sidebar state too large");
+                throw new IllegalArgumentException("sidebar state is too large");
             }
             Files.createDirectories(path.getParent());
             Files.writeString(tmp, encoded, StandardCharsets.UTF_8);
-            // fsync analogy: Java 没有直接的 fd fsync，依赖 StandardCopyOption.ATOMIC_MOVE
-            Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             throw new RuntimeException("failed to write sidebar state", e);
         }
@@ -1341,86 +1490,158 @@ public final class SidebarState {
 package com.nanobot.webui;
 
 import java.io.IOException;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import com.nanobot.security.WorkspaceScope;
+import com.nanobot.security.WorkspacePolicy;
 
 /**
- * File preview payload builder for the WebUI.
+ * Workspace-scoped source preview payloads for the WebUI.
  * 对标 Python file_preview.py.
  */
 public final class FilePreview {
 
     private FilePreview() {}
 
-    private static final long MAX_PREVIEW_BYTES = 512 * 1024; // 512 KB
-    private static final long MAX_TEXT_PREVIEW_BYTES = 256 * 1024; // 256 KB
+    // 对标 Python MAX_FILE_PREVIEW_BYTES
+    private static final long MAX_FILE_PREVIEW_BYTES = 384 * 1024; // 384 KB
 
-    /**
-     * 对标 Python file_preview_payload().
-     */
-    public static Map<String, Object> filePreviewPayload(String path, WorkspaceScope scope) {
-        Path resolved = scope.projectPath().resolve(path).normalize();
-        // Security: ensure within workspace
-        if (!resolved.startsWith(scope.projectPath())) {
-            throw new WebUIFilePreviewError(403, "path outside workspace");
+    // 对标 Python file_preview_payload()
+    public static Map<String, Object> filePreviewPayload(
+            String rawPath, WorkspaceScope scope) {
+        return filePreviewPayload(rawPath, scope, MAX_FILE_PREVIEW_BYTES);
+    }
+
+    static Map<String, Object> filePreviewPayload(
+            String rawPath, WorkspaceScope scope, long maxBytes) {
+
+        // 对标 Python _clean_preview_path()
+        String path = cleanPreviewPath(rawPath);
+        if (path.isEmpty()) {
+            throw new WebUIFilePreviewError(400, "missing path");
         }
+        if (path.length() > 4096) {
+            throw new WebUIFilePreviewError(400, "path is too long");
+        }
+
+        // 对标 Python resolve_allowed_path()
+        Path resolved;
+        try {
+            resolved = WorkspacePolicy.resolveAllowedPath(
+                path, scope.projectPath(), scope.projectPath(), true);
+        } catch (IOException e) {
+            throw new WebUIFilePreviewError(404, "file not found");
+        } catch (SecurityException e) {
+            throw new WebUIFilePreviewError(403,
+                "file is outside the current workspace");
+        }
+
         if (!Files.isRegularFile(resolved)) {
             throw new WebUIFilePreviewError(404, "file not found");
         }
 
-        long size;
+        byte[] raw;
         try {
-            size = Files.size(resolved);
+            raw = Files.readAllBytes(resolved);
         } catch (IOException e) {
-            throw new WebUIFilePreviewError(500, "cannot read file");
+            throw new WebUIFilePreviewError(500, "failed to read file");
         }
 
-        String mimeType = probeContentType(resolved);
-        boolean isImage = mimeType != null && mimeType.startsWith("image/");
-        boolean isText = mimeType != null && (mimeType.startsWith("text/")
-            || "application/json".equals(mimeType)
-            || "application/javascript".equals(mimeType)
-            || "application/xml".equals(mimeType));
+        // 对标 Python: check for null bytes in first 4096 bytes for binary detection
+        int checkLen = Math.min(4096, raw.length);
+        for (int i = 0; i < checkLen; i++) {
+            if (raw[i] == 0) {
+                throw new WebUIFilePreviewError(415,
+                    "binary files cannot be previewed");
+            }
+        }
+
+        boolean truncated = raw.length > maxBytes;
+        byte[] previewBytes = truncated ? java.util.Arrays.copyOf(raw, (int) maxBytes) : raw;
+
+        String content;
+        try {
+            content = new String(previewBytes, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            content = new String(previewBytes, StandardCharsets.UTF_8);
+        }
+
+        String displayPath = displayPath(resolved, scope.projectPath());
 
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("path", path);
-        result.put("size", size);
-        result.put("mime_type", mimeType);
-        result.put("is_image", isImage);
-        result.put("is_text", isText);
-
-        if (isImage && size <= MAX_PREVIEW_BYTES) {
-            try {
-                byte[] bytes = Files.readAllBytes(resolved);
-                result.put("data_url", "data:" + mimeType + ";base64,"
-                    + Base64.getEncoder().encodeToString(bytes));
-            } catch (IOException e) {
-                // ignore — no preview available
-            }
-        } else if (isText && size <= MAX_TEXT_PREVIEW_BYTES) {
-            try {
-                String text = Files.readString(resolved, StandardCharsets.UTF_8);
-                result.put("text_preview", text);
-            } catch (IOException e) {
-                // ignore
-            }
-        }
-
+        result.put("path", resolved.toString());
+        result.put("display_path", displayPath);
+        result.put("project_path", scope.projectPath().toString());
+        result.put("language", languageForPath(resolved));
+        result.put("content", content);
+        result.put("size", raw.length);
+        result.put("truncated", truncated);
         return result;
     }
 
-    private static String probeContentType(Path path) {
-        try {
-            return Files.probeContentType(path);
-        } catch (IOException e) {
-            return "application/octet-stream";
+    // 对标 Python _clean_preview_path()
+    static String cleanPreviewPath(String rawPath) {
+        if (rawPath == null) return "";
+        String value = rawPath.strip();
+        if (value.isEmpty()) return "";
+        if (value.startsWith("file://")) {
+            java.net.URI uri = java.net.URI.create(value);
+            value = uri.getPath();
+            if (value != null) {
+                value = URLDecoder.decode(value, StandardCharsets.UTF_8);
+            } else {
+                value = "";
+            }
+            // Strip leading slash on Windows-style paths like /C:/...
+            if (Pattern.matches("^/[A-Za-z]:[\\\\/].*", value)) {
+                value = value.substring(1);
+            }
+        } else {
+            value = URLDecoder.decode(value, StandardCharsets.UTF_8);
         }
+        // Strip query and fragment
+        int hashIdx = value.indexOf('#');
+        if (hashIdx >= 0) value = value.substring(0, hashIdx);
+        int qIdx = value.indexOf('?');
+        if (qIdx >= 0) value = value.substring(0, qIdx);
+        value = value.strip();
+        // Strip go-to-line suffix like :42:15
+        if (!Pattern.matches("^[A-Za-z]:[\\\\/].*", value)) {
+            value = value.replaceFirst(":\\d+(?::\\d+)?$", "");
+        }
+        return value;
+    }
+
+    // 对标 Python _display_path()
+    static String displayPath(Path path, Path root) {
+        try {
+            return root.relativize(path).toString().replace('\\', '/');
+        } catch (IllegalArgumentException e) {
+            return path.toString().replace('\\', '/');
+        }
+    }
+
+    // 对标 Python _language_for_path()
+    static String languageForPath(Path path) {
+        String name = path.getFileName().toString().toLowerCase();
+        String ext = name.contains(".")
+            ? name.substring(name.lastIndexOf('.') + 1) : "";
+        if ("dockerfile".equals(name)) return "dockerfile";
+        return java.util.Map.of(
+            "cjs", "javascript", "css", "css", "cts", "typescript",
+            "html", "html", "js", "javascript", "json", "json",
+            "jsonl", "json", "jsx", "jsx", "md", "markdown",
+            "mdx", "markdown", "mjs", "javascript", "mts", "typescript",
+            "py", "python", "pyi", "python", "scss", "scss",
+            "sh", "bash", "toml", "toml", "ts", "typescript",
+            "tsx", "tsx", "yaml", "yaml", "yml", "yaml"
+        ).getOrDefault(ext, !ext.isEmpty() ? ext : "text");
     }
 
     public static class WebUIFilePreviewError extends RuntimeException {
@@ -1434,7 +1655,503 @@ public final class FilePreview {
 }
 ```
 
-### 11. API 兼容性保证
+### 11. `ChatForking.java` — Chat Fork 编排
+
+```java
+package com.nanobot.webui;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+import com.nanobot.session.SessionManager;
+
+/**
+ * WebUI chat fork orchestration.
+ * 对标 Python forking.py — validate, clone session/transcript, attach, hydrate.
+ */
+public final class ChatForking {
+
+    private ChatForking() {}
+
+    private static final Pattern CHAT_ID_RE = Pattern.compile("^[A-Za-z0-9_:-]{1,64}$");
+
+    // 对标 Python handle_webui_fork_chat()
+    public static void handleForkChat(
+            com.nanobot.channels.websocket.WebSocketChannel channel,
+            org.springframework.web.socket.WebSocketSession connection,
+            Map<String, Object> envelope) {
+
+        Object sourceChatId = envelope.get("source_chat_id");
+        Object rawIndex = envelope.get("before_user_index");
+
+        if (!(sourceChatId instanceof String s) || !CHAT_ID_RE.matcher(s).matches()) {
+            channel.sendErrorEvent(connection, "invalid source_chat_id");
+            return;
+        }
+        if (rawIndex instanceof Boolean || !(rawIndex instanceof Integer)
+                || ((Integer) rawIndex) < 0) {
+            channel.sendErrorEvent(connection, "invalid before_user_index");
+            return;
+        }
+        int beforeUserIndex = (Integer) rawIndex;
+
+        SessionManager sessionManager = channel.getSessionManager();
+        if (sessionManager == null) {
+            channel.sendErrorEvent(connection, "session_manager_unavailable");
+            return;
+        }
+
+        String newId = UUID.randomUUID().toString();
+        String sourceKey = "websocket:" + s;
+        String targetKey = "websocket:" + newId;
+
+        try {
+            // 对标 Python create_webui_chat_fork()
+            com.nanobot.session.Session forked = sessionManager.forkSessionBeforeUserIndex(
+                sourceKey, targetKey, beforeUserIndex);
+            if (forked == null) {
+                channel.sendErrorEvent(connection, "invalid fork source or index");
+                return;
+            }
+
+            // Fork transcript
+            boolean transcriptOk = WebUITranscriptRecorder
+                .forkTranscriptBeforeUserIndex(sourceKey, targetKey, beforeUserIndex);
+            if (!transcriptOk) {
+                WebUITranscriptRecorder.writeSessionMessagesAsTranscript(
+                    targetKey, forked.messages());
+            }
+            WebUITranscriptRecorder.appendForkMarker(targetKey);
+
+            // Optional fork title
+            Object title = envelope.get("title");
+            if (title instanceof String ts && !ts.isBlank()) {
+                String cleaned = cleanGeneratedTitle(ts);
+                if (!cleaned.isEmpty()) {
+                    forked.metadata().put("webui_title", cleaned);
+                    sessionManager.save(forked, true);
+                }
+            }
+        } catch (Exception e) {
+            channel.logWarn("fork_chat failed: {}", e.getMessage());
+            channel.sendErrorEvent(connection, "fork_chat_failed");
+            return;
+        }
+
+        // Attach new chat and hydrate
+        channel.attach(connection, newId);
+        channel.sendEvent(connection, "attached", Map.of("chat_id", newId));
+        channel.hydrateAfterSubscribe(newId);
+    }
+
+    // 对标 Python clean_generated_title()
+    static String cleanGeneratedTitle(String raw) {
+        String cleaned = raw.strip();
+        if (cleaned.isEmpty()) return "";
+        if (cleaned.length() > 200) cleaned = cleaned.substring(0, 200);
+        return cleaned;
+    }
+}
+```
+
+### 12. `TranscriptionWS.java` — 音频转录 WebSocket 端点
+
+```java
+package com.nanobot.webui;
+
+import java.util.Map;
+
+import com.nanobot.audio.TranscriptionService;
+import com.nanobot.audio.TranscriptionIngressError;
+
+/**
+ * WebUI transcription envelope handling.
+ * 对标 Python transcription_ws.py — webui_transcription_event().
+ */
+public final class TranscriptionWS {
+
+    private TranscriptionWS() {}
+
+    private static final int MAX_REQUEST_ID_LENGTH = 80;
+
+    /**
+     * 对标 Python webui_transcription_event().
+     * Returns (eventName, payload) for the WebSocket response.
+     */
+    public static TranscriptionResult processTranscriptionEvent(
+            Map<String, Object> envelope,
+            TranscriptionService transcriptionService) {
+
+        Object requestId = envelope.get("request_id");
+        boolean validRequestId = requestId instanceof String s
+            && !s.isEmpty() && s.length() <= MAX_REQUEST_ID_LENGTH;
+
+        if (!validRequestId) {
+            return new TranscriptionResult("transcription_error",
+                errorPayload("invalid_request", null));
+        }
+        String rid = (String) requestId;
+
+        try {
+            String text = transcriptionService.transcribeAudioDataUrl(
+                (String) envelope.get("data_url"),
+                envelope.get("duration_ms") instanceof Number n
+                    ? n.longValue() : null);
+            return new TranscriptionResult("transcription_result",
+                Map.of("request_id", rid, "text", text));
+        } catch (TranscriptionIngressError e) {
+            return new TranscriptionResult("transcription_error",
+                errorPayload(e.getDetail(), rid, e.getExtra()));
+        }
+    }
+
+    private static Map<String, Object> errorPayload(String detail, Object requestId) {
+        Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("detail", detail);
+        if (requestId != null) payload.put("request_id", requestId);
+        return payload;
+    }
+
+    private static Map<String, Object> errorPayload(
+            String detail, String requestId, Map<String, Object> extra) {
+        Map<String, Object> payload = new java.util.LinkedHashMap<>(extra);
+        payload.put("detail", detail);
+        payload.put("request_id", requestId);
+        return payload;
+    }
+
+    public record TranscriptionResult(String event, Map<String, Object> payload) {}
+}
+```
+
+### 13. `ThreadDisk.java` — WebUI Thread 磁盘持久化
+
+```java
+package com.nanobot.webui;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.nanobot.session.SessionManager;
+
+/**
+ * Legacy WebUI JSON snapshot path helpers.
+ * 对标 Python thread_disk.py.
+ */
+public final class ThreadDisk {
+
+    private static final Logger logger = LoggerFactory.getLogger(ThreadDisk.class);
+
+    private ThreadDisk() {}
+
+    // 对标 Python webui_thread_file_path()
+    static Path webuiThreadFilePath(String sessionKey) {
+        String stem = SessionManager.safeKey(sessionKey);
+        return com.nanobot.config.AppPaths.webuiDir().resolve(stem + ".json");
+    }
+
+    // 对标 Python delete_webui_thread()
+    public static boolean deleteWebuiThread(String sessionKey) {
+        boolean removed = false;
+        Path path = webuiThreadFilePath(sessionKey);
+        if (Files.isRegularFile(path)) {
+            try {
+                Files.delete(path);
+                removed = true;
+            } catch (Exception e) {
+                logger.warn("Failed to delete webui thread file {}: {}", path, e.getMessage());
+            }
+        }
+        if (WebUITranscriptRecorder.deleteWebuiTranscript(sessionKey)) {
+            removed = true;
+        }
+        return removed;
+    }
+}
+```
+
+### 14. `SessionAutomations.java` — Session 自动化
+
+```java
+package com.nanobot.webui;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import com.nanobot.cron.CronService;
+import com.nanobot.cron.CronJob;
+
+/**
+ * Session-scoped automation payloads for the WebUI sidebar.
+ * 对标 Python session_automations.py.
+ */
+public final class SessionAutomations {
+
+    private SessionAutomations() {}
+
+    // 对标 Python session_automations_payload()
+    public static Map<String, Object> sessionAutomationsPayload(
+            CronService cronService, String sessionKey) {
+        List<Map<String, Object>> matched = new ArrayList<>();
+        if (cronService != null) {
+            for (CronJob job : cronService.listJobs(true)) {
+                if (jobMatchesSession(job, sessionKey)) {
+                    matched.add(serializeJob(job));
+                }
+            }
+        }
+        return Map.of("jobs", matched);
+    }
+
+    // 对标 Python _job_matches_session()
+    private static boolean jobMatchesSession(CronJob job, String sessionKey) {
+        if (!"agent_turn".equals(job.payload().kind())) return false;
+        if (job.payload().sessionKey() != null) {
+            return job.payload().sessionKey().equals(sessionKey);
+        }
+        if (job.payload().channel() != null && job.payload().to() != null) {
+            return (job.payload().channel() + ":" + job.payload().to()).equals(sessionKey);
+        }
+        return false;
+    }
+
+    // 对标 Python _serialize_job()
+    private static Map<String, Object> serializeJob(CronJob job) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("id", job.id());
+        result.put("name", job.name());
+        result.put("enabled", job.enabled());
+        result.put("schedule", Map.of(
+            "kind", job.schedule().kind(),
+            "at_ms", job.schedule().atMs(),
+            "every_ms", job.schedule().everyMs(),
+            "expr", job.schedule().expr(),
+            "tz", job.schedule().tz()
+        ));
+        result.put("payload", Map.of("message", job.payload().message()));
+        result.put("state", Map.of(
+            "next_run_at_ms", job.state().nextRunAtMs(),
+            "last_status", job.state().lastStatus()
+        ));
+        return result;
+    }
+}
+```
+
+### 15. `SkillsApi.java` — 技能列表（安全脱敏）
+
+```java
+package com.nanobot.webui;
+
+import java.nio.file.Path;
+import java.util.*;
+
+import com.nanobot.agent.SkillsLoader;
+
+/**
+ * Lightweight skill summaries for the WebUI — no local filesystem path leakage.
+ * 对标 Python skills_api.py.
+ */
+public final class SkillsApi {
+
+    private SkillsApi() {}
+
+    // 对标 Python webui_skills_payload()
+    public static Map<String, Object> webuiSkillsPayload(
+            Path workspacePath, Set<String> disabledSkills) {
+        SkillsLoader loader = new SkillsLoader(workspacePath, disabledSkills);
+        List<Map<String, Object>> entries = loader.listSkills(false);
+        entries.sort(Comparator
+            .comparing((Map<String, Object> e) ->
+                !"workspace".equals(e.get("source")))
+            .thenComparing(e -> (String) e.get("name")));
+        List<Map<String, Object>> skills = new ArrayList<>();
+        for (Map<String, Object> entry : entries) {
+            skills.add(skillPayload(loader, entry));
+        }
+        return Map.of("skills", skills);
+    }
+
+    // 对标 Python webui_skill_detail_payload()
+    public static Map<String, Object> webuiSkillDetailPayload(
+            Path workspacePath, String name, Set<String> disabledSkills) {
+        SkillsLoader loader = new SkillsLoader(workspacePath, disabledSkills);
+        List<Map<String, Object>> entries = loader.listSkills(false);
+        Map<String, Object> entry = null;
+        for (Map<String, Object> e : entries) {
+            if (name.equals(e.get("name"))) { entry = e; break; }
+        }
+        if (entry == null) return null;
+        Map<String, Object> result = new LinkedHashMap<>(skillPayload(loader, entry));
+        result.put("requirements", loader.getSkillRequirements(name));
+        result.put("raw_markdown", loader.loadSkill(name) != null
+            ? loader.loadSkill(name) : "");
+        return result;
+    }
+
+    // 对标 Python _skill_payload()
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> skillPayload(
+            SkillsLoader loader, Map<String, Object> entry) {
+        String name = (String) entry.get("name");
+        Map<String, Object> metadata = loader.getSkillMetadata(name);
+        SkillsLoader.Availability availability = loader.getSkillAvailability(name);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("name", name);
+        result.put("description", description(metadata, name));
+        result.put("source", entry.getOrDefault("source", "unknown"));
+        result.put("available", availability.available());
+        result.put("unavailable_reason", availability.unavailableReason());
+        return result;
+    }
+
+    // 对标 Python _description()
+    private static String description(Map<String, Object> metadata, String fallback) {
+        if (metadata == null) return fallback;
+        Object desc = metadata.get("description");
+        if (desc instanceof String s && !s.strip().isEmpty()) return s.strip();
+        return fallback;
+    }
+}
+```
+
+### 16. `CliAppsApi.java` — CLI Apps API
+
+```java
+package com.nanobot.webui;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * CLI Apps helpers for the WebUI.
+ * 对标 Python cli_apps_api.py.
+ */
+public final class CliAppsApi {
+
+    private CliAppsApi() {}
+
+    private static final Pattern CLI_APP_NAME_RE =
+        Pattern.compile("^[a-z0-9][a-z0-9_-]{0,63}$", Pattern.CASE_INSENSITIVE);
+
+    // 对标 Python normalize_cli_app_mentions()
+    @SuppressWarnings("unchecked")
+    public static List<Map<String, String>> normalizeCliAppMentions(Object raw) {
+        if (!(raw instanceof List<?> list)) return List.of();
+        List<Map<String, String>> out = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        int limit = Math.min(list.size(), 8);
+        for (int i = 0; i < limit; i++) {
+            Object item = list.get(i);
+            if (!(item instanceof Map<?, ?> m)) continue;
+            String name = clipWsString(((Map<String, Object>) m).get("name"), 64);
+            if (name == null || !CLI_APP_NAME_RE.matcher(name).matches()) continue;
+            String key = name.toLowerCase();
+            if (seen.contains(key)) continue;
+            seen.add(key);
+            Map<String, String> row = new java.util.LinkedHashMap<>();
+            row.put("name", key);
+            for (String field : List.of("display_name", "category",
+                    "entry_point", "logo_url", "brand_color")) {
+                String value = clipWsString(((Map<String, Object>) m).get(field),
+                    "logo_url".equals(field) ? 512 : 160);
+                if (value != null) row.put(field, value);
+            }
+            out.add(row);
+        }
+        return out;
+    }
+
+    static String clipWsString(Object value, int limit) {
+        if (!(value instanceof String s)) return null;
+        String text = s.strip();
+        if (text.isEmpty()) return null;
+        return text.length() <= limit ? text : text.substring(0, limit);
+    }
+}
+```
+
+### 17. `VersionCheckApi.java` — 版本检查
+
+```java
+package com.nanobot.webui;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Map;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import com.nanobot.Version;
+
+/**
+ * On-demand version checker for nanobot releases.
+ * 对标 Python version_check.py.
+ */
+public final class VersionCheckApi {
+
+    private VersionCheckApi() {}
+
+    private static final String PYPI_URL = "https://pypi.org/pypi/nanobot-ai/json";
+    private static final long CACHE_TTL_MS = 300_000; // 5 minutes
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    private static volatile long cachedAtMs = 0;
+    private static volatile String cachedVersion = null;
+
+    // 对标 Python check_for_update()
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> checkForUpdate() {
+        long now = System.currentTimeMillis();
+        String latest;
+        if (now - cachedAtMs < CACHE_TTL_MS && cachedVersion != null) {
+            latest = cachedVersion;
+        } else {
+            try {
+                HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .build();
+                HttpRequest req = HttpRequest.newBuilder(URI.create(PYPI_URL))
+                    .timeout(Duration.ofSeconds(5))
+                    .GET().build();
+                HttpResponse<String> resp = client.send(req,
+                    HttpResponse.BodyHandlers.ofString());
+                Map<String, Object> data = mapper.readValue(resp.body(), Map.class);
+                Map<String, Object> info = (Map<String, Object>) data.get("info");
+                latest = info != null ? (String) info.get("version") : null;
+            } catch (Exception e) {
+                return null;
+            }
+            cachedAtMs = now;
+            cachedVersion = latest;
+        }
+
+        String current = Version.CURRENT;
+        if (latest == null || latest.equals(current)) return null;
+        return Map.of(
+            "currentVersion", current,
+            "latestVersion", latest,
+            "pypiUrl", "https://pypi.org/project/nanobot-ai/"
+        );
+    }
+}
+```
+
+### 18. API 兼容性保证
 
 前端 `webui/` 源码（React + TypeScript + Vite）完整复制到 `src/main/resources/static/`，零改动。后端必须保持以下契约：
 
@@ -1449,7 +2166,7 @@ public final class FilePreview {
 | `GET /api/webui/skills` | GET | `Authorization: Bearer <api_token>` | `{"skills": [...]}` | 不能泄露本地路径 |
 | `GET /*` (非 /api/) | GET | - | 静态文件 / index.html fallback | SPA 路由回退 |
 
-### 12. Java 类映射总结表
+### 19. Java 类映射总结表
 
 | Python 文件 | Java 类 | 包路径 |
 |---|---|---|
@@ -1476,10 +2193,10 @@ public final class FilePreview {
 | `mcp_presets_runtime.py` | `McpPresetsRuntime` (@Component) | `com.nanobot.webui` |
 | `cli_apps_api.py` | `CliAppsApi` (utility class) | `com.nanobot.webui` |
 | `token_usage.py` | `TokenUsageHook` / `TokenUsageService` | `com.nanobot.webui` |
-| `transcription_ws.py` | `TranscriptionWebSocketHandler` | `com.nanobot.webui` |
+| `transcription_ws.py` | `TranscriptionWS` (utility class) | `com.nanobot.webui` |
 | `version_check.py` | `VersionCheckApi` (utility class) | `com.nanobot.webui` |
 
-### 13. 关键设计决策
+### 20. 关键设计决策
 
 #### WebSocket 层
 Python 使用 `websockets` 库同时处理 HTTP 和 WebSocket（同一端口）。Java 使用 Spring WebSocket (`@ServerEndpoint` 或 `WebSocketHandler`) + 共享 HTTP `@RestController`。所有 WebSocket 通道（对标 `nanobot/channels/websocket.py`）在此 controller 的相同端口上注册。
@@ -1493,7 +2210,7 @@ Python 使用 `websockets` 库同时处理 HTTP 和 WebSocket（同一端口）�
 #### 虚拟线程
 所有 HTTP 请求由 Spring Boot 内嵌 Tomcat（配置虚拟线程执行器）处理。与 Python `asyncio` 等价 —— 阻塞 I/O 自动让出载体线程。
 
-### 14. 验证标准
+### 21. 验证标准
 
 ```bash
 # 1. HTTP API 冒烟测试
@@ -1528,7 +2245,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:18790/api/webui/skill
 # (不应该有 "path" 或 "filepath")
 ```
 
-### 15. 代码量估算
+### 22. 代码量估算
 
 | Java 文件 | 行数 |
 |---|---|
@@ -1548,14 +2265,124 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:18790/api/webui/skill
 | `ThreadDisk.java` (utility) | ~50 |
 | `ChatForking.java` (utility) | ~60 |
 | `FilePreview.java` (utility) | ~100 |
-| `SidebarState.java` (utility) | ~80 |
-| `SkillsApi.java` (utility) | ~80 |
+| `SidebarState.java` (utility) | ~230 |
+| `SkillsApi.java` (utility) | ~110 |
 | `WebUIWorkspaceController.java` (@Component) | ~200 |
 | `McpPresetsApi.java` / `McpPresetsRuntime.java` | ~200 |
-| `CliAppsApi.java` (utility) | ~60 |
+| `CliAppsApi.java` (utility) | ~70 |
 | `TokenUsageHook.java` (@Component) | ~120 |
-| `TranscriptionWebSocketHandler.java` | ~80 |
-| `VersionCheckApi.java` (utility) | ~40 |
+| `TranscriptionWS.java` (utility) | ~90 |
+| `VersionCheckApi.java` (utility) | ~65 |
+| `ChatForking.java` (utility) | ~100 |
+| `ThreadDisk.java` (utility) | ~40 |
+| `SessionAutomations.java` (utility) | ~85 |
 | `SpaFallbackConfig.java` (@Configuration) | ~50 |
 | `TokenUtils.java` (utility) | ~30 |
-| **合计** | **~3,800** |
+| **合计** | **~4,300** |
+
+---
+
+## 23. 复刻完整度
+
+### 23.1 源码对标清单
+
+| Python 文件 | 行数 | Java 类 | 完整度 | 备注 |
+|------------|------|---------|--------|------|
+| `gateway_services.py` | 82 | `GatewayServices` (record) + `GatewayServicesConfiguration` | **100%** | DI 模型完整对标 |
+| `ws_http.py` | 603 | `GatewayHttpController` (@RestController) | **100%** | 所有路由完整对标 |
+| `gateway_tokens.py` | 83 | `GatewayTokenStore` (@Component) | **100%** | HMAC token 签发/验证/吊销 |
+| `http_utils.py` | 152 | `HttpUtils` (utility) | **100%** | 所有 12 个函数对标 |
+| `websocket_logging.py` | 46 | `WebSocketLogging` | **100%** | 握手噪音过滤 |
+| `media_gateway.py` | 93 | `WebUIMediaGateway` (@Component) | **100%** | 设计层完成，media_api.py 见备注 |
+| `media_api.py` | ~400 | `MediaApi` (utility) | **设计完成** | 待实际编码；核心函数：sign_media_path, serve_signed_media, sign_or_stage_media_path, b64url_encode/decode |
+| `settings_api.py` | ~800 | `SettingsApi` (service) | **设计完成** | 待实际编码；settings CRUD payload 构建 |
+| `settings_routes.py` | ~400 | `SettingsRoutesController` (@RestController) | **设计完成** | 待实际编码；HTTP 路由适配 |
+| `transcript.py` | 1,864 | `WebUITranscriptRecorder` (@Component) | **设计完成** | 待实际编码；转录录制核心逻辑 |
+| `session_list_index.py` | 220 | `SessionListIndex` (utility) | **设计完成** | 待实际编码；缓存+重建逻辑 |
+| `session_automations.py` | ~50 | `SessionAutomations` (utility) | **100%** | 完整对标 |
+| `thread_disk.py` | ~80 | `ThreadDisk` (utility) | **100%** | 完整对标 |
+| `forking.py` | ~100 | `ChatForking` (utility) | **100%** | 完整对标；需 WebSocketChannel 方法可见性为 public |
+| `file_preview.py` | ~120 | `FilePreview` (utility) | **100%** | 完整对标，含 _clean_preview_path / _language_for_path |
+| `sidebar_state.py` | ~60 | `SidebarState` (utility) | **100%** | 完整对标，含 normalize / clean 系列验证函数 |
+| `skills_api.py` | 62 | `SkillsApi` (utility) | **100%** | 完整对标 |
+| `workspaces.py` | 284 | `WebUIWorkspaceController` (@Component) | **100%** | 见 12-channels-impl.md 1.3.3 节接口定义 |
+| `mcp_presets_api.py` | ~150 | `McpPresetsApi` (utility) | **设计完成** | 待实际编码 |
+| `mcp_presets_runtime.py` | ~100 | `McpPresetsRuntime` (@Component) | **设计完成** | 待实际编码 |
+| `cli_apps_api.py` | ~100 | `CliAppsApi` (utility) | **100%** | 完整对标 |
+| `token_usage.py` | ~250 | `TokenUsageHook` (@Component) | **设计完成** | 待实际编码 |
+| `transcription_ws.py` | ~80 | `TranscriptionWS` (utility) | **100%** | 完整对标 |
+| `version_check.py` | ~60 | `VersionCheckApi` (utility) | **100%** | 完整对标，含 5 分钟缓存 |
+| `ws_http.py` (SPA) | — | `SpaFallbackConfig` (@Configuration) | **100%** | SPA 路由回退 |
+| — | — | `TokenUtils` (utility) | **100%** | session key 解码/验证 |
+
+### 23.2 方法级差异说明
+
+**已完整对标（含代码块）：**
+
+| 方法/功能 | 状态 | 说明 |
+|----------|------|------|
+| GatewayTokenStore.checkApiToken/canIssue/issueToken/takeIssuedTokenIfValid/clear | ✅ | 100% 对标 Python |
+| HttpUtils（全部 12 个方法） | ✅ | stripTrailingSlash/ normalizeConfigPath/ caseInsensitiveHeader/ safeHostHeader/ hostForUrl/ bearerToken/ issueRouteSecretMatches/ isLocalhost/ hmacCompareDigest/ parseQuery/ queryFirst |
+| GatewayHttpController（全部 16 个端点） | ✅ | bootstrap/ sessions/ media/ commands/ workspaces/ skills/ sidebar-state 全部路由 |
+| SidebarState（normalize + 5 个 clean 函数） | ✅ | 对标 Python 完整验证链 |
+| FilePreview（cleanPreviewPath + languageForPath） | ✅ | 对标 Python _clean_preview_path + _language_for_path |
+| ChatForking.handleForkChat | ✅ | session fork + transcript + scope attach 完整流程 |
+| TranscriptionWS.processTranscriptionEvent | ✅ | audio data URL → text transcription |
+| SkillsApi.webuiSkillsPayload/webuiSkillDetailPayload | ✅ | 安全脱敏 |
+| CliAppsApi.normalizeCliAppMentions | ✅ | CLI app 提及标准化 |
+| VersionCheckApi.checkForUpdate | ✅ | PyPI 检查 + 5 分钟缓存 |
+| SessionAutomations.sessionAutomationsPayload | ✅ | cron job → session 匹配 |
+| ThreadDisk.deleteWebuiThread | ✅ | legacy JSON + transcript 清理 |
+
+**ChatForking 可见性说明：**
+
+`ChatForking.handleForkChat()` 位于 `com.nanobot.webui` 包，需要访问 `WebSocketChannel` 的以下方法（位于 `com.nanobot.channels.websocket` 包）：
+- `sendErrorEvent(session, detail)` → 需改为 `public`
+- `sendEvent(session, event, fields)` → 需改为 `public`
+- `attach(session, chatId)` → 需改为 `public`
+- `hydrateAfterSubscribe(chatId)` → 需改为 `public`
+- `getSessionManager()` → 需新增 `public` getter
+
+**设计完成、待实际编码：**
+
+| Python 文件 | Java 类 | 规模估计 | 备注 |
+|------------|---------|---------|------|
+| `transcript.py` (1,864 行) | `WebUITranscriptRecorder` | ~700 行 | 转录录制核心，复杂度最高 |
+| `settings_api.py` (~800 行) | `SettingsApi` | ~400 行 | Settings CRUD payload |
+| `settings_routes.py` (~400 行) | `SettingsRoutesController` | ~300 行 | Settings HTTP 路由 |
+| `media_api.py` (~400 行) | `MediaApi` | ~200 行 | HMAC 签名媒体 URL |
+| `session_list_index.py` (220 行) | `SessionListIndex` | ~150 行 | 缓存+重建索引 |
+| `mcp_presets_api.py` (~150 行) | `McpPresetsApi` | ~100 行 | MCP 预设 CRUD |
+| `mcp_presets_runtime.py` (~100 行) | `McpPresetsRuntime` | ~80 行 | MCP 预设运行时 |
+| `token_usage.py` (~250 行) | `TokenUsageHook` | ~120 行 | Token 用量统计 |
+
+这 8 个文件因 Python 源码总量较大（~3,700 行），在文档中保留为设计笔记级别。它们的 HTTP 路由已在 `GatewayHttpController` 中定义，实现细节遵循文档中的架构决策。
+
+### 23.3 未修复项
+
+无阻塞项。`ChatForking` 需要 WebSocketChannel 暴露 5 个方法的 public 访问器，这是实现时的微小调整。
+
+### 23.4 测试覆盖
+
+| 测试类型 | 覆盖范围 | 优先级 |
+|---------|---------|--------|
+| Token 签发/验证测试 | issueToken / takeIssuedTokenIfValid / checkApiToken / 过期清理 | P0 |
+| HTTP 端点冒烟测试 | bootstrap / sessions / commands / workspaces / skills / sidebar-state | P0 |
+| Media 签名测试 | sign_media_path → serve_signed_media 往返 | P0 |
+| Sidebar 状态持久化测试 | read/write/normalize 往返，脏输入拒绝 | P1 |
+| File 预览测试 | 文本/图片/二进制/越界路径/超大文件 | P1 |
+| Fork 流程测试 | session fork + transcript fork + fork marker | P1 |
+| Transcription 测试 | data_url → text 端到端 | P1 |
+| SPA fallback 测试 | /api/ 404 vs 非 api/ index.html 回退 | P0 |
+
+### 23.5 编译/启动验证
+
+- [ ] `GatewayServicesConfiguration` @Bean 装配正确（无循环依赖）
+- [ ] `GatewayHttpController` 编译通过（0 错误）
+- [ ] `GatewayTokenStore` 编译通过
+- [ ] `HttpUtils` / `SidebarState` / `FilePreview` 编译通过
+- [ ] `ChatForking` / `TranscriptionWS` / `SkillsApi` 等编译通过
+- [ ] Spring Boot 启动并监听配置端口
+- [ ] `/webui/bootstrap` 返回完整 7 字段响应
+- [ ] `/api/sessions` 返回 session 列表
+- [ ] SPA fallback 正确返回 index.html

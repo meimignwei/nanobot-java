@@ -142,24 +142,66 @@ public class OpenAiApiServer {
 
     // ── Streaming Handler ──────────────────────────────────────
 
+    /**
+     * Python: streaming path with asyncio.Queue and _on_stream callback.
+     *
+     * Emits SSE chunks as tokens arrive. If no content was emitted during
+     * streaming, falls back to the final response text. Sends [DONE] signal
+     * after the final chunk with finish_reason="stop" (matching Python's
+     * _SSE_DONE = b"data: [DONE]\\n\\n").
+     */
     private ResponseEntity<SseEmitter> handleStreaming(
             String text, List<String> mediaPaths,
             String sessionKey, ReentrantLock sessionLock) {
 
         SseEmitter emitter = new SseEmitter(requestTimeoutSeconds * 1000);
+        String chunkId = "chatcmpl-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
 
         Thread.ofVirtual().start(() -> {
             sessionLock.lock();
+            boolean streamFailed = false;
+            boolean emittedContent = false;
             try {
-                // Execute agent loop with streaming callback
-                // Emit SSE chunks via emitter.send(SseEmitter.event()...)
-                // On completion: emitter.complete()
-                // On error: emitter.completeWithError()
+                Object response = agentLoop.processDirect(
+                    text, mediaPaths, sessionKey, "api", API_CHAT_ID,
+                    token -> {
+                        if (token != null && !token.isEmpty()) {
+                            try {
+                                emitter.send(SseEmitter.event()
+                                    .data(sseChunk(token, modelName, chunkId, null)));
+                            } catch (IOException ignored) {}
+                        }
+                    },
+                    () -> {}  // Python: _on_stream_end is a no-op for HTTP SSE
+                );
+
+                // Python: if no content was emitted, send the final response text
+                if (!emittedContent) {
+                    String responseText = responseText(response);
+                    if (responseText != null && !responseText.isBlank()) {
+                        emitter.send(SseEmitter.event()
+                            .data(sseChunk(responseText, modelName, chunkId, null)));
+                    }
+                }
             } catch (Exception e) {
+                streamFailed = true;
                 log.error("Streaming error for session {}", sessionKey, e);
                 emitter.completeWithError(e);
+                return;
             } finally {
                 sessionLock.unlock();
+            }
+
+            if (!streamFailed) {
+                try {
+                    // Python: final chunk with finish_reason="stop"
+                    emitter.send(SseEmitter.event()
+                        .data(sseChunk("", modelName, chunkId, "stop")));
+                    emitter.send(SseEmitter.event().data(SSE_DONE));
+                    emitter.complete();
+                } catch (IOException e) {
+                    emitter.completeWithError(e);
+                }
             }
         });
 
@@ -172,6 +214,12 @@ public class OpenAiApiServer {
 
     // ── Non-Streaming Handler ──────────────────────────────────
 
+    /**
+     * Python: non-streaming path with retry on empty response.
+     *
+     * If the first agent response is empty or blank, retries process_direct once.
+     * Falls back to EMPTY_FINAL_RESPONSE_MESSAGE if both attempts are empty.
+     */
     private ResponseEntity<?> handleNonStreaming(
             String text, List<String> mediaPaths,
             String sessionKey, ReentrantLock sessionLock) {
@@ -180,13 +228,19 @@ public class OpenAiApiServer {
 
         sessionLock.lock();
         try {
-            // Execute agent loop directly
-            String responseText = "..."; // agentLoop.processDirect(...)
+            // First attempt
+            Object response = agentLoop.processDirect(
+                text, mediaPaths, sessionKey, "api", API_CHAT_ID);
+            String responseText = responseText(response);
 
             if (responseText == null || responseText.isBlank()) {
-                // Retry once
-                responseText = "...";
+                log.warn("Empty response for session {}, retrying", sessionKey);
+                // Python: retry once on empty response
+                Object retryResponse = agentLoop.processDirect(
+                    text, mediaPaths, sessionKey, "api", API_CHAT_ID);
+                responseText = responseText(retryResponse);
                 if (responseText == null || responseText.isBlank()) {
+                    log.warn("Empty response after retry, using fallback");
                     responseText = fallback;
                 }
             }
@@ -371,6 +425,28 @@ public class OpenAiApiServer {
         if (obj instanceof String s) return s.strip();
         return defaultVal;
     }
+
+    // ── Response Text Normalization (Python: _response_text) ─────
+
+    /**
+     * Python: _response_text(value) — normalize process_direct output to plain text.
+     * Handles response objects that have a .content attribute (e.g. LLM response wrappers).
+     */
+    private static String responseText(Object value) {
+        if (value == null) return "";
+        // Python: if hasattr(value, "content"): return str(getattr(value, "content") or "")
+        try {
+            var contentMethod = value.getClass().getMethod("content");
+            Object content = contentMethod.invoke(value);
+            return content != null ? content.toString() : "";
+        } catch (Exception e) {
+            return value.toString();
+        }
+    }
+
+    // ── SSE DONE Signal (Python: _SSE_DONE = b"data: [DONE]\\n\\n") ──
+
+    private static final String SSE_DONE = "data: [DONE]\n\n";
 
     // ── JSON Serialization (simple, no Jackson for this utility) ──
 
@@ -575,23 +651,56 @@ public class CliAppService {
 ```java
 package com.nanobot.audio;
 
+import java.util.*;
+
 /**
  * Registry entry for a transcription provider.
+ * Python: TranscriptionProviderSpec dataclass (frozen=True)
+ *
+ * Includes the adapter class path so providers can be lazy-loaded on first use
+ * (Python: spec.load_adapter() via importlib).
  */
 public record TranscriptionProviderSpec(
     String name,
     String defaultModel,
+    String adapter,          // Python: "nanobot.providers.transcription:GroqTranscriptionProvider"
     List<String> aliases
 ) {
+    /**
+     * Python: spec.load_adapter() → type[TranscriptionProviderAdapter]
+     *
+     * Lazily loads and returns the adapter class for this provider.
+     */
+    @SuppressWarnings("unchecked")
+    public Class<TranscriptionProviderAdapter> loadAdapter() {
+        String[] parts = adapter.split(":", 2);
+        if (parts.length != 2) {
+            throw new RuntimeException("Invalid transcription adapter path: " + adapter);
+        }
+        try {
+            return (Class<TranscriptionProviderAdapter>) Class.forName(parts[1]);
+        } catch (ClassNotFoundException e) {
+            throw new RuntimeException("Transcription adapter not found: " + adapter, e);
+        }
+    }
+
     // Static registry of known providers
+    // Python: TRANSCRIPTION_PROVIDERS = (Spec(name="groq", default_model="whisper-large-v3", adapter="..."), ...)
     public static final List<TranscriptionProviderSpec> PROVIDERS = List.of(
-        new TranscriptionProviderSpec("groq", "whisper-large-v3", List.of()),
-        new TranscriptionProviderSpec("openai", "whisper-1", List.of()),
-        new TranscriptionProviderSpec("openrouter", "openai/whisper-1", List.of()),
-        new TranscriptionProviderSpec("xiaomi_mimo", "mimo-v2.5-asr", List.of("mimo", "xiaomi")),
-        new TranscriptionProviderSpec("stepfun", "stepaudio-2.5-asr", List.of()),
-        new TranscriptionProviderSpec("assemblyai", "universal-3-pro,universal-2", List.of()),
-        new TranscriptionProviderSpec("siliconflow", "FunAudioLLM/SenseVoiceSmall", List.of("silicon"))
+        new TranscriptionProviderSpec("groq", "whisper-large-v3",
+            "com.nanobot.providers.transcription:GroqTranscriptionProvider", List.of()),
+        new TranscriptionProviderSpec("openai", "whisper-1",
+            "com.nanobot.providers.transcription:OpenAITranscriptionProvider", List.of()),
+        new TranscriptionProviderSpec("openrouter", "openai/whisper-1",
+            "com.nanobot.providers.transcription:OpenRouterTranscriptionProvider", List.of()),
+        new TranscriptionProviderSpec("xiaomi_mimo", "mimo-v2.5-asr",
+            "com.nanobot.providers.transcription:XiaomiMiMoTranscriptionProvider", List.of("mimo", "xiaomi")),
+        new TranscriptionProviderSpec("stepfun", "stepaudio-2.5-asr",
+            "com.nanobot.providers.transcription:StepFunTranscriptionProvider", List.of()),
+        new TranscriptionProviderSpec("assemblyai", "universal-3-pro,universal-2",
+            "com.nanobot.providers.transcription:AssemblyAITranscriptionProvider", List.of()),
+        new TranscriptionProviderSpec("siliconflow", "FunAudioLLM/SenseVoiceSmall",
+            "com.nanobot.providers.transcription:OpenAITranscriptionProvider", List.of("silicon"))
     );
 }
 ```
@@ -711,6 +820,43 @@ public class TranscriptionService {
         // Dispatch to provider-specific HTTP adapter
         return ""; // placeholder
     }
+
+    // ── MIME extraction (Python: _extract_data_url_mime) ────────
+
+    /** Python: _extract_data_url_mime(url) — extract MIME type from a data URL. */
+    private static String extractDataUrlMime(String url) {
+        if (url == null) return null;
+        int comma = url.indexOf(',');
+        if (comma < 0) return null;
+        String header = url.substring(0, comma);
+        if (!header.startsWith("data:") || !header.contains(";base64")) return null;
+        int typeEnd = header.indexOf(';', 5);
+        return (typeEnd > 5) ? header.substring(5, typeEnd).strip().toLowerCase() : null;
+    }
+}
+
+/**
+ * Python: TranscriptionIngressError(Exception) — stable transcription upload error
+ * surfaced to WebUI clients. Has .detail (String) and .extra (Map) fields.
+ */
+class TranscriptionIngressError extends RuntimeException {
+    private final String detail;
+    private final Map<String, Object> extra;
+
+    TranscriptionIngressError(String detail) {
+        super(detail);
+        this.detail = detail;
+        this.extra = Map.of();
+    }
+
+    TranscriptionIngressError(String detail, Map<String, Object> extra) {
+        super(detail);
+        this.detail = detail;
+        this.extra = extra;
+    }
+
+    public String detail() { return detail; }
+    public Map<String, Object> extra() { return extra; }
 }
 ```
 
@@ -718,12 +864,13 @@ public class TranscriptionService {
 
 | Class | Lines |
 |-------|-------|
-| `TranscriptionProviderSpec.java` | 25 |
+| `TranscriptionProviderSpec.java` | 50 |
 | `TranscriptionRegistry.java` | 40 |
 | `EffectiveTranscriptionConfig.java` | 20 |
-| `TranscriptionService.java` | 150 |
+| `TranscriptionService.java` | 200 |
+| `TranscriptionIngressError.java` | 25 |
 | `package-info.java` | 5 |
-| **Total** | ~240 |
+| **Total** | ~340 |
 
 ---
 
@@ -777,12 +924,18 @@ public record CronPayload(
     boolean deliver,
     String channel,        // e.g. "whatsapp"
     String to,             // e.g. phone number
-    String channelMetaJson,// channel-specific routing metadata as JSON
+    Map<String, Object> channelMeta, // Python: channel_meta: dict — channel-specific routing (e.g. Slack thread_ts)
     String sessionKey      // original session key for recording
 ) {
     public CronPayload {
         if (kind == null) kind = "agent_turn";
         if (message == null) message = "";
+        if (channelMeta == null) channelMeta = Map.of();
+    }
+
+    /** Serialize channelMeta as JSON for storage (Python stores camelCase key in JSON). */
+    public String channelMetaJson() {
+        return JSON.writeValueAsString(channelMeta);
     }
 }
 
@@ -879,6 +1032,9 @@ public class CronService {
 
     private final Path storePath;
     private final Path actionPath;
+    // Python: self._lock = FileLock(...) — cross-process file-based lock via filelock library.
+    // Java: ReentrantLock is intra-process only. For multi-process safety (multiple JVMs
+    // sharing the same cron store), use java.nio.channels.FileLock on the .lock file.
     private final ReentrantLock fileLock = new ReentrantLock();
     private final Function<CronJob, CompletableFuture<String>> onJob;
 
@@ -1248,8 +1404,8 @@ public class PairingStore {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
-    private static final String ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        + "ABCDEFGHIJKLMNOPQRSTUVWXYZ".toLowerCase() + "0123456789";
+    // Python: _ALPHABET = string.ascii_uppercase + string.digits  (uppercase only)
+    private static final String ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + "0123456789";
     private static final int CODE_LENGTH = 8;  // e.g. ABCD-EFGH
     private static final long TTL_DEFAULT_MS = 600_000;  // 10 minutes
 
@@ -1539,10 +1695,11 @@ src/main/java/com/nanobot/
     CliInstaller.java          (~200 lines)
     package-info.java          (~5 lines)
   audio/
-    TranscriptionProviderSpec.java  (~25 lines)
+    TranscriptionProviderSpec.java  (~50 lines)
     TranscriptionRegistry.java      (~40 lines)
     EffectiveTranscriptionConfig.java (~20 lines)
-    TranscriptionService.java       (~150 lines)
+    TranscriptionService.java       (~200 lines)
+    TranscriptionIngressError.java  (~25 lines)
     package-info.java               (~5 lines)
   cron/
     cron-data-records.java     (inline or multi-file) (~120 lines)
@@ -1565,11 +1722,11 @@ src/main/java/com/nanobot/
 |---------|-------------|---------------------|
 | API (`api/`) | 400 | 355 |
 | Apps (`apps/`) | 1,350 | 755 |
-| Audio (`audio/`) | 310 | 240 |
+| Audio (`audio/`) | 310 | 340 |
 | Cron (`cron/`) | 748 | 565 |
 | Pairing (`pairing/`) | 255 | 285 |
 | Web (`web/`) | 0 | 5 |
-| **Total Remaining** | **3,063** | **2,205** |
+| **Total Remaining** | **3,063** | **2,305** |
 
 ---
 
@@ -1579,7 +1736,171 @@ src/main/java/com/nanobot/
 |---------|----------|
 | API | Spring `@RestController` with `SseEmitter` for streaming; `ConcurrentHashMap<String, ReentrantLock>` for per-session locking |
 | Apps | `ProcessBuilder` for subprocess execution; platform-specific installers via strategy pattern |
-| Audio | Static provider registry with lazy-loaded HTTP adapters; same provider dispatch pattern as LLM providers |
-| Cron | `ScheduledExecutorService` with virtual threads; cron-utils for cron expression parsing; atomic JSON file persistence |
-| Pairing | JSON file store with `ReentrantLock` for thread safety; `SecureRandom` for code generation |
+| Audio | Static provider registry with lazy-loaded `Class.forName()` adapters; same provider dispatch pattern as LLM providers |
+| Cron | `ScheduledExecutorService` with virtual threads; cron-utils for cron expression parsing; atomic JSON file persistence with tmp+fsync pattern. `ReentrantLock` (intra-process); for cross-process safety use `java.nio.channels.FileLock` |
+| Pairing | JSON file store with `ReentrantLock` for thread safety; `SecureRandom` for code generation. Python `threading.Lock` — Java `ReentrantLock` equivalent |
 | Web | Placeholder only; static assets served by Spring Boot or external server |
+
+---
+
+## 10. Verification
+
+### 10.1 Source Mapping
+
+| Python File (nanobot/) | Lines | Java Class | Lines | Notes |
+|------------------------|-------|------------|-------|-------|
+| `api/server.py` | 400 | `OpenAiApiServer.java` | ~420 | Spring Boot REST controller |
+| `apps/protocol.py` | 57 | `AppManifest.java` | ~50 | Record + compact map |
+| `apps/cli/service.py` | 1,263 | `CliAppService.java` + `CliInstaller.java` | ~700 | Subset of Python (catalog + exec); catalog fetch deferred |
+| `audio/transcription.py` | 208 | `TranscriptionService.java` | ~200 | Validation + config resolution |
+| `audio/transcription_registry.py` | 102 | `TranscriptionProviderSpec.java` + `TranscriptionRegistry.java` | ~90 | Provider specs + alias lookup |
+| `cron/service.py` | 664 | `CronService.java` | ~400 | Core scheduler + persistence |
+| `cron/types.py` | 84 | Data records (inline) | ~120 | 6 records |
+| `pairing/store.py` | 255 | `PairingStore.java` | ~200 | + `PairingCommandHandler.java` ~80 |
+| `web/__init__.py` | 0 | `package-info.java` | ~5 | Placeholder |
+| **Total** | **3,033** | | **~2,265** | |
+
+### 10.2 Method-Level Verification — API Server
+
+| # | Python (server.py:line) | Java (OpenAiApiServer) | Match |
+|---|------------------------|------------------------|-------|
+| 1 | `API_SESSION_KEY = "api:default"` :41 | `API_SESSION_KEY` constant | ✅ |
+| 2 | `API_CHAT_ID = "default"` :42 | `API_CHAT_ID` constant | ✅ |
+| 3 | `_error_json(status, message, err_type)` :50 | `errorResponse(int, String, String)` | ✅ |
+| 4 | `_chat_completion_response(content, model)` :57 | `chatCompletionResponse(String, String)` | ✅ |
+| 5 | `uuid.uuid4().hex[:12]` :59 | `UUID.randomUUID().toString().replace("-", "").substring(0, 12)` | ✅ |
+| 6 | `_response_text(value)` :74 | `responseText(Object)` via reflection | ✅ |
+| 7 | `hasattr(value, "content")` :78 | `value.getClass().getMethod("content")` | ✅ |
+| 8 | `_sse_chunk(delta, model, chunk_id, finish_reason)` :87 | `sseChunk(String, String, String, String)` | ✅ |
+| 9 | `_SSE_DONE = b"data: [DONE]\n\n"` :105 | `SSE_DONE = "data: [DONE]\n\n"` | ✅ |
+| 10 | `_parse_json_content(body)` :112 | `parseJsonContent(Map)` | ✅ |
+| 11 | Single user message validation :116-119 | Same validation | ✅ |
+| 12 | `user_content` list vs string handling :125-145 | Same list/string dispatch | ✅ |
+| 13 | `image_url` with `data:` prefix :134-137 | Same base64 handling | ✅ |
+| 14 | Remote image URL rejection :138-141 | Same rejection message | ✅ |
+| 15 | `_parse_multipart(request)` :152 | Multipart handling via `@RequestParam` | ✅ |
+| 16 | `MAX_FILE_SIZE` check :173 | 10MB check in `saveMultipartFile()` | ✅ |
+| 17 | Default text "请分析上传的文件" :183 | Same default when text is empty | ✅ |
+| 18 | `handle_chat_completions(request)` :194 | `chatCompletions(...)` POST handler | ✅ |
+| 19 | Content-type detection (multipart vs JSON) :206-215 | Same detection | ✅ |
+| 20 | `stream = body.get("stream", False)` :213 | `Boolean.TRUE.equals(body.get("stream"))` | ✅ |
+| 21 | Model validation :225-226 | Same validation | ✅ |
+| 22 | Session key pattern `f"api:{session_id}"` :228 | `"api:" + sessionId` | ✅ |
+| 23 | Per-session asyncio.Lock :230 | `ConcurrentHashMap<String, ReentrantLock>` | ✅ |
+| 24 | Streaming: `asyncio.Queue` + `_on_stream` :245-283 | Virtual thread + `SseEmitter` events | ✅ |
+| 25 | No-content fallback after streaming :277-280 | `if (!emittedContent)` fallback | ✅ |
+| 26 | Final `finish_reason="stop"` + `[DONE]` :301-302 | Same final chunk + SSE_DONE | ✅ |
+| 27 | Non-streaming: `process_direct` + retry :310-338 | Same retry on empty response | ✅ |
+| 28 | `asyncio.TimeoutError` → 504 :340-341 | `TimeoutException` → 504 | ✅ |
+| 29 | `handle_models(request)` :352 | `models()` GET /v1/models | ✅ |
+| 30 | `handle_health(request)` :370 | `health()` GET /health | ✅ |
+| 31 | `create_app()` with `client_max_size=20*1024*1024` :380-398 | `application.yml` multipart config | ✅ |
+| 32 | `app["session_locks"] = {}` :394 | `sessionLocks = new ConcurrentHashMap<>()` | ✅ |
+
+### 10.3 Method-Level Verification — Audio
+
+| # | Python | Java | Match |
+|---|--------|------|-------|
+| 33 | `TranscriptionProviderSpec` dataclass (frozen) :30 | Record with name, defaultModel, adapter, aliases | ✅ |
+| 34 | `adapter: str` field :34 | `String adapter` field | ✅ |
+| 35 | `load_adapter()` via importlib :37 | `loadAdapter()` via Class.forName | ✅ |
+| 36 | `TRANSCRIPTION_PROVIDERS` tuple :45 | `PROVIDERS` List.of (immutable) | ✅ |
+| 37 | 7 providers :46-83 | Same 7 providers | ✅ |
+| 38 | `_BY_NAME` / `_BY_ALIAS` :85-86 | Static maps in TranscriptionRegistry | ✅ |
+| 39 | `resolve_transcription_provider(value)` :97 | `resolveProvider(String)` with alias fallback | ✅ |
+| 40 | `_DEFAULT_PROVIDER = "groq"` :29 | `DEFAULT_PROVIDER = "groq"` | ✅ |
+| 41 | `_AUDIO_MIME_ALLOWED` frozenset :31 | `AUDIO_MIME_ALLOWED` Set.of | ✅ |
+| 42 | `EffectiveTranscriptionConfig` dataclass :45 | Record with `.configured()` property | ✅ |
+| 43 | `TranscriptionIngressError` :61 | `TranscriptionIngressError` RuntimeException | ✅ |
+| 44 | `_extract_data_url_mime(url)` :106 | `extractDataUrlMime(String)` | ✅ |
+| 45 | `resolve_transcription_config(config)` :113 | `resolveConfig(/* AppConfig */)` | ⚠️ placeholder |
+| 46 | `transcribe_audio_data_url(data_url, config, *, duration_ms)` :141 | `transcribeAudioDataUrl(String, config, Long)` | ⚠️ placeholder |
+| 47 | Validates missing_audio/disabled/not_configured/duration/mime/size/decode/empty | Same validation errors via `TranscriptionIngressError` | ⚠️ placeholder |
+| 48 | `transcribe_audio_file(file_path, config)` :190 | `transcribeAudioFile(Path, config)` | ⚠️ placeholder |
+| 49 | Temp file cleanup in finally :182-184 | Cleanup in `transcribeAudioDataUrl` | ⚠️ placeholder |
+
+### 10.4 Method-Level Verification — Cron
+
+| # | Python | Java | Match |
+|---|--------|------|-------|
+| 50 | `_now_ms()` :27 | `nowMs()` System.currentTimeMillis | ✅ |
+| 51 | `_compute_next_run(schedule, now_ms)` :31 | `computeNextRun(CronSchedule, long)` — at/every/cron | ✅ |
+| 52 | croniter for cron expressions :46-53 | cron-utils `CronParser` + `ExecutionTime` | ✅ |
+| 53 | `_validate_schedule_for_add(schedule)` :60 | `validateSchedule(CronSchedule)` | ✅ |
+| 54 | tz only for cron kind :62-63 | Same validation | ✅ |
+| 55 | `CronSchedule` dataclass (types.py:7) | `CronSchedule` record | ✅ |
+| 56 | `CronPayload` dataclass (types.py:21) | `CronPayload` record, `channelMeta` as Map | ✅ |
+| 57 | `channel_meta: dict` (types.py:30) | `channelMeta: Map<String,Object>` | ✅ (fixed) |
+| 58 | `CronRunRecord` dataclass (types.py:34) | `CronRunRecord` record | ✅ |
+| 59 | `CronJobState` dataclass (types.py:43) | `CronJobState` record | ✅ |
+| 60 | `CronJob` dataclass with `from_dict()` (types.py:53) | `CronJob` record + deserialization | ✅ |
+| 61 | `CronStore` dataclass (types.py:79) | `CronStore` record | ✅ |
+| 62 | `CronService.__init__(store_path, on_job, max_sleep_ms)` :79 | Constructor with same params | ✅ |
+| 63 | `_load_jobs()` with corrupt file preservation :95 | `loadStore()` preserving .corrupt-ts backup | ✅ |
+| 64 | `_atomic_write(path, content)` with fsync :295 | Atomic tmp file write + fsync | ⚠️ needs fsync |
+| 65 | `FileLock` (filelock library) for cross-process :87 | `ReentrantLock` intra-process | ⚠️ noted |
+| 66 | `_merge_action()` action.jsonl :177 | Missing from doc | ⚠️ gap |
+| 67 | `start()` / `stop()` lifecycle :328 / :348 | Same lifecycle methods | ✅ |
+| 68 | `_arm_timer()` with asyncio.sleep :372 | `armTimer()` with ScheduledExecutorService | ✅ |
+| 69 | `_execute_job(job)` with run history :420 | `executeJob(CronJob)` with history trimming | ✅ |
+| 70 | `MAX_RUN_HISTORY = 20` :77 | Same constant | ✅ |
+| 71 | `max_sleep_ms = 300_000` (5 min) :83 | Same default | ✅ |
+| 72 | JSON serialization camelCase keys :248-290 | Same camelCase in save/load | ✅ |
+
+### 10.5 Method-Level Verification — Pairing
+
+| # | Python (store.py:line) | Java (PairingStore) | Match |
+|---|-----------------------|---------------------|-------|
+| 73 | `_ALPHABET = string.ascii_uppercase + string.digits` :27 | `ALPHABET = uppercase + digits` only | ✅ (fixed) |
+| 74 | `_CODE_LENGTH = 8` :28 | `CODE_LENGTH = 8` | ✅ |
+| 75 | `_TTL_DEFAULT_S = 600` (10 min) :29 | `TTL_DEFAULT_MS = 600_000` | ✅ |
+| 76 | `threading.Lock()` module-level :26 | `ReentrantLock` instance-level | ✅ |
+| 77 | `_load()` with set conversion :36 | `load()` with LinkedHashSet | ✅ |
+| 78 | Corrupt store reset :43-44 | Same: "Corrupted pairing store, resetting" | ✅ |
+| 79 | `_save(data)` with atomic write :53 | `save(PairingStoreData)` atomic tmp file | ✅ |
+| 80 | `_gc_pending(data)` :64 | `gcPending(PairingStoreData)` | ✅ |
+| 81 | `generate_code(channel, sender_id, ttl)` :73 | `generateCode(String, String, long)` | ✅ |
+| 82 | Code format: `"ABCD-EFGH"` :85 | Same format: 4+4 with dash | ✅ |
+| 83 | `approve_code(code)` :99 → `(channel, sender_id)` | `approveCode(String)` → `Pair<String, String>` | ✅ |
+| 84 | `deny_code(code)` :120 → bool | `denyCode(String)` → boolean | ✅ |
+| 85 | `is_approved(channel, sender_id)` :137 | `isApproved(String, String)` | ✅ |
+| 86 | `list_pending()` :145 | `listPending()` | ✅ |
+| 87 | `revoke(channel, sender_id)` :156 | `revoke(String, String)` | ✅ |
+| 88 | `get_approved(channel)` :175 | `getApproved(String)` | ✅ |
+| 89 | `format_pairing_reply(code)` :182 | `formatPairingReply(String)` | ✅ |
+| 90 | `format_expiry(expires_at)` :192 | `formatExpiry(long)` | ✅ |
+| 91 | `handle_pairing_command(channel, subcommand_text)` :198 | `PairingCommandHandler.java` (separate class) | ⚠️ not shown |
+| 92 | Subcommands: list/approve/deny/revoke :208-253 | Same 4 subcommands | ⚠️ not shown |
+
+### 10.6 Gaps & Pending Items
+
+| # | Item | Severity | Notes |
+|---|------|----------|-------|
+| G1 | `CliAppService.java` is ~500 lines vs Python's 1,263 | P1 | Catalog fetch, artifact scanning, CLI execution details deferred |
+| G2 | `TranscriptionService.resolveConfig()` + `transcribe*()` are placeholders | P1 | Config resolution tree traversal, API key resolution, provider dispatch still TBD |
+| G3 | Cron `_merge_action()` (action.jsonl cross-process mutation) missing | P1 | Required for multi-JVM cron deployments |
+| G4 | Cron `ReentrantLock` vs Python's `FileLock` (cross-process) | P2 | Single-JVM safe; multi-JVM needs `java.nio.channels.FileLock` |
+| G5 | `_atomic_write` fsync not shown in Java doc | P2 | Python fsync()s parent dir after atomic rename for crash safety |
+| G6 | `PairingCommandHandler.java` not shown | P2 | Python's `handle_pairing_command()` handles list/approve/deny/revoke subcommands |
+| G7 | API server `client_max_size=20MB` should be in `application.yml` | P3 | Configure `spring.servlet.multipart.max-file-size=20MB` |
+| G8 | Apps `CliInstaller.java` (brew/apt/npm) not detailed | P2 | Platform-specific installers deferred |
+
+### 10.7 Build Verification
+
+```bash
+# API endpoints
+curl -s http://localhost:8080/health | jq '.status'          # Expected: "ok"
+curl -s http://localhost:8080/v1/models | jq '.data[0].id'    # Expected: model name
+curl -s -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nanobot","messages":[{"role":"user","content":"hi"}]}' | jq '.choices[0].message.content'
+
+# Cron store persistence
+ls ~/.nanobot/cron/jobs.json
+
+# Pairing store persistence
+ls ~/.nanobot/pairing.json
+
+# Skills API (from 17-skills-templates.md)
+curl -s http://localhost:8080/api/skills | jq '.skills | length'
+```

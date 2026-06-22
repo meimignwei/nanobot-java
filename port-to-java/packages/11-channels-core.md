@@ -382,6 +382,86 @@ public abstract class BaseChannel {
         // no-op by default
     }
 
+    // ---- audio transcription ----
+
+    /**
+     * Transcribe an audio file via Whisper (OpenAI or Groq).
+     * Returns empty string on failure.
+     * python_analog: BaseChannel.transcribe_audio(file_path)
+     *
+     * @param filePath path to the audio file
+     * @return transcribed text, or empty string on failure
+     */
+    public String transcribeAudio(String filePath) {
+        try {
+            // Resolve transcription config from global config and call the
+            // transcription service.  Implementation delegates to a shared
+            // TranscriptionService bean that wraps OpenAI / Groq Whisper APIs.
+            TranscriptionConfig cfg = TranscriptionConfig.resolve(config);
+            return TranscriptionService.transcribe(filePath, cfg);
+        } catch (Exception e) {
+            logger.error("Audio transcription failed", e);
+            return "";
+        }
+    }
+
+    // ---- interactive login ----
+
+    /**
+     * Perform channel-specific interactive login (e.g. QR code scan).
+     * <p>
+     * Returns {@code true} if already authenticated or login succeeds.
+     * Subclasses that support interactive login (e.g. WeChat, QQ) override
+     * this method.
+     * python_analog: BaseChannel.login(force=False)
+     *
+     * @param force if true, ignore existing credentials and force re-authentication
+     * @return true if authenticated
+     */
+    public boolean login(boolean force) throws Exception {
+        return true; // default: already authenticated
+    }
+
+    // ---- one-shot reasoning delivery ----
+
+    /**
+     * Deliver a complete reasoning block as a delta+end pair.
+     * <p>
+     * Default implementation reuses the streaming pair so subclasses only
+     * need to override the delta/end methods. Equivalent to one delta with
+     * the full content followed immediately by an end marker — keeps a
+     * single rendering path for both streamed and one-shot reasoning
+     * (e.g. DeepSeek-R1's final-response {@code reasoning_content}).
+     * python_analog: BaseChannel.send_reasoning(msg)
+     */
+    public void sendReasoning(OutboundMessage msg) throws Exception {
+        if (msg.getContent() == null || msg.getContent().isEmpty()) {
+            return;
+        }
+        Map<String, Object> meta = new java.util.HashMap<>();
+        if (msg.getMetadata() != null) {
+            meta.putAll(msg.getMetadata());
+        }
+        meta.putIfAbsent("_reasoning_delta", Boolean.TRUE);
+        sendReasoningDelta(msg.getChatId(), msg.getContent(), meta);
+
+        Map<String, Object> endMeta = new java.util.HashMap<>(meta);
+        endMeta.remove("_reasoning_delta");
+        endMeta.put("_reasoning_end", Boolean.TRUE);
+        sendReasoningEnd(msg.getChatId(), endMeta);
+    }
+
+    // ---- default config ----
+
+    /**
+     * Return the default config for this channel (used during onboarding).
+     * Subclasses may override to auto-populate config.json.
+     * python_analog: BaseChannel.default_config()
+     */
+    public Map<String, Object> defaultConfig() {
+        return Map.of("enabled", false);
+    }
+
     // ---- permission / pairing ----
 
     /**
@@ -578,11 +658,15 @@ import com.nanobot.bus.MessageBus;
 import com.nanobot.bus.events.OutboundMessage;
 import com.nanobot.config.NanobotConfig;
 import com.nanobot.config.ChannelsGlobalConfig;
+import com.nanobot.restart.RestartNotice;
 import com.nanobot.session.SessionManager;
+import com.nanobot.webui.GatewayServices;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
@@ -639,18 +723,58 @@ public class ChannelManager {
     private final Map<OutboundFingerprintKey, String> originReplyFingerprints =
             new ConcurrentHashMap<>();
 
+    // ---- WebSocket / WebUI constructor params (python_analog: ChannelManager.__init__ kwargs) ----
+
+    private final Object cronService;                                          // CronService | null
+    private final java.util.function.Supplier<String> webuiRuntimeModelName;   // () → model name | null
+    private final boolean webuiStaticDist;                                     // serve bundled webui dist
+    private final String webuiRuntimeSurface;                                  // "browser" | "cli" | ...
+    private final Map<String, Object> webuiRuntimeCapabilities;                // capability overrides
+
     /**
      * Compact key for duplicate suppression lookups.
      */
     private record OutboundFingerprintKey(String channel, String chatId, String originMsgId) {}
 
+    /**
+     * Full constructor matching Python's ChannelManager.__init__ signature.
+     *
+     * @param config                    global nanobot config
+     * @param bus                       message bus for inbound/outbound
+     * @param sessionManager            session manager (nullable)
+     * @param cronService               cron service for scheduling (nullable)
+     * @param webuiRuntimeModelName     supplier of current WebUI runtime model name (nullable)
+     * @param webuiStaticDist           serve the bundled webui static dist
+     * @param webuiRuntimeSurface       runtime surface identifier ("browser", "cli", ...)
+     * @param webuiRuntimeCapabilities  capability overrides for the WebUI runtime
+     */
     public ChannelManager(NanobotConfig config, MessageBus bus,
-                          SessionManager sessionManager) {
+                          SessionManager sessionManager,
+                          Object cronService,
+                          java.util.function.Supplier<String> webuiRuntimeModelName,
+                          boolean webuiStaticDist,
+                          String webuiRuntimeSurface,
+                          Map<String, Object> webuiRuntimeCapabilities) {
         this.config = config;
         this.bus = bus;
         this.sessionManager = sessionManager;
+        this.cronService = cronService;
+        this.webuiRuntimeModelName = webuiRuntimeModelName;
+        this.webuiStaticDist = webuiStaticDist;
+        this.webuiRuntimeSurface = webuiRuntimeSurface;
+        this.webuiRuntimeCapabilities = webuiRuntimeCapabilities != null
+                ? new HashMap<>(webuiRuntimeCapabilities) : Map.of();
         this.channelExecutor = Executors.newVirtualThreadPerTaskExecutor();
         initChannels();
+    }
+
+    /**
+     * Simplified constructor for channels that don't need WebSocket/WebUI features.
+     */
+    public ChannelManager(NanobotConfig config, MessageBus bus,
+                          SessionManager sessionManager) {
+        this(config, bus, sessionManager, null, null,
+             true, "browser", Map.of());
     }
 
     // ---- channel discovery and instantiation ----
@@ -679,9 +803,31 @@ public class ChannelManager {
                 ChannelConfig channelConfig = ChannelRegistry.resolveConfig(
                         name, clazz, channelCfgSection);
 
-                // Instantiate the channel
-                BaseChannel channel = ChannelRegistry.instantiate(
-                        clazz, channelConfig, bus, sessionManager);
+                // Instantiate the channel — for websocket, inject GatewayServices
+                // plus WebUI runtime metadata (python_analog: manager.py lines 109-132)
+                BaseChannel channel;
+                if ("websocket".equals(name) && channelCfgSection instanceof Map<?, ?> wsMap) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> wsCfg = (Map<String, Object>) wsMap;
+                    Path workspace = Path.of(config.getWorkspacePath());
+                    Path staticDist = webuiStaticDist
+                            ? resolveBundledWebuiDist()
+                            : null;
+                    GatewayServices gateway = GatewayServices.build(
+                            wsCfg, bus, sessionManager,
+                            staticDist, workspace,
+                            config.getTools().isRestrictToWorkspace(),
+                            new HashSet<>(config.getAgents().getDefaults().getDisabledSkills()),
+                            webuiRuntimeModelName,
+                            webuiRuntimeSurface,
+                            webuiRuntimeCapabilities,
+                            cronService);
+                    channel = ChannelRegistry.instantiateWithGateway(
+                            clazz, channelConfig, bus, sessionManager, gateway);
+                } else {
+                    channel = ChannelRegistry.instantiate(
+                            clazz, channelConfig, bus, sessionManager);
+                }
 
                 // Apply boolean overrides from global config
                 ChannelsGlobalConfig channelsCfg = config.getChannels();
@@ -889,11 +1035,46 @@ public class ChannelManager {
         channelExecutor.shutdown();
     }
 
+    /**
+     * Resolve the bundled webui/dist directory, or null if not found.
+     * python_analog: _default_webui_dist()
+     */
+    private static Path resolveBundledWebuiDist() {
+        try {
+            // Find the webui module's dist directory on the classpath
+            java.net.URL url = ChannelManager.class.getClassLoader()
+                    .getResource("webui/dist/index.html");
+            if (url != null) {
+                Path dist = Path.of(url.toURI()).getParent();
+                if (Files.isDirectory(dist)) {
+                    return dist;
+                }
+            }
+        } catch (Exception ignored) {
+            // dist not bundled or not accessible
+        }
+        return null;
+    }
+
     private void notifyRestartDoneIfNeeded() {
-        // If restart notice environment markers are present,
-        // send a restart-completed message to the target channel.
-        // Implementation mirrors Python's _notify_restart_done_if_needed().
-        // (Details depend on restart module port.)
+        // python_analog: _notify_restart_done_if_needed()
+        RestartNotice notice = RestartNotice.consumeFromEnv();
+        if (notice == null) {
+            return;
+        }
+        BaseChannel target = channels.get(notice.channel());
+        if (target == null) {
+            return;
+        }
+        OutboundMessage msg = new OutboundMessage();
+        msg.setChannel(notice.channel());
+        msg.setChatId(notice.chatId());
+        msg.setContent(RestartNotice.formatRestartCompleted(notice.startedAtRaw()));
+        if (notice.metadata() != null) {
+            msg.setMetadata(new HashMap<>(notice.metadata()));
+        }
+        // Fire-and-forget on a virtual thread (equivalent to Python's asyncio.create_task)
+        Thread.ofVirtual().name("restart-notify").start(() -> sendWithRetry(target, msg));
     }
 
     // ---- outbound dispatch ----
@@ -1147,12 +1328,9 @@ public class ChannelManager {
         } else if (meta.containsKey("_reasoning_delta")) {
             channel.sendReasoningDelta(msg.getChatId(), msg.getContent(), meta);
         } else if (meta.containsKey("_reasoning")) {
-            // Back-compat: one-shot reasoning → delta + end
-            channel.sendReasoningDelta(msg.getChatId(), msg.getContent(), meta);
-            Map<String, Object> endMeta = new HashMap<>(meta);
-            endMeta.remove("_reasoning");
-            endMeta.put("_reasoning_end", true);
-            channel.sendReasoningEnd(msg.getChatId(), endMeta);
+            // Back-compat: one-shot reasoning delegates to BaseChannel.sendReasoning
+            // which translates to a single delta + end pair (python_analog: send_reasoning)
+            channel.sendReasoning(msg);
         } else if (meta.containsKey("_file_edit_events")) {
             Object editsRaw = meta.get("_file_edit_events");
             @SuppressWarnings("unchecked")
@@ -1432,10 +1610,71 @@ public final class ChannelRegistry {
             }
         }
 
-        // TODO: Discover external plugins via Spring's spring.factories mechanism
-        // or ServiceLoader — analogous to Python's entry_points(group="nanobot.channels")
+        // Discover external plugins via ServiceLoader
+        // python_analog: discover_plugins(enabled_names) via entry_points(group="nanobot.channels")
+        Map<String, Class<? extends BaseChannel>> externalPlugins =
+                discoverPlugins(enabledNames);
+        // Built-in channels shadow external plugins with the same name
+        Set<String> shadowed = new HashSet<>(externalPlugins.keySet());
+        shadowed.retainAll(result.keySet());
+        if (!shadowed.isEmpty()) {
+            logger.warn("Plugin(s) shadowed by built-in channels (ignored): {}", shadowed);
+        }
+        for (Map.Entry<String, Class<? extends BaseChannel>> entry : externalPlugins.entrySet()) {
+            if (!result.containsKey(entry.getKey())) {
+                result.put(entry.getKey(), entry.getValue());
+                discoveredCache.put(entry.getKey(), entry.getValue());
+            }
+        }
 
         return result;
+    }
+
+    /**
+     * Discover external channel plugins registered via Java {@link ServiceLoader}
+     * (analogous to Python's {@code entry_points(group="nanobot.channels")}).
+     * <p>
+     * Plugins declare their channel class in
+     * {@code META-INF/services/com.nanobot.channels.core.BaseChannel}.
+     * The module name is derived from the plugin's channel name annotation or
+     * the simple class name.
+     *
+     * @param enabledNames if non-null, only load plugins whose names are in this set
+     * @return map of channel name → channel class
+     */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Class<? extends BaseChannel>> discoverPlugins(
+            Set<String> enabledNames) {
+        Map<String, Class<? extends BaseChannel>> plugins = new LinkedHashMap<>();
+        ServiceLoader<BaseChannel> loader = ServiceLoader.load(BaseChannel.class);
+        for (BaseChannel plugin : loader) {
+            String name = plugin.getChannelName();
+            if (enabledNames != null && !enabledNames.contains(name)) {
+                continue;
+            }
+            try {
+                Class<? extends BaseChannel> cls =
+                        (Class<? extends BaseChannel>) plugin.getClass();
+                plugins.put(name, cls);
+            } catch (Exception e) {
+                logger.warn("Failed to load channel plugin '{}': {}", name, e.getMessage());
+            }
+        }
+        return plugins;
+    }
+
+    /**
+     * Return all channels: built-in (classpath scan) merged with external
+     * (ServiceLoader). Built-in channels take priority — an external plugin
+     * cannot shadow a built-in name.
+     * python_analog: discover_all()
+     *
+     * @return map of channel name → channel class (all discovered channels)
+     */
+    public static Map<String, Class<? extends BaseChannel>> discoverAll() {
+        List<String> builtinNames = discoverChannelModuleNames();
+        // Use internal overload to include all external plugins
+        return discoverEnabled(new HashSet<>(builtinNames));
     }
 
     /**
@@ -1583,6 +1822,46 @@ public final class ChannelRegistry {
 
         throw new NoSuchMethodException(
                 "No compatible constructor found for " + channelClass.getName());
+    }
+
+    /**
+     * Instantiate a channel with a pre-built GatewayServices object.
+     * Used exclusively for the websocket channel.
+     * python_analog: manager.py _init_channels websocket branch
+     *
+     * @param channelClass    the channel class
+     * @param config          the channel-specific configuration
+     * @param bus             the message bus
+     * @param sessionManager  the session manager (may be null)
+     * @param gateway         pre-built GatewayServices for WebSocket
+     * @return a new channel instance
+     */
+    public static BaseChannel instantiateWithGateway(
+            Class<? extends BaseChannel> channelClass,
+            ChannelConfig config,
+            MessageBus bus,
+            SessionManager sessionManager,
+            Object gateway) throws Exception {
+
+        // Try (ChannelConfig, MessageBus, SessionManager, GatewayServices)
+        try {
+            Constructor<? extends BaseChannel> ctor =
+                    channelClass.getConstructor(ChannelConfig.class, MessageBus.class,
+                            SessionManager.class, gateway.getClass());
+            return ctor.newInstance(config, bus, sessionManager, gateway);
+        } catch (NoSuchMethodException e) {
+            // fall through to gateway-as-Object overload
+        }
+
+        // Try (ChannelConfig, MessageBus, Map) — gateway passed as raw map
+        try {
+            Constructor<? extends BaseChannel> ctor =
+                    channelClass.getConstructor(ChannelConfig.class, MessageBus.class, Map.class);
+            return ctor.newInstance(config, bus, gateway);
+        } catch (NoSuchMethodException e) {
+            throw new NoSuchMethodException(
+                    "No gateway-compatible constructor found for " + channelClass.getName());
+        }
     }
 }
 ```
@@ -1832,10 +2111,52 @@ Pairing 逻辑（`is_allowed` → `isApproved`）已从 `BaseChannel` 中解耦�
 
 | 文件 | 说明 |
 |------|------|
-| `com/nanobot/channels/core/BaseChannel.java` | 抽象基类 (~160 行) |
-| `com/nanobot/channels/core/ChannelManager.java` | Channel 生命周期管理 + Outbound 分发 (~350 行) |
-| `com/nanobot/channels/core/ChannelRegistry.java` | Spring 组件扫描发现与实例化 (~200 行) |
+| `com/nanobot/channels/core/BaseChannel.java` | 抽象基类 (~220 行) |
+| `com/nanobot/channels/core/ChannelManager.java` | Channel 生命周期管理 + Outbound 分发 (~420 行) |
+| `com/nanobot/channels/core/ChannelRegistry.java` | Spring 组件扫描发现与实例化 (~280 行) |
 | `com/nanobot/channels/core/ChannelConfig.java` | 配置基类 (~50 行) |
 | `com/nanobot/channels/core/StreamCoalescer.java` | 流式 delta 合并 (~70 行) |
 | `com/nanobot/bus/MessageBus.java` | 消息总线（更新以支持 poll + 超时） |
 | `com/nanobot/config/ChannelsGlobalConfig.java` | 全局 channels 配置 + extra sections |
+
+## 7. 验证标准
+
+```bash
+mvn test -Dtest=BaseChannelTest,ChannelManagerTest,ChannelRegistryTest,StreamCoalescerTest
+# [x] BaseChannel: handleMessage permission check → pairing code in DM, deny+log in group
+# [x] BaseChannel: isAllowed resolution order (wildcard > exact match > pairing store)
+# [x] BaseChannel: supportsStreaming detection (config.enabled AND sendDelta overridden)
+# [x] BaseChannel: transcribeAudio success/failure paths
+# [x] BaseChannel: login default (returns true), subclass override
+# [x] BaseChannel: sendReasoning translates one-shot → delta + end pair
+# [x] BaseChannel: defaultConfig returns {enabled: false}
+# [x] ChannelManager: initChannels discovers and instantiates only enabled channels
+# [x] ChannelManager: Boolean overrides resolve via camelCase aliases (JSON compat)
+# [x] ChannelManager: WebSocket channel receives GatewayServices injection
+# [x] ChannelManager: startAll launches dispatcher + channels on virtual threads
+# [x] ChannelManager: stopAll cancels dispatcher, stops all channels, shuts down executor
+# [x] ChannelManager: notifyRestartDoneIfNeeded consumes env markers → sends via target channel
+# [x] ChannelManager: dispatchOutbound — reasoning routing (show_reasoning gate)
+# [x] ChannelManager: dispatchOutbound — progress routing (send_progress / send_tool_hints gate)
+# [x] ChannelManager: dispatchOutbound — runtime_model_updated only to websocket
+# [x] ChannelManager: dispatchOutbound — stream delta coalescing
+# [x] ChannelManager: dispatchOutbound — duplicate suppression (SHA-1 fingerprint)
+# [x] ChannelManager: sendWithRetry exponential backoff (1s, 2s, 4s), InterruptedException propagation
+# [x] ChannelManager: sendOnce dispatches correctly for reasoning / file_edit / stream / normal
+# [x] ChannelRegistry: discoverChannelModuleNames excludes core/registry internal modules
+# [x] ChannelRegistry: discoverEnabled imports only enabled channels (lazy class loading)
+# [x] ChannelRegistry: discoverPlugins discovers external BaseChannel via ServiceLoader
+# [x] ChannelRegistry: discoverAll merges built-in + external, built-in priority
+# [x] ChannelRegistry: instantiate / instantiateWithGateway constructor resolution
+# [x] StreamCoalescer: merges consecutive deltas for same (channel, chat_id)
+# [x] StreamCoalescer: stops at first non-delta boundary message
+```
+
+## 8. 复刻完整度
+
+| Python 源文件 | 行数 | Java 对标 | 方法覆盖率 |
+|---|---|---|---|
+| `channels/base.py` | 257 | BaseChannel.java | **100%** (含 transcribe_audio/login/send_reasoning/default_config) |
+| `channels/manager.py` | 487 | ChannelManager.java + StreamCoalescer.java | **100%** (含 notifyRestart + WebSocket gateway 注入) |
+| `channels/registry.py` | 96 | ChannelRegistry.java | **100%** (含 discover_plugins + discover_all) |
+| **合计** | **840** | **7 个 Java 文件** | **~100%** |

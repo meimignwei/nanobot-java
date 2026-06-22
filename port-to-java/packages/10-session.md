@@ -118,6 +118,7 @@ com.nanobot.session/
 ├── GoalState.java                # 持续目标状态
 ├── TurnContinuation.java         # Turn 延续策略
 ├── TurnContinuationContext.java  # maybeContinueTurn 上下文接口
+├── BusProgress.java              # 进度回调 → OutboundMessage 桥接
 ├── WebuiTurnCoordinator.java     # WebUI turn 协调器
 └── WebuiTitleGenerator.java      # WebUI 标题生成
 ```
@@ -550,13 +551,28 @@ final class SessionSanitizer {
 ```java
 package com.nanobot.session;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.knuddels.jtokkit.Encodings;
+import com.knuddels.jtokkit.api.Encoding;
+import com.knuddels.jtokkit.api.EncodingRegistry;
+import com.knuddels.jtokkit.api.EncodingType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.*;
 
 /**
  * Token-budget trimming for get_history().
- * python_analog: max_tokens path in Session.get_history()
+ * python_analog: max_tokens path in Session.get_history() + estimate_message_tokens()
  */
 final class SessionTokenBudget {
+    private static final Logger log = LoggerFactory.getLogger(SessionTokenBudget.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int MIN_TOKENS = 4;
+    private static volatile Encoding CACHED_ENCODING;
+    private static volatile boolean encodingFailed;
+
     private SessionTokenBudget() {}
 
     static List<Map<String, Object>> trim(List<Map<String, Object>> out, int maxTokens) {
@@ -585,22 +601,88 @@ final class SessionTokenBudget {
         return kept;
     }
 
-    /** Rough token count: ~4 chars/token + per-message overhead. */
-    private static int estimateTokens(Map<String, Object> msg) {
-        String text = Objects.toString(msg.get("content"), "");
-        int base = 8 + (text.length() + 3) / 4;
-        Object tc = msg.get("tool_calls");
-        if (tc instanceof List<?> tcl)
-            for (Object item : tcl)
-                if (item instanceof Map<?, ?> tcm && tcm.get("function") instanceof Map<?, ?> fm) {
-                    base += 32;
-                    Object args = fm.get("arguments");
-                    if (args instanceof String a) base += (a.length() + 3) / 4;
+    /**
+     * Estimate prompt tokens contributed by one persisted message.
+     * Uses tiktoken cl100k_base encoding via JTokkit when available,
+     * falling back to ~4 chars/token on initialization failure.
+     * python_analog: estimate_message_tokens(message) in utils/helpers.py
+     */
+    static int estimateTokens(Map<String, Object> msg) {
+        // Build payload parts matching Python's logic exactly
+        List<String> parts = new ArrayList<>();
+        Object content = msg.get("content");
+        if (content instanceof String s) {
+            parts.add(s);
+        } else if (content instanceof List<?> list) {
+            for (Object part : list) {
+                if (part instanceof Map<?, ?> m && "text".equals(m.get("type"))) {
+                    Object text = m.get("text");
+                    if (text instanceof String s && !s.isEmpty()) parts.add(s);
+                } else {
+                    try { parts.add(MAPPER.writeValueAsString(part)); }
+                    catch (JsonProcessingException ignored) {}
                 }
-        return base;
+            }
+        } else if (content != null) {
+            try { parts.add(MAPPER.writeValueAsString(content)); }
+            catch (JsonProcessingException ignored) {}
+        }
+
+        // Include name and tool_call_id in token count (Python lines 482-485)
+        for (String key : List.of("name", "tool_call_id")) {
+            Object v = msg.get(key);
+            if (v instanceof String s && !s.isEmpty()) parts.add(s);
+        }
+
+        // Include full tool_calls JSON (Python line 487)
+        Object tc = msg.get("tool_calls");
+        if (tc != null) {
+            try { parts.add(MAPPER.writeValueAsString(tc)); }
+            catch (JsonProcessingException ignored) {}
+        }
+
+        // Include reasoning_content (Python lines 489-491)
+        Object rc = msg.get("reasoning_content");
+        if (rc instanceof String s && !s.isEmpty()) parts.add(s);
+
+        String payload = String.join("\n", parts);
+        if (payload.isEmpty()) return MIN_TOKENS;
+
+        // Try tiktoken encoding, fall back to char/4 estimate
+        try {
+            Encoding enc = getEncoding();
+            if (enc != null) {
+                return Math.max(MIN_TOKENS, enc.encode(payload).size() + MIN_TOKENS);
+            }
+        } catch (Exception e) {
+            log.debug("tiktoken encode failed, using fallback: {}", e.getMessage());
+        }
+        return Math.max(MIN_TOKENS, payload.length() / 4 + MIN_TOKENS);
+    }
+
+    private static Encoding getEncoding() {
+        if (CACHED_ENCODING != null) return CACHED_ENCODING;
+        if (encodingFailed) return null;
+        try {
+            EncodingRegistry registry = Encodings.newDefaultEncodingRegistry();
+            CACHED_ENCODING = registry.getEncoding(EncodingType.CL100K_BASE);
+            return CACHED_ENCODING;
+        } catch (Exception e) {
+            encodingFailed = true;
+            log.warn("JTokkit initialization failed, token estimates will use char/4 fallback: {}", e.getMessage());
+            return null;
+        }
     }
 }
 ```
+
+**依赖:** 需要添加 `com.knuddels:jtokkit` 依赖（对标 Python `tiktoken`）。若不可用，自动回退到 `chars/4` 估算。`estimateTokens` 方法现在完全对标 Python 的 `estimate_message_tokens()`：
+- 处理 `content` 为 String、content-block List、或其它 JSON 类型
+- 包含 `name`、`tool_call_id` 字段
+- 包含完整的 `tool_calls` JSON
+- 包含 `reasoning_content`
+- 空 payload 返回 4（最小 token 开销）
+- 优先使用 cl100k_base 精确编码，失败则回退 chars/4
 
 ### 2.6 SessionConstants.java
 
@@ -1570,8 +1652,8 @@ public class WebuiTurnCoordinator {
     }
 
     // 对标 Python webui_turns.py:187-192 build_bus_progress_callback
-    public static Runnable buildBusProgressCallback(MessageBus bus, InboundMessage msg) {
-        return () -> {}; // 占位：实际应调用 bus.buildProgressCallback
+    public static ProgressCallback buildBusProgressCallback(MessageBus bus, InboundMessage msg) {
+        return BusProgress.buildCallback(bus, msg);
     }
 
     private void publish(String chatId, String channel, Map<String, Object> meta) {
@@ -1591,7 +1673,68 @@ public class WebuiTurnCoordinator {
 }
 ```
 
-## 7. WebuiTitleGenerator.java
+## 7. BusProgress.java
+
+对标 Python `nanobot/bus/progress.py` — 将进度回调转为 OutboundMessage 发布到 MessageBus。
+
+```java
+package com.nanobot.session;
+
+import com.nanobot.bus.InboundMessage;
+import com.nanobot.bus.OutboundMessage;
+import com.nanobot.bus.queue.MessageBus;
+
+import java.util.*;
+
+/**
+ * Progress-callback → OutboundMessage bridge.
+ * python_analog: nanobot.bus.progress.build_bus_progress_callback
+ */
+public final class BusProgress {
+    private BusProgress() {}
+
+    /**
+     * Build a progress callback that publishes each progress tick as an
+     * OutboundMessage carrying _progress, _tool_hint, _reasoning_delta,
+     * _reasoning_end, _tool_events, and _file_edit_events metadata.
+     */
+    public static ProgressCallback buildCallback(MessageBus bus, InboundMessage msg) {
+        return (content, toolHint, toolEvents, fileEditEvents, reasoning, reasoningEnd) -> {
+            Map<String, Object> meta = new LinkedHashMap<>();
+            if (msg.metadata() != null) meta.putAll(msg.metadata());
+            meta.put("_progress", Boolean.TRUE);
+            meta.put("_tool_hint", toolHint);
+            if (reasoning) meta.put("_reasoning_delta", Boolean.TRUE);
+            if (reasoningEnd) meta.put("_reasoning_end", Boolean.TRUE);
+            if (toolEvents != null) meta.put("_tool_events", toolEvents);
+            if (fileEditEvents != null) meta.put("_file_edit_events", fileEditEvents);
+
+            try {
+                bus.publishOutbound(new OutboundMessage(
+                    msg.channel(), msg.chatId(), content,
+                    null, List.of(), meta, List.of()));
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        };
+    }
+
+    /** Functional interface matching Python's _bus_progress callback signature. */
+    @FunctionalInterface
+    public interface ProgressCallback {
+        void onProgress(
+            String content,
+            boolean toolHint,
+            @jakarta.annotation.Nullable List<Map<String, Object>> toolEvents,
+            @jakarta.annotation.Nullable List<Map<String, Object>> fileEditEvents,
+            boolean reasoning,
+            boolean reasoningEnd
+        );
+    }
+}
+```
+
+**调用方式:** AgentLoop 中 `ctx.setProgressCallback(BusProgress.buildCallback(bus, msg))`，每次 tool 执行/stream delta 时间歇调用 `callback.onProgress(...)` 向 WebSocket 推送进度。
+
+## 8. WebuiTitleGenerator.java
 
 ```java
 package com.nanobot.session;
@@ -1720,7 +1863,7 @@ public final class WebuiTitleGenerator {
 }
 ```
 
-## 8. 线程安全分析
+## 9. 线程安全分析
 
 | 数据结构 | 策略 | 理由 |
 |----------|------|------|
@@ -1735,7 +1878,7 @@ public final class WebuiTitleGenerator {
 
 **锁层次：** SessionManager 的 `save()` 持有 Session 的 read lock — 与 `getHistory()` 共存，与 `clear()`/`retain` 互斥。
 
-## 9. Spring 集成
+## 10. Spring 集成
 
 ```java
 @Bean
@@ -1751,7 +1894,7 @@ public WebuiTurnCoordinator webuiTurnCoordinator(MessageBus bus, SessionManager 
 }
 ```
 
-## 10. 测试用例
+## 11. 测试用例
 
 ```java
 class SessionTest {
@@ -1788,32 +1931,37 @@ class TurnContinuationTest {
 }
 ```
 
-## 11. 验证标准
+## 12. 验证标准
 
 ```bash
-mvn test -Dtest=SessionTest,SessionManagerTest,GoalStateTest,TurnContinuationTest
+mvn test -Dtest=SessionTest,SessionManagerTest,GoalStateTest,TurnContinuationTest,BusProgressTest
 # [x] Session: new/append/history/clear/retain all correct
 # [x] SessionManager: get/create/save/reload/repair/delete/flush/fork
 # [x] JSONL corruption repair: bad lines skipped, good data preserved
 # [x] Atomic write: no partial files visible via ATOMIC_MOVE
 # [x] GoalState: all predicates match Python behavior
 # [x] TurnContinuation: continuation detection, stripping, round tracking
+# [x] SessionTokenBudget: token estimation matches Python estimate_message_tokens
+#       (String content, List<block> content, tool_calls, reasoning_content, cl100k_base)
+# [x] SessionTokenBudget: fallback to chars/4 when JTokkit unavailable
+# [x] BusProgress: callback publishes OutboundMessage with _progress/_tool_hint metadata
 ```
 
-## 12. 代码量估算
+## 13. 代码量估算
 
 | 文件 | 行数 |
 |------|------|
 | Session.java | ~200 |
 | SessionHelpers.java | ~60 |
 | SessionSanitizer.java | ~120 |
-| SessionTokenBudget.java | ~50 |
+| SessionTokenBudget.java | ~110 |
 | SessionConstants.java | ~20 |
 | SessionManager.java | ~310 |
 | GoalState.java | ~120 |
 | TurnContinuation.java | ~190 |
 | TurnContinuationContext.java | ~15 |
+| BusProgress.java | ~55 |
 | WebuiTurnCoordinator.java | ~100 |
 | WebuiTitleGenerator.java | ~100 |
 | 测试 | ~300 |
-| **合计** | **~1585** |
+| **合计** | **~1700** |

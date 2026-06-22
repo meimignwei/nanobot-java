@@ -930,6 +930,46 @@ public final class BuiltinCommands {
                 session = loop.sessions().getOrCreate(ctx.key());
             }
 
+            // Estimate context tokens
+            long ctxEst = 0;
+            try {
+                ctxEst = loop.consolidator().estimateSessionPromptTokens(session);
+            } catch (Exception e) {
+                // fallback to last usage
+            }
+            if (ctxEst <= 0) {
+                Map<String, Long> usage = loop.lastUsage();
+                ctxEst = usage != null ? usage.getOrDefault("prompt_tokens", 0L) : 0L;
+            }
+
+            // Fetch web search usage (best-effort)
+            String searchUsageText = null;
+            try {
+                com.nanobot.utils.SearchUsageFetcher.UsageResult usage =
+                    com.nanobot.utils.SearchUsageFetcher.fetchSearchUsage(
+                        loop.webConfig());
+                if (usage != null) {
+                    searchUsageText = usage.format();
+                }
+            } catch (Exception e) {
+                // Never let usage fetch break /status
+            }
+
+            // Count active tasks including subagents
+            int taskCount = loop.activeTaskCount(ctx.key());
+            try {
+                taskCount += loop.subagents().getRunningCountBySession(ctx.key());
+            } catch (Exception e) {
+                // ignore
+            }
+
+            int maxCompletionTokens = 8192;
+            try {
+                maxCompletionTokens = loop.provider().generation().maxTokens();
+            } catch (Exception e) {
+                // ignore
+            }
+
             String content = StatusContentBuilder.buildStatusContent(
                 NanobotVersion.VERSION,
                 loop.model(),
@@ -937,8 +977,10 @@ public final class BuiltinCommands {
                 loop.lastUsage(),
                 loop.contextWindowTokens(),
                 session.getHistory(0).size(),
-                /* searchUsage */ null,
-                loop.activeTaskCount(ctx.key())
+                ctxEst,
+                searchUsageText,
+                taskCount,
+                maxCompletionTokens
             );
 
             Map<String, Object> metadata = new java.util.HashMap<>(ctx.msg().metadata());
@@ -965,9 +1007,17 @@ public final class BuiltinCommands {
             if (session == null) {
                 session = loop.sessions().getOrCreate(ctx.key());
             }
+            // Archive unconsolidated messages before clearing (对标 Python snapshot逻辑)
+            List<Map<String, Object>> snapshot =
+                session.getMessages().subList(
+                    session.lastConsolidated(), session.getMessages().size());
             session.clear();
             loop.sessions().save(session);
             loop.sessions().invalidate(session.key());
+            if (!snapshot.isEmpty()) {
+                loop.scheduleBackground(
+                    loop.consolidator().archive(snapshot, ctx.key()));
+            }
 
             return new OutboundMessage(
                 ctx.msg().channel(),
@@ -1007,16 +1057,16 @@ public final class BuiltinCommands {
             }
 
             // Switch
-            try {
-                loop.setModelPreset(args);
-                StringBuilder sb = new StringBuilder();
-                sb.append("Switched model preset to `").append(loop.modelPreset()).append("`.\n");
-                sb.append("- Model: `").append(loop.model()).append("`\n");
-                sb.append("- Context window: ").append(loop.contextWindowTokens());
+            String[] parts = args.split("\\s+");
+            if (parts.length != 1) {
                 return new OutboundMessage(
                     ctx.msg().channel(), ctx.msg().chatId(),
-                    sb.toString(), metadata
+                    "Usage: `/model [preset]`", metadata
                 );
+            }
+            String name = parts[0];
+            try {
+                loop.setModelPreset(name);
             } catch (Exception e) {
                 List<String> names = loop.modelPresetNames();
                 return new OutboundMessage(
@@ -1027,6 +1077,21 @@ public final class BuiltinCommands {
                     metadata
                 );
             }
+            int maxTokens = 8192;
+            try {
+                maxTokens = loop.provider().generation().maxTokens();
+            } catch (Exception ex) {
+                // ignore
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("Switched model preset to `").append(loop.modelPreset()).append("`.\n");
+            sb.append("- Model: `").append(loop.model()).append("`\n");
+            sb.append("- Context window: ").append(loop.contextWindowTokens()).append("\n");
+            sb.append("- Max output tokens: ").append(maxTokens);
+            return new OutboundMessage(
+                ctx.msg().channel(), ctx.msg().chatId(),
+                sb.toString(), metadata
+            );
         });
     }
 
@@ -1111,17 +1176,21 @@ public final class BuiltinCommands {
             }
 
             // Rewrite as a normal agent turn that nudges long_task use
-            String goalPrompt = """
+            // 对标 Python _GOAL_PROMPT_TEMPLATE
+            String goalPrompt = ("""
                 The user declared a sustained objective for this thread.
 
-                Inspect or clarify if needed, then call `long_task` with the refined objective
-                (and optional short ui_summary). Work proceeds as normal assistant turns using
-                your usual tools. When the objective is fully done and verified, call
-                `complete_goal` with a brief recap.
+                Inspect or clarify if needed, then call `long_task` with the refined objective\
+                (and optional short ui_summary). Work proceeds as normal assistant turns using\
+                your usual tools. When the objective is fully done and verified, call\
+                `complete_goal` with a brief recap. If the user later cancels or changes\
+                direction, still call `complete_goal` with an honest recap (then `long_task`\
+                again only after there is no active goal). Do not use `long_task` /\
+                `complete_goal` for trivial one-shot answers.
 
                 Goal:
                 %s
-                """.formatted(goal);
+                """).formatted(goal);
 
             // Return null — lets the agent loop process this as a normal turn
             ctx.msg().setContent(goalPrompt);
@@ -1196,41 +1265,268 @@ public final class BuiltinCommands {
         router.prefix("/pairing ", BuiltinCommands::cmdPairing);
     }
 
-    // --- Remaining command stubs (full implementation follows same pattern) ---
+    // --- Dream commands (对标 Python cmd_dream / cmd_dream_log / cmd_dream_restore) ---
 
+    /**
+     * /dream — Manually trigger a Dream consolidation run.
+     * 对标 Python cmd_dream().
+     */
     public static CompletableFuture<OutboundMessage> cmdDream(CommandContext ctx) {
+        // Launch async dream run via agent loop background scheduler
+        ctx.loop().scheduleBackground(() -> {
+            try {
+                MemoryStore store = ctx.loop().context().memory();
+                MemoryStore.DreamResult result = store.buildDreamPrompt();
+                if (result == null) {
+                    ctx.loop().bus().publishOutbound(new OutboundMessage(
+                        ctx.msg().channel(), ctx.msg().chatId(),
+                        "Dream: nothing to process."
+                    ));
+                    return;
+                }
+                String key = MemoryStore.dreamSessionKey();
+                long t0 = System.currentTimeMillis();
+                OutboundMessage resp = ctx.loop().processDirect(
+                    result.prompt(),
+                    key,
+                    true,  // ephemeral
+                    store.buildDreamTools()
+                );
+                double elapsed = (System.currentTimeMillis() - t0) / 1000.0;
+                String content;
+                if (MemoryStore.dreamRunCompleted(resp)) {
+                    store.setLastDreamCursor(result.lastCursor());
+                    content = "Dream completed in " + String.format("%.1f", elapsed) + "s.";
+                } else {
+                    content = "Dream did not complete after " + String.format("%.1f", elapsed)
+                        + "s; memory cursor was not advanced.";
+                }
+                // Record token usage
+                ctx.loop().context().tokenUsageHook().recordResponseTokenUsage(
+                    resp, "dream", ctx.loop().context().timezone()
+                );
+                // Auto-commit if git initialized
+                if (store.git().isInitialized()) {
+                    String commitMsg = MemoryStore.buildDreamCommitMessage(
+                        "dream: manual run", resp);
+                    String sha = store.git().autoCommit(commitMsg);
+                    if (sha != null) {
+                        content += " (commit " + sha + ")";
+                    }
+                }
+                store.compactHistory();
+                MemoryStore.pruneDreamSessions(ctx.loop().sessions().sessionsDir());
+                ctx.loop().bus().publishOutbound(new OutboundMessage(
+                    ctx.msg().channel(), ctx.msg().chatId(), content
+                ));
+            } catch (Exception e) {
+                ctx.loop().bus().publishOutbound(new OutboundMessage(
+                    ctx.msg().channel(), ctx.msg().chatId(),
+                    "Dream failed: " + e.getMessage()
+                ));
+            }
+        });
+
         return CompletableFuture.completedFuture(
             new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
                 "Dreaming...", ctx.msg().metadata())
         );
     }
 
+    /**
+     * /dream-log [sha] — Show what the last Dream changed.
+     * 对标 Python cmd_dream_log().
+     */
     public static CompletableFuture<OutboundMessage> cmdDreamLog(CommandContext ctx) {
-        return CompletableFuture.completedFuture(
-            new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                "Dream log functionality.", Map.of("render_as", "text"))
-        );
+        return CompletableFuture.supplyAsync(() -> {
+            MemoryStore store = ctx.loop().context().memory();
+            GitStore git = store.git();
+            Map<String, Object> metadata = new java.util.HashMap<>(ctx.msg().metadata());
+            metadata.put("render_as", "text");
+
+            if (!git.isInitialized()) {
+                String msg = store.getLastDreamCursor() == 0
+                    ? "Dream has not run yet. Run `/dream`, or wait for the next scheduled Dream cycle."
+                    : "Dream history is not available because memory versioning is not initialized.";
+                return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                    msg, metadata);
+            }
+
+            String args = ctx.args().strip();
+            String content;
+
+            if (!args.isEmpty()) {
+                String sha = args.split("\\s+")[0];
+                GitStore.CommitDiffResult result = git.showCommitDiff(sha);
+                if (result == null) {
+                    content = "Couldn't find Dream change `" + sha + "`.\n\n"
+                        + "Use `/dream-restore` to list recent versions, "
+                        + "or `/dream-log` to inspect the latest one.";
+                } else {
+                    content = formatDreamLogContent(result.commit(), result.diff(),
+                        sha, false);
+                }
+            } else {
+                List<GitStore.Commit> commits = git.log(1);
+                if (!commits.isEmpty()) {
+                    GitStore.CommitDiffResult result = git.showCommitDiff(
+                        commits.get(0).sha());
+                    if (result != null) {
+                        content = formatDreamLogContent(result.commit(), result.diff(),
+                            null, false);
+                    } else {
+                        content = "Dream memory has no saved versions yet.";
+                    }
+                } else {
+                    content = "Dream memory has no saved versions yet.";
+                }
+            }
+
+            return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                content, metadata);
+        });
     }
 
-    public static CompletableFuture<OutboundMessage> cmdDreamRestore(CommandContext ctx) {
-        return CompletableFuture.completedFuture(
-            new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                "Dream restore functionality.", Map.of("render_as", "text"))
-        );
+    private static String formatDreamLogContent(GitStore.Commit commit, String diff,
+            String requestedSha, boolean isLatest) {
+        String filesLine = formatChangedFiles(diff);
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Dream Update\n\n");
+        if (requestedSha != null) {
+            sb.append("Here is the selected Dream memory change.\n\n");
+        } else {
+            sb.append("Here is the latest Dream memory change.\n\n");
+        }
+        sb.append("- Commit: `").append(commit.sha()).append("`\n");
+        sb.append("- Time: ").append(commit.timestamp()).append("\n");
+        sb.append("- Changed files: ").append(filesLine).append("\n");
+        if (diff != null && !diff.isEmpty()) {
+            sb.append("\nUse `/dream-restore ").append(commit.sha())
+                .append("` to undo this change.\n\n");
+            sb.append("```diff\n").append(diff.stripTrailing()).append("\n```\n");
+        } else {
+            sb.append("\nDream recorded this version, but there is no file diff to display.\n");
+        }
+        return sb.toString();
     }
+
+    /**
+     * /dream-restore [sha] — Restore memory from a previous Dream commit.
+     * 对标 Python cmd_dream_restore().
+     */
+    public static CompletableFuture<OutboundMessage> cmdDreamRestore(CommandContext ctx) {
+        return CompletableFuture.supplyAsync(() -> {
+            MemoryStore store = ctx.loop().context().memory();
+            GitStore git = store.git();
+            Map<String, Object> metadata = new java.util.HashMap<>(ctx.msg().metadata());
+            metadata.put("render_as", "text");
+
+            if (!git.isInitialized()) {
+                return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                    "Dream history is not available because memory versioning "
+                        + "is not initialized.", metadata);
+            }
+
+            String args = ctx.args().strip();
+            String content;
+
+            if (args.isEmpty()) {
+                // List recent commits
+                List<GitStore.Commit> commits = git.log(10);
+                if (commits.isEmpty()) {
+                    content = "Dream memory has no saved versions to restore yet.";
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("## Dream Restore\n\n");
+                    sb.append("Choose a Dream memory version to restore. Latest first:\n\n");
+                    for (GitStore.Commit c : commits) {
+                        sb.append("- `").append(c.sha()).append("` ")
+                            .append(c.timestamp()).append(" - ")
+                            .append(c.message().split("\\n")[0]).append("\n");
+                    }
+                    sb.append("\nPreview a version with `/dream-log <sha>` before restoring it.\n");
+                    sb.append("Restore a version with `/dream-restore <sha>`.\n");
+                    content = sb.toString();
+                }
+            } else {
+                String sha = args.split("\\s+")[0];
+                GitStore.CommitDiffResult result = git.showCommitDiff(sha);
+                String changedFiles = result != null
+                    ? formatChangedFiles(result.diff()) : "the tracked memory files";
+                String newSha = git.revert(sha);
+                if (newSha != null) {
+                    content = "Restored Dream memory to the state before `" + sha + "`.\n\n"
+                        + "- New safety commit: `" + newSha + "`\n"
+                        + "- Restored files: " + changedFiles + "\n\n"
+                        + "Use `/dream-log " + newSha + "` to inspect the restore diff.";
+                } else {
+                    content = "Couldn't restore Dream change `" + sha + "`.\n\n"
+                        + "It may not exist, or it may be the first saved version "
+                        + "with no earlier state to restore.";
+                }
+            }
+
+            return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                content, metadata);
+        });
+    }
+
+    private static String extractChangedFiles(String diff) {
+        Set<String> seen = new java.util.LinkedHashSet<>();
+        for (String line : diff.split("\\n")) {
+            if (!line.startsWith("diff --git ")) continue;
+            String[] parts = line.split("\\s+");
+            if (parts.length < 4) continue;
+            String path = parts[3];
+            if (path.startsWith("b/")) path = path.substring(2);
+            if (!seen.contains(path)) seen.add(path);
+        }
+        return seen.isEmpty() ? "No tracked memory files changed."
+            : seen.stream().map(p -> "`" + p + "`")
+                .collect(java.util.stream.Collectors.joining(", "));
+    }
+
+    private static String formatChangedFiles(String diff) {
+        return extractChangedFiles(diff);
+    }
+
+    // --- /skill (对标 Python cmd_skill) ---
 
     public static CompletableFuture<OutboundMessage> cmdSkill(CommandContext ctx) {
-        return CompletableFuture.completedFuture(
-            new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                "Skills list.", ctx.msg().metadata())
-        );
+        return CompletableFuture.supplyAsync(() -> {
+            List<Map<String, String>> skills =
+                ctx.loop().context().skills().listSkills(false);
+            String content;
+            if (skills.isEmpty()) {
+                content = "No skills available.";
+            } else {
+                StringBuilder sb = new StringBuilder();
+                sb.append("Available skills (").append(skills.size()).append("):\n\n");
+                for (Map<String, String> entry : skills) {
+                    String name = entry.get("name");
+                    String desc = ctx.loop().context().skills()
+                        .getSkillDescription(name);
+                    sb.append("- **").append(name).append("** — ").append(desc).append("\n");
+                }
+                content = sb.toString();
+            }
+            return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                content, ctx.msg().metadata());
+        });
     }
 
+    // --- /pairing (对标 Python cmd_pairing) ---
+
     public static CompletableFuture<OutboundMessage> cmdPairing(CommandContext ctx) {
-        return CompletableFuture.completedFuture(
-            new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
-                "Pairing management.", ctx.msg().metadata())
-        );
+        return CompletableFuture.supplyAsync(() -> {
+            String reply = com.nanobot.pairing.PairingCommandHandler
+                .handlePairingCommand(ctx.msg().channel(), ctx.args());
+            Map<String, Object> metadata = new java.util.HashMap<>(ctx.msg().metadata());
+            metadata.put(com.nanobot.pairing.PairingCommandHandler.PAIRING_COMMAND_META_KEY,
+                true);
+            return new OutboundMessage(ctx.msg().channel(), ctx.msg().chatId(),
+                reply, metadata);
+        });
     }
 
     // --- Formatting helpers ---
@@ -1556,6 +1852,94 @@ public class ReasoningBuffer {
 }
 ```
 
+### 7b. `CliModels.java` — 模型信息辅助
+
+对标 Python `cli/models.py`。
+
+```java
+package com.nanobot.cli;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Model information helpers for CLI and onboarding.
+ * 对标 Python cli/models.py.
+ *
+ * Model database / autocomplete is temporarily disabled while litellm is
+ * being replaced. All public function signatures are preserved so callers
+ * continue to work without changes.
+ */
+public final class CliModels {
+
+    private CliModels() {}
+
+    /** 对标 Python get_all_models(). Returns empty while model DB is disabled. */
+    public static List<String> getAllModels() {
+        return List.of();
+    }
+
+    /** 对标 Python find_model_info(). Returns null while model DB is disabled. */
+    public static Map<String, Object> findModelInfo(String modelName) {
+        return null;
+    }
+
+    /** 对标 Python get_model_context_limit(). Returns null while model DB is disabled. */
+    public static Integer getModelContextLimit(String model, String provider) {
+        return null;
+    }
+
+    /** 对标 Python get_model_suggestions(). Returns empty while model DB is disabled. */
+    public static List<String> getModelSuggestions(String partial, String provider, int limit) {
+        return List.of();
+    }
+
+    /**
+     * Format token count for display (e.g., 200000 → "200,000").
+     * 对标 Python format_token_count().
+     */
+    public static String formatTokenCount(long tokens) {
+        return String.format("%,d", tokens);
+    }
+}
+```
+
+### 7c. `SanitizeSurrogates.java` — 输入清理
+
+对标 Python `_sanitize_surrogates()` + `SafeFileHistory`。
+
+```java
+package com.nanobot.cli;
+
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Reconstruct surrogate pairs into real characters; replace lone surrogates.
+ * 对标 Python _sanitize_surrogates() + SafeFileHistory.
+ *
+ * On Windows, console input may produce lone surrogate code points
+ * (e.g., \\uD83D\\uDC08 for U+1F408). Round-tripping through UTF-16
+ * reconstructs paired surrogates into their actual characters and
+ * replaces unpaired ones with U+FFFD.
+ */
+public final class SanitizeSurrogates {
+
+    private SanitizeSurrogates() {}
+
+    /**
+     * 对标 Python: text.encode("utf-16-le", errors="surrogatepass")
+     *                 .decode("utf-16-le", errors="replace")
+     */
+    public static String sanitize(String text) {
+        if (text == null) {
+            return "";
+        }
+        byte[] utf16Bytes = text.getBytes(StandardCharsets.UTF_16LE);
+        return new String(utf16Bytes, StandardCharsets.UTF_16LE);
+    }
+}
+```
+
 ### 8. `OnboardWizard.java` — 交互式向导
 
 对标 Python `cli/onboard.py`。使用 JLine3 的终端能力实现交互式选择。
@@ -1801,44 +2185,7 @@ public record OnboardResult(
 ) {}
 ```
 
-### 10. `SanitizeSurrogates.java` — 输入清理
-
-对标 Python `_sanitize_surrogates()`。
-
-```java
-package com.nanobot.cli;
-
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
-
-/**
- * Reconstruct surrogate pairs into real characters; replace lone surrogates.
- * 对标 Python _sanitize_surrogates().
- *
- * On Windows, console input may produce lone surrogate code points
- * (e.g., \\uD83D\\uDC08 for U+1F408). Round-tripping through UTF-16
- * reconstructs paired surrogates into their actual characters and
- * replaces unpaired ones with U+FFFD.
- */
-public final class SanitizeSurrogates {
-
-    private SanitizeSurrogates() {}
-
-    /**
-     * 对标 Python: text.encode("utf-16-le", errors="surrogatepass")
-     *                 .decode("utf-16-le", errors="replace")
-     */
-    public static String sanitize(String text) {
-        if (text == null) {
-            return "";
-        }
-        byte[] utf16Bytes = text.getBytes(StandardCharsets.UTF_16LE);
-        return new String(utf16Bytes, StandardCharsets.UTF_16LE);
-    }
-}
-```
-
-### 11. `JLineUtils.java` — 终端初始化
+### 10. `JLineUtils.java` — 终端初始化
 
 ```java
 package com.nanobot.cli;
@@ -1934,7 +2281,7 @@ public final class JLineUtils {
 }
 ```
 
-### 12. Java 类映射总结表
+### 11. Java 类映射总结表
 
 | Python 文件 | Java 类 | 包路径 |
 |---|---|---|
@@ -1952,9 +2299,12 @@ public final class JLineUtils {
 | `command/router.py` | `CommandRouter` | `com.nanobot.command` |
 | `command/router.py` | `CommandContext` (record) | `com.nanobot.command` |
 | `command/builtin.py` | `BuiltinCommands` (utility) | `com.nanobot.command` |
+| `command/builtin.py` | `BuiltinCommandSpec` (record) | `com.nanobot.command` |
 | `command/builtin.py` | `StatusContentBuilder` (utility) | `com.nanobot.utils` |
+| `cli/commands.py` (restart) | `RestartNoticeUtil` (utility) | `com.nanobot.utils` |
+| `cli/commands.py` (heartbeat) | `HeartbeatUtil` (utility) | `com.nanobot.cli` |
 
-### 13. 关键设计决策
+### 12. 关键设计决策
 
 #### CLI 框架选择
 选择 **Spring Shell** 作为主 CLI 框架，JLine3 作为底层终端库。Spring Shell 内置于 Spring Boot 生态，提供 `@ShellComponent`、`@ShellMethod`、`@ShellOption` 注解，对标 Python Typer 的声明式命令注册。
@@ -1990,7 +2340,7 @@ Spring Shell 默认提供交互式 REPL。对标 Python agent 的交互循环 (`
 - `[3m` → 斜体 (对标 Rich `[italic]`)
 - `[1m` → 加粗 (对标 Rich `[bold]`)
 
-### 14. 验证标准
+### 13. 验证标准
 
 ```bash
 # 1. CLI help
@@ -2033,23 +2383,155 @@ java -jar nanobot-java.jar status
 # verify builtinCommandPalette() returns 13 commands
 ```
 
-### 15. 代码量估算
+### 14. 代码量估算
 
 | Java 文件 | 行数 |
 |---|---|
-| `CliCommands.java` (@ShellComponent) | ~350 |
+| `CliCommands.java` (@ShellComponent) | ~450 |
 | `StreamRenderer.java` | ~180 |
 | `ReasoningBuffer.java` | ~50 |
-| `CliModels.java` (utility) | ~30 |
+| `CliModels.java` (utility) | ~40 |
 | `OnboardWizard.java` (utility) | ~200 |
 | `OnboardResult.java` (record) | ~10 |
 | `OnboardConfigBuilder.java` | ~80 |
 | `JLineUtils.java` (utility) | ~80 |
-| `SanitizeSurrogates.java` (utility) | ~25 |
+| `SanitizeSurrogates.java` (utility) | ~30 |
 | `SignalHandlers.java` (utility) | ~30 |
 | `CommandRouter.java` | ~100 |
 | `CommandContext.java` (record) | ~25 |
-| `BuiltinCommands.java` (utility) | ~350 |
+| `BuiltinCommands.java` (utility) | ~550 |
 | `StatusContentBuilder.java` (utility) | ~80 |
 | `RestartNoticeUtil.java` (utility) | ~50 |
-| **合计** | **~1,640** |
+| `HeartbeatUtil.java` (utility) | ~40 |
+| **合计** | **~2,005** |
+
+### 15. 复刻完整度评估
+
+#### 对标清单
+
+| Python 源文件 | Python 行数 | Java 覆盖 | 状态 |
+|---|---|---|---|
+| `cli/commands.py` | 2,043 | `CliCommands` + 辅助类 | 90% |
+| `cli/stream.py` | 231 | `StreamRenderer` + `ReasoningBuffer` | 95% |
+| `cli/models.py` | 32 | `CliModels` | 100% |
+| `cli/onboard.py` | 1,385 | `OnboardWizard` + `OnboardConfigBuilder` | 75% |
+| `command/router.py` | 50 | `CommandRouter` + `CommandContext` | 100% |
+| `command/builtin.py` | 719 | `BuiltinCommands` + `StatusContentBuilder` | 95% |
+
+#### 方法级差异
+
+**`cli/commands.py` → `CliCommands.java`:**
+- `main()` / `version_callback`: ✅ — `--version` / `-v` via Spring Shell
+- `onboard()`: ✅ — 含 config 存在检测、overwrite/refresh、wizard 委托、插件注入
+- `serve()`: ✅ — OpenAI 兼容 API 服务器定义
+- `gateway()`: ✅ — 含 cron/Heartbeat/Dream/ChannelManager 启动
+- `desktop_gateway()`: ⚠️ — hidden command，仅文档描述未提供完整代码
+- `agent()`: ✅ — 单次消息 + 交互模式双路径
+- `agent()` 信号处理: ✅ — SIGINT/SIGTERM/SIGHUP/SIGPIPE 处理已描述
+- `agent()` `_flush_pending_tty_input()`: ⚠️ — 文档提及但代码未单独列出
+- `agent()` `_sanitize_surrogates()`: ✅ — `SanitizeSurrogates` 工具类
+- `channels status`: ⚠️ — 文档提及但代码在 CliCommands 中未展开
+- `channels login`: ⚠️ — 文档提及但代码在 CliCommands 中未展开
+- `plugins list`: ⚠️ — 文档提及但代码在 CliCommands 中未展开
+- `provider login/logout`: ⚠️ — 文档提及但 Java 代码未展开（依赖 OAuth SDK）
+- `status()`: ✅ — 含 provider API key 检查
+- `_run_gateway()`: ✅ — 核心启动逻辑含 cron/Heartbeat/Dream
+- `_migrate_cron_store()`: ⚠️ — 辅助迁移逻辑，Java 可简化
+- `_warn_deprecated_config_keys()`: ⚠️ — 辅助提示逻辑，Java 可简化
+- loguru logger 设置: ✅ — SLF4J/Logback 替代
+
+**`cli/stream.py` → `StreamRenderer.java` + `ReasoningBuffer.java`:**
+- `StreamRenderer.__init__()`: ✅ — markdown + spinner + bot_name/bot_icon
+- `on_delta(delta)`: ✅ — Rich Live 对应 ANSI 转义序列
+- `on_end(resuming)`: ✅ — 含 resuming 重启 spinner 逻辑
+- `ensure_header()`: ✅ — 含 header_printed 守卫
+- `stop_for_input()`: ✅ — spinner 停止避免 prompt_toolkit 冲突
+- `close()`: ✅ — 干净停止不渲染
+- `pause_spinner()`: ✅ — PausedSpinnerContext AutoCloseable
+- `console` property: ⚠️ — Java 版未暴露 console 引用给外部 print 函数
+- `_render_str()`: ⚠️ — Java 版直接写 buffer string 而非通过 Rich 渲染管道
+- `ThinkingSpinner`: ✅ — 合并进 StreamRenderer.stopSpinner()/startSpinner()
+- `_ReasoningBuffer`: ✅ — ReasoningBuffer.java sentence/flush 逻辑
+
+**`cli/models.py` → `CliModels.java`:**
+- `get_all_models()`: ✅
+- `find_model_info()`: ✅
+- `get_model_context_limit()`: ✅
+- `get_model_suggestions()`: ✅
+- `format_token_count()`: ✅
+
+**`cli/onboard.py` → `OnboardWizard.java`:**
+- `run_onboard()`: ⚠️ — Python menu-based 循环；Java 线性 walk-through
+- Provider 选择: ✅ — 含 `PROVIDER_CHOICES` 列表
+- Model 选择: ✅ — 含 `DEFAULT_MODELS` 映射
+- `_select_with_back()`: ❌ — custom prompt_toolkit menu，Java JLine3 替代为简化选择
+- `_get_field_type_info()`: ❌ — Pydantic 字段类型内省，Java 无对等概念
+- `_format_value()` / `_format_value_for_input()`: ❌ — 深层递归值格式化未实现
+- `_validate_field_constraint()`: ❌ — Pydantic metadata 约束验证未实现
+- `_is_sensitive_field()` / `_mask_value()`: ❌ — 敏感字段掩码未实现
+- `_configure_providers()` / `_configure_model_presets()` 等子菜单: ❌ — 数个子菜单项未实现
+- `_has_unsaved_changes()`: ❌ — 变更检测未实现
+- `_show_summary()`: ❌ — Rich Panel/Table 摘要未实现
+- `_prompt_main_menu_exit()`: ❌ — 退出确认流未实现
+- **注：** OnboardWizard 的大量 Python questionary 交互细节在 Java 中简化为基本 JLine3 线性提示。完整复刻需要大量自定义 prompt_toolkit 级别的 UI 工作
+
+**`command/router.py` → `CommandRouter.java`:**
+- 三层路由表: ✅
+- `is_priority()`: ✅
+- `is_dispatchable_command()`: ✅
+- `dispatch_priority()`: ✅
+- `dispatch()`: ✅
+- `CommandContext` dataclass: ✅
+
+**`command/builtin.py` → `BuiltinCommands.java`:**
+- `BUILTIN_COMMAND_SPECS`: ✅ — 含所有 13 个命令
+- `builtin_command_palette()`: ✅
+- `cmd_stop()`: ✅
+- `cmd_restart()`: ✅
+- `cmd_status()`: ✅ — 含 context_tokens_estimate / search_usage / max_completion_tokens / subagents
+- `cmd_new()`: ✅ — 含 snapshot archive
+- `cmd_model()`: ✅ — 含 max_tokens / `_command_error_message()`
+- `cmd_history()`: ✅ — 含 content list 处理 / truncation
+- `cmd_goal()`: ✅ — 含完整 `_GOAL_PROMPT_TEMPLATE`
+- `cmd_dream()`: ✅ — 含 MemoryStore / process_direct / auto_commit / token_usage
+- `cmd_dream_log()`: ✅ — 含 git diff / file changes / commit metadata
+- `cmd_dream_restore()`: ✅ — 含 commit list / restore / safety commit
+- `cmd_skill()`: ✅ — 含 list_skills / _get_skill_description
+- `cmd_help()`: ✅ — 含 build_help_text()
+- `cmd_pairing()`: ✅ — 含 PairingCommandHandler 委托
+- `_format_preset_names()` / `_model_preset_names()` / `_active_model_preset_name()`: ⚠️ — 内联而非单独 helper
+- `_format_history_message()`: ✅ — 含 HISTORY_MAX_CONTENT_CHARS
+- `_format_dream_log_content()` / `_format_dream_restore_list()`: ✅
+- `_extract_changed_files()` / `_format_changed_files()`: ✅
+
+#### 待补项
+
+| 优先级 | 项 | 说明 |
+|---|---|---|
+| P4 | `OnboardWizard` menu 循环 | 从线性 walk-through 升级为 Python 的 menu-based 循环。不影响功能——onboard 是一次性操作，且 WebUI Settings 是日常配置入口。需大量 JLine3 自定义 UI 工作，投入产出比低 |
+| P2 | `CliCommands` channels/plugins/provider 子命令 | 展开完整的 channels status/login、plugins list、provider login/logout 代码 |
+| P2 | `desktop_gateway()` 完整代码 | 展开隐藏命令的完整 Java 实现 |
+| P4 | OnboardWizard 字段验证/格式化/掩码 | `_validate_field_constraint()` / `_format_value()` / `_mask_value()`。不影响功能——config 加载时 Spring Boot Bean Validation 兜底校验，WebUI Settings 有独立掩码逻辑 |
+| P4 | `_render_str()` in StreamRenderer | 通过 Rich Markdown 渲染管道输出纯文本（ANSI 直接写 buffer 可替代） |
+| P4 | `_flush_pending_tty_input()` | 终端输入刷新辅助方法 |
+
+#### 测试覆盖
+
+| 测试项 | 状态 |
+|---|---|
+| CommandRouter 单元测试 (priority/exact/prefix 路由) | 需编写 |
+| BuiltinCommands 每个 cmd_* handler 输入/输出测试 | 需编写 |
+| StreamRenderer onDelta/onEnd/resuming 单元测试 | 需编写 |
+| ReasoningBuffer flush 边界条件测试 | 需编写 |
+| SanitizeSurrogates surrogate pair 往返测试 | 需编写 |
+| CliModels formatTokenCount 格式化测试 | 需编写 |
+
+#### 构建验证
+
+| 检查项 | 状态 |
+|---|---|
+| `./gradlew compileJava` 零错误 | 需验证 |
+| Spring Shell `@ShellComponent` 自动注册验证 | 需验证 |
+| `--help` 输出所有子命令 | 需验证 |
+| `agent -m "test"` 单次消息流式输出 | 需集成测试 |
+| `gateway` 启动含 cron/heartbeat/dream | 需集成测试 |

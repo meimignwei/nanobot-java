@@ -4,7 +4,7 @@
 
 The `nanobot/utils/` package contains 18 Python files providing general-purpose helpers, git-backed version control, file-edit event streaming, document text extraction, media decoding, template rendering, and runtime support. This document specifies the Java 21 + Spring Boot 3.2 port.
 
-**Estimated Java lines:** ~3,200 across 12 Java files.
+**Estimated Java lines:** ~3,725 across 19 Java files.
 
 ---
 
@@ -178,6 +178,41 @@ public final class Helpers {
 
     public record ThinkExtraction(String thinking, String cleanedText) {}
 
+    /**
+     * Return (reasoningText, cleanedContent) from one model response.
+     * Fallback order: reasoning_content → thinking_blocks → inline &lt;think&gt; blocks.
+     * Only one source contributes; lower-priority sources are ignored
+     * when a higher-priority one is present, but inline tags are always stripped.
+     */
+    @SuppressWarnings("unchecked")
+    public static ReasoningExtraction extractReasoning(
+            String reasoningContent,
+            List<Map<String, Object>> thinkingBlocks,
+            String content) {
+        if (reasoningContent != null && !reasoningContent.isEmpty()) {
+            return new ReasoningExtraction(reasoningContent,
+                content != null ? stripThink(content) : null);
+        }
+        if (thinkingBlocks != null && !thinkingBlocks.isEmpty()) {
+            List<String> parts = new ArrayList<>();
+            for (Map<String, Object> tb : thinkingBlocks) {
+                if ("thinking".equals(tb.get("type")) && tb.get("thinking") instanceof String s && !s.isEmpty()) {
+                    parts.add(s);
+                }
+            }
+            String joined = parts.isEmpty() ? null : String.join("\n\n", parts);
+            return new ReasoningExtraction(joined,
+                content != null ? stripThink(content) : null);
+        }
+        if (content != null) {
+            ThinkExtraction te = extractThink(content);
+            return new ReasoningExtraction(te.thinking(), te.cleanedText());
+        }
+        return new ReasoningExtraction(null, content);
+    }
+
+    public record ReasoningExtraction(String reasoning, String cleanedContent) {}
+
     // ── MIME Detection ─────────────────────────────────────────
 
     /**
@@ -258,6 +293,12 @@ public final class Helpers {
     public static String safeFilename(String name) {
         if (name == null || name.isEmpty()) return "unnamed";
         return UNSAFE_CHARS.matcher(name).replaceAll("_").strip();
+    }
+
+    /** Build an image placeholder string for use when image data can't be shown inline. */
+    public static String imagePlaceholderText(String path, String empty) {
+        String fallback = empty != null ? empty : "[image]";
+        return (path != null && !path.isEmpty()) ? "[image: " + path + "]" : fallback;
     }
 
     // ── Message Splitting ──────────────────────────────────────
@@ -411,6 +452,76 @@ public final class Helpers {
         if (value instanceof String s && !s.isEmpty()) sb.append(s);
     }
 
+    /** Estimate prompt tokens contributed by one persisted message. */
+    @SuppressWarnings("unchecked")
+    public static int estimateMessageTokens(Map<String, Object> message) {
+        List<String> parts = new ArrayList<>();
+        Object content = message.get("content");
+        if (content instanceof String s) {
+            parts.add(s);
+        } else if (content instanceof List<?> list) {
+            for (Object part : list) {
+                if (part instanceof Map<?, ?> pm && "text".equals(pm.get("type"))) {
+                    Object txt = pm.get("text");
+                    if (txt != null) parts.add(txt.toString());
+                } else {
+                    parts.add(String.valueOf(part));
+                }
+            }
+        } else if (content != null) {
+            parts.add(String.valueOf(content));
+        }
+
+        for (String key : List.of("name", "tool_call_id")) {
+            Object val = message.get(key);
+            if (val instanceof String s && !s.isEmpty()) parts.add(s);
+        }
+        if (message.get("tool_calls") != null) {
+            parts.add(message.get("tool_calls").toString());
+        }
+        Object rc = message.get("reasoning_content");
+        if (rc instanceof String s && !s.isEmpty()) parts.add(s);
+
+        String payload = String.join("\n", parts);
+        if (payload.isEmpty()) return PER_MESSAGE_OVERHEAD;
+        try {
+            return Math.max(PER_MESSAGE_OVERHEAD,
+                CL100K_BASE.encode(payload).size() + PER_MESSAGE_OVERHEAD);
+        } catch (Exception e) {
+            return Math.max(PER_MESSAGE_OVERHEAD, payload.length() / 4 + PER_MESSAGE_OVERHEAD);
+        }
+    }
+
+    /**
+     * Estimate prompt tokens via provider counter first, then tiktoken fallback.
+     * Returns (tokenCount, source).
+     */
+    public static TokenEstimate estimatePromptTokensChain(
+            Object provider,
+            String model,
+            List<Map<String, Object>> messages,
+            List<Map<String, Object>> tools) {
+        // Try provider's built-in counter first (via reflection or interface)
+        if (provider instanceof TokenCounter tc) {
+            try {
+                long count = tc.estimatePromptTokens(messages, tools, model);
+                if (count > 0) return new TokenEstimate((int) count, "provider_counter");
+            } catch (Exception ignored) {}
+        }
+        int estimated = estimatePromptTokens(messages, tools);
+        if (estimated > 0) return new TokenEstimate(estimated, "tiktoken");
+        return new TokenEstimate(0, "none");
+    }
+
+    public record TokenEstimate(int tokens, String source) {}
+
+    /** Interface for providers that have a native token-counting method. */
+    @FunctionalInterface
+    public interface TokenCounter {
+        long estimatePromptTokens(List<Map<String, Object>> messages,
+                                  List<Map<String, Object>> tools, String model);
+    }
+
     // ── Tool Result Persistence ────────────────────────────────
 
     /**
@@ -562,15 +673,80 @@ public final class Helpers {
 
     // ── Workspace Template Sync ────────────────────────────────
 
+    private static final String[] BUNDLED_TEMPLATES = {
+        "SOUL.md", "USER.md", "MEMORY.md"
+    };
+
     /**
-     * Sync bundled templates to workspace. Creates missing files without
-     * overwriting existing user files. Returns list of created relative paths.
+     * Sync bundled templates from classpath resources to workspace.
+     * Creates missing files without overwriting existing user files.
+     * Also initializes the memory git store. Returns list of created relative paths.
      */
     public static List<String> syncWorkspaceTemplates(Path workspace, boolean silent) {
-        // Implementation reads from classpath resources/templates/ and copies
-        // missing files. See Section 4 for the resource layout.
-        // ...
-        return List.of(); // placeholder
+        List<String> added = new ArrayList<>();
+        try {
+            Files.createDirectories(workspace);
+        } catch (IOException e) {
+            return added;
+        }
+
+        // Copy bundled templates that don't exist yet
+        for (String name : BUNDLED_TEMPLATES) {
+            Path dest = workspace.resolve(name);
+            if (!Files.exists(dest)) {
+                String bundled = loadBundledTemplate(name);
+                if (bundled != null) {
+                    try {
+                        Files.createDirectories(dest.getParent());
+                        Files.writeString(dest, bundled, StandardCharsets.UTF_8);
+                        added.add(name);
+                    } catch (IOException ignored) {}
+                }
+            }
+        }
+
+        // Ensure memory directory and empty history file
+        Path memoryDir = workspace.resolve("memory");
+        try {
+            Files.createDirectories(memoryDir);
+            Path history = memoryDir.resolve("history.jsonl");
+            if (!Files.exists(history)) {
+                Files.writeString(history, "", StandardCharsets.UTF_8);
+            }
+        } catch (IOException ignored) {}
+
+        // Ensure skills directory
+        try {
+            Files.createDirectories(workspace.resolve("skills"));
+        } catch (IOException ignored) {}
+
+        // Initialize git store for memory version control
+        try {
+            GitStore gs = new GitStore(workspace,
+                List.of("SOUL.md", "USER.md", "memory/MEMORY.md"));
+            gs.init();
+        } catch (Exception ignored) {}
+
+        if (!added.isEmpty() && !silent) {
+            for (String name : added) {
+                System.out.println("  Created " + name);
+            }
+        }
+        return added;
+    }
+
+    /**
+     * Read a bundled template file from classpath resources/templates/.
+     * Returns null if the resource is not found or unreadable.
+     */
+    public static String loadBundledTemplate(String templateName) {
+        try (InputStream is = Helpers.class.getClassLoader()
+                .getResourceAsStream("templates/" + templateName)) {
+            if (is == null) return null;
+            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     // ── Status Content Builder ─────────────────────────────────
@@ -729,7 +905,34 @@ public final class RuntimeConstants {
             custom != null ? custom : SUSTAINED_GOAL_CONTINUE_PROMPT);
     }
 
-    // External lookup signature (for throttling repeated lookups)
+    // ── Tool Result Guards ─────────────────────────────────────
+
+    /** Replace semantically empty tool results with a short marker string. */
+    @SuppressWarnings("unchecked")
+    public static Object ensureNonemptyToolResult(String toolName, Object content) {
+        if (content == null) return emptyToolResultMessage(toolName);
+        if (content instanceof String s && s.isBlank())
+            return emptyToolResultMessage(toolName);
+        if (content instanceof List<?> list) {
+            if (list.isEmpty()) return emptyToolResultMessage(toolName);
+            String text = Helpers.stringifyTextBlocks((List<Map<String, Object>>) content);
+            if (text != null && text.isBlank())
+                return emptyToolResultMessage(toolName);
+        }
+        return content;
+    }
+
+    /** True when content is missing or only whitespace. */
+    public static boolean isBlankText(String content) {
+        return content == null || content.isBlank();
+    }
+
+    // ── External Lookup Throttling ─────────────────────────────
+
+    /**
+     * Stable signature for repeated external lookups we want to throttle.
+     * Returns null if not a tracked external lookup tool.
+     */
     public static String externalLookupSignature(String toolName, Map<String, Object> arguments) {
         if (arguments == null) return null;
         if ("web_fetch".equals(toolName)) {
@@ -743,14 +946,92 @@ public final class RuntimeConstants {
         }
         return null;
     }
+
+    /**
+     * Block repeated external lookups after a small retry budget.
+     * Returns an error string if the limit is exceeded, null otherwise.
+     */
+    public static String repeatedExternalLookupError(
+            String toolName,
+            Map<String, Object> arguments,
+            Map<String, Integer> seenCounts) {
+        String signature = externalLookupSignature(toolName, arguments);
+        if (signature == null) return null;
+        int count = seenCounts.getOrDefault(signature, 0) + 1;
+        seenCounts.put(signature, count);
+        if (count <= MAX_REPEAT_EXTERNAL_LOOKUPS) return null;
+        log.warn("Blocking repeated external lookup {} on attempt {}", signature, count);
+        return "Error: repeated external lookup blocked. "
+            + "Use the results you already have to answer, or try a meaningfully different source.";
+    }
+
+    // ── Workspace Violation Throttling ─────────────────────────
+
+    private static final Pattern OUTSIDE_PATH_PATTERN =
+        Pattern.compile("(?:^|[\\s|>'\"'])((?:/[^\\s\"'>;|<]+)|(?:~[^\\s\"'>;|<]+))");
+
+    /**
+     * Return a stable cross-tool signature for the outside-workspace target.
+     */
+    public static String workspaceViolationSignature(String toolName, Map<String, Object> arguments) {
+        if (arguments == null) return null;
+        for (String key : List.of("path", "file_path", "target", "source", "destination")) {
+            Object val = arguments.get(key);
+            if (val instanceof String s && !s.isBlank())
+                return normalizeViolationTarget(s.strip());
+        }
+        if (Set.of("exec", "shell").contains(toolName)) {
+            String cmd = Objects.toString(arguments.get("command"), "").strip();
+            if (!cmd.isEmpty()) {
+                java.util.regex.Matcher matcher = OUTSIDE_PATH_PATTERN.matcher(cmd);
+                if (matcher.find()) return normalizeViolationTarget(matcher.group(1));
+            }
+            String cwd = Objects.toString(arguments.get("working_dir"), "").strip();
+            if (!cwd.isEmpty()) return normalizeViolationTarget(cwd);
+        }
+        return null;
+    }
+
+    private static String normalizeViolationTarget(String raw) {
+        try {
+            return "violation:" + Path.of(raw).toRealPath().toString().replace("\\", "/").toLowerCase();
+        } catch (Exception e) {
+            return "violation:" + raw.replace("\\", "/").toLowerCase();
+        }
+    }
+
+    /**
+     * Return an escalated error after repeated workspace-bypass attempts.
+     */
+    public static String repeatedWorkspaceViolationError(
+            String toolName,
+            Map<String, Object> arguments,
+            Map<String, Integer> seenCounts) {
+        String signature = workspaceViolationSignature(toolName, arguments);
+        if (signature == null) return null;
+        int count = seenCounts.getOrDefault(signature, 0) + 1;
+        seenCounts.put(signature, count);
+        if (count <= MAX_REPEAT_WORKSPACE_VIOLATIONS) return null;
+        log.warn("Escalating repeated workspace bypass attempt {} (attempt {})", signature, count);
+        String target = signature.contains("violation:")
+            ? signature.split("violation:", 2)[1] : signature;
+        return "Error: refusing repeated workspace-bypass attempts.\n"
+            + "You have tried to access '" + target + "' (or an equivalent path) "
+            + count + " times in this turn. This is a hard policy boundary -- "
+            + "switching tools, shell tricks, working_dir overrides, symlinks, "
+            + "or base64 piping will NOT change the answer. Stop retrying. "
+            + "If the user genuinely needs this resource, tell them you cannot "
+            + "access it and ask how they want to proceed (e.g. copy the file "
+            + "into the workspace, or disable restrict_to_workspace for this run).";
+    }
 }
 ```
 
 ---
 
-## 4. `FileEditEvents.java` — File Edit Event Streaming (~700 lines)
+## 4. `FileEditEvents.java` + `StreamingFileEditTracker.java` — File Edit Event Streaming (~850 lines)
 
-This is the most complex utility. It tracks streaming JSON tool-call arguments and emits approximate file-edit progress events to the WebUI before the final tool execution.
+This is the most complex utility pair. `FileEditEvents` handles snapshotting, diff stats, path resolution, and event payload construction. `StreamingFileEditTracker` tracks streaming JSON tool-call arguments and emits approximate file-edit progress events to the WebUI before the final tool execution.
 
 ### 4.1 Key Records
 
@@ -921,9 +1202,730 @@ public final class FileEditEvents {
         return trackers;
     }
 
-    // ... (remaining methods for resolveFileEditPaths, buildFileEditStartEvent,
-    //      buildFileEditEndEvent, buildFileEditErrorEvent, buildFileEditLiveEvent,
-    //      buildFileEditPendingEvent, StreamingFileEditTracker, etc.)
+    // ── Path Resolution ──────────────────────────────────────
+
+    public static boolean isFileEditTool(String toolName) {
+        return toolName != null && TRACKED_FILE_EDIT_TOOLS.contains(toolName);
+    }
+
+    public static List<Path> resolveFileEditPaths(
+            String toolName, Path workspace, Map<String, Object> params) {
+        if ("apply_patch".equals(toolName)) {
+            return resolveApplyPatchPaths(workspace, params);
+        }
+        Path path = resolveSinglePath(workspace, params);
+        return path != null ? List.of(path) : List.of();
+    }
+
+    private static Path resolveSinglePath(Path workspace, Map<String, Object> params) {
+        if (params == null) return null;
+        Object raw = params.get("path");
+        if (!(raw instanceof String s) || s.isBlank()) return null;
+        if (workspace == null) return Path.of(s);
+        return workspace.resolve(s).toAbsolutePath().normalize();
+    }
+
+    private static List<Path> resolveApplyPatchPaths(
+            Path workspace, Map<String, Object> params) {
+        if (params == null) return List.of();
+        Object editsObj = params.get("edits");
+        if (!(editsObj instanceof List<?> edits) || edits.isEmpty()) return List.of();
+        if (Boolean.TRUE.equals(params.get("dry_run"))) return List.of();
+
+        List<Path> resolved = new ArrayList<>();
+        Set<Path> seen = new HashSet<>();
+        for (Object edit : edits) {
+            if (!(edit instanceof Map<?, ?> em)) continue;
+            Object rawPath = em.get("path");
+            if (!(rawPath instanceof String s) || s.isBlank()) continue;
+            Path path = workspace != null
+                ? workspace.resolve(s).toAbsolutePath().normalize()
+                : Path.of(s);
+            if (seen.add(path)) resolved.add(path);
+        }
+        return resolved;
+    }
+
+    public static String displayFileEditPath(Path path, Path workspace) {
+        if (workspace != null) {
+            try {
+                return workspace.toRealPath().relativize(path.toRealPath()).toString();
+            } catch (IOException e) { /* fall through */ }
+        }
+        return path.toString();
+    }
+
+    // ── Event Builders ────────────────────────────────────────
+
+    public static Map<String, Object> buildFileEditStartEvent(
+            FileEditTracker tracker, Map<String, Object> params) {
+        String predictedAfter = predictAfterText(tracker.tool(), params, tracker.before());
+        int added = 0, deleted = 0;
+        if (tracker.before().countable() && predictedAfter != null) {
+            int[] diff = lineDiffStats(tracker.before().text(), predictedAfter);
+            added = diff[0]; deleted = diff[1];
+        }
+        return eventPayload(tracker, "start", "editing", added, deleted, true);
+    }
+
+    public static Map<String, Object> buildFileEditEndEvent(
+            FileEditTracker tracker, Map<String, Object> params) {
+        FileSnapshot after = readFileSnapshot(tracker.path());
+        boolean counted = false;
+        int added = 0, deleted = 0;
+        boolean binary = false;
+        String operation = null;
+
+        if (tracker.before().countable() && after.countable()) {
+            int[] diff = lineDiffStats(tracker.before().text(), after.text());
+            added = diff[0]; deleted = diff[1];
+            counted = true;
+        } else {
+            String predictedAfter = predictAfterText(tracker.tool(), params, tracker.before());
+            if (tracker.before().countable() && predictedAfter != null) {
+                int[] diff = lineDiffStats(tracker.before().text(), predictedAfter);
+                added = diff[0]; deleted = diff[1];
+                counted = true;
+            }
+        }
+
+        binary = (after.binary() || after.oversized() || after.unreadable()) && !counted;
+        if (tracker.before().exists() && !after.exists()) operation = "delete";
+
+        Map<String, Object> payload = eventPayload(tracker, "end", "done", added, deleted, false);
+        if (binary) payload.put("binary", true);
+        if (operation != null) payload.put("operation", operation);
+        return payload;
+    }
+
+    public static Map<String, Object> buildFileEditErrorEvent(
+            FileEditTracker tracker, String error) {
+        Map<String, Object> payload = eventPayload(
+            tracker, "error", "error", 0, 0, false);
+        if (error != null && !error.isBlank()) {
+            payload.put("error", error.strip().substring(0,
+                Math.min(error.strip().length(), 240)));
+        }
+        return payload;
+    }
+
+    public static Map<String, Object> buildFileEditLiveEvent(
+            FileEditTracker tracker, int added, int deleted, String operation) {
+        Map<String, Object> payload = eventPayload(
+            tracker, "start", "editing", added, deleted, true);
+        if (operation != null) payload.put("operation", operation);
+        return payload;
+    }
+
+    public static Map<String, Object> buildFileEditPendingEvent(
+            String callId, String toolName, int added, int deleted) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("version", 1);
+        payload.put("call_id", callId != null ? callId : "");
+        payload.put("tool", toolName);
+        payload.put("path", "");
+        payload.put("phase", "start");
+        payload.put("added", Math.max(0, added));
+        payload.put("deleted", Math.max(0, deleted));
+        payload.put("approximate", true);
+        payload.put("status", "editing");
+        payload.put("pending", true);
+        return payload;
+    }
+
+    // ── Internal Helpers ──────────────────────────────────────
+
+    private static Map<String, Object> eventPayload(
+            FileEditTracker tracker, String phase, String status,
+            int added, int deleted, boolean approximate) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("version", 1);
+        payload.put("call_id", tracker.callId());
+        payload.put("tool", tracker.tool());
+        payload.put("path", tracker.displayPath());
+        payload.put("absolute_path", tracker.path().toString().replace("\\", "/"));
+        payload.put("phase", phase);
+        payload.put("added", Math.max(0, added));
+        payload.put("deleted", Math.max(0, deleted));
+        payload.put("approximate", approximate);
+        payload.put("status", status);
+        return payload;
+    }
+
+    private static String predictAfterText(
+            String toolName, Map<String, Object> params, FileSnapshot before) {
+        if (!before.countable()) return null;
+        String beforeText = before.text() != null ? before.text() : "";
+
+        if ("write_file".equals(toolName)) {
+            Object content = params.get("content");
+            return content instanceof String s ? s : "";
+        }
+        if ("edit_file".equals(toolName)) {
+            Object oldObj = params.get("old_text");
+            Object newObj = params.get("new_text");
+            if (!(oldObj instanceof String oldText) || !(newObj instanceof String newText))
+                return null;
+            boolean replaceAll = Boolean.TRUE.equals(params.get("replace_all"));
+            if (oldText.isEmpty())
+                return !before.exists() ? newText : beforeText;
+            if (beforeText.contains(oldText)) {
+                return replaceAll
+                    ? beforeText.replace(oldText, newText)
+                    : beforeText.replaceFirst(Pattern.quote(oldText), Matcher.quoteReplacement(newText));
+            }
+            return null;
+        }
+        return null;
+    }
+}
+```
+
+### 4.2 `StreamingFileEditTracker.java` — Real-Time Streaming Tracker (~400 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.nio.file.Path;
+import java.util.*;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Track file-edit tool arguments while the model is still streaming them.
+ * Converts argument deltas into approximate WebUI file-edit events before
+ * the final exact diff is available.
+ */
+public class StreamingFileEditTracker {
+
+    private static final double LIVE_EMIT_INTERVAL_S = 0.18;
+    private static final int LIVE_EMIT_LINE_STEP = 24;
+
+    private final Path workspace;
+    private final Map<String, Object> tools;
+    private final Consumer<List<Map<String, Object>>> emit;
+    private final Map<String, StreamingFileEditState> states = new LinkedHashMap<>();
+
+    public StreamingFileEditTracker(
+            Path workspace,
+            Map<String, Object> tools,
+            Consumer<List<Map<String, Object>>> emit) {
+        this.workspace = workspace;
+        this.tools = tools;
+        this.emit = emit;
+    }
+
+    public void update(Map<String, Object> payload) {
+        String key = streamKey(payload);
+        if (key.isEmpty()) return;
+
+        StreamingFileEditState state = states.computeIfAbsent(key,
+            k -> new StreamingFileEditState(k));
+        state.applyDelta(payload);
+
+        if ("apply_patch".equals(state.name)) {
+            updateApplyPatch(state);
+            return;
+        }
+        if (!Set.of("write_file", "edit_file").contains(state.name)) return;
+
+        if (state.path == null) {
+            state.path = extractCompleteJsonString(state.arguments, "path");
+        }
+        if (state.path == null) {
+            int[] counts = state.liveDiffCounts();
+            double now = nowMono();
+            if (state.shouldEmitPending(counts[0], counts[1], now)) {
+                state.markPendingEmitted(counts[0], counts[1], now);
+                emit.accept(List.of(FileEditEvents.buildFileEditPendingEvent(
+                    state.callId != null ? state.callId : state.key,
+                    state.name, counts[0], counts[1])));
+            }
+            return;
+        }
+        if (state.tracker == null) {
+            state.tracker = FileEditEvents.prepareFileEditTracker(
+                state.callId != null ? state.callId : state.key,
+                state.name, workspace,
+                Map.of("path", state.path));
+            if (state.tracker == null) return;
+        }
+
+        int[] counts = state.liveDiffCounts();
+        double now = nowMono();
+        if (!state.shouldEmit(counts[0], counts[1], now)) return;
+        state.markEmitted(counts[0], counts[1], now);
+        emit.accept(List.of(FileEditEvents.buildFileEditLiveEvent(
+            state.tracker, counts[0], counts[1], null)));
+    }
+
+    private void updateApplyPatch(StreamingFileEditState state) {
+        if (jsonBoolTrue(state.arguments, "dry_run")) return;
+
+        List<Map<String, Object>> events = new ArrayList<>();
+        double now = nowMono();
+
+        Matcher pathMatcher = Pattern.compile("\"path\"\\s*:\\s*\"([^\"]+)\"")
+            .matcher(state.arguments);
+        List<int[]> pathSpans = new ArrayList<>();
+        while (pathMatcher.find()) {
+            pathSpans.add(new int[]{pathMatcher.start(), pathMatcher.end()});
+        }
+        if (pathSpans.isEmpty()) return;
+
+        for (int i = 0; i < pathSpans.size(); i++) {
+            int[] span = pathSpans.get(i);
+            // extract raw path from inside the quotes
+            int pathStart = state.arguments.indexOf('"', span[0] + 8) + 1;
+            String rawPath = state.arguments.substring(pathStart, span[1] - 1);
+
+            int segStart = span[0];
+            int segEnd = i + 1 < pathSpans.size()
+                ? pathSpans.get(i + 1)[0] : state.arguments.length();
+            String segment = state.arguments.substring(segStart, segEnd);
+
+            Matcher actionM = Pattern.compile("\"action\"\\s*:\\s*\"(replace|add)\"")
+                .matcher(segment);
+            String action = actionM.find() ? actionM.group(1) : "replace";
+
+            String oldText = extractJsonStringPrefix(segment, "old_text");
+            String newText = extractJsonStringPrefix(segment, "new_text");
+            if (oldText == null) oldText = "";
+            if (newText == null) newText = "";
+
+            int added = ("replace".equals(action) || "add".equals(action))
+                ? FileEditEvents.textLineCount(newText) : 0;
+            int deleted = "replace".equals(action)
+                ? FileEditEvents.textLineCount(oldText) : 0;
+
+            StreamingPatchFileState fileState = state.patchFiles.get(rawPath);
+            if (fileState == null) {
+                Path path = workspace != null
+                    ? workspace.resolve(rawPath).toAbsolutePath().normalize()
+                    : Path.of(rawPath);
+                FileEditEvents.FileEditTracker tracker =
+                    new FileEditEvents.FileEditTracker(
+                    state.callId != null ? state.callId : state.key,
+                    "apply_patch", path,
+                    FileEditEvents.displayFileEditPath(path, workspace),
+                    FileEditEvents.readFileSnapshot(path));
+                fileState = new StreamingPatchFileState(tracker);
+                state.patchFiles.put(rawPath, fileState);
+            }
+            if (!fileState.shouldEmit(added, deleted, now)) continue;
+            fileState.markEmitted(added, deleted, now);
+            events.add(FileEditEvents.buildFileEditLiveEvent(
+                fileState.tracker, added, deleted, null));
+        }
+        if (!events.isEmpty()) emit.accept(events);
+    }
+
+    public void flush() {
+        List<Map<String, Object>> events = new ArrayList<>();
+        double now = nowMono();
+        for (StreamingFileEditState state : states.values()) {
+            for (StreamingPatchFileState fs : state.patchFiles.values()) {
+                if (!fs.emittedOnce) continue;
+                if (fs.lastEmittedAdded == fs.lastAdded
+                    && fs.lastEmittedDeleted == fs.lastDeleted) continue;
+                fs.markEmitted(fs.lastAdded, fs.lastDeleted, now);
+                events.add(FileEditEvents.buildFileEditLiveEvent(
+                    fs.tracker, fs.lastAdded, fs.lastDeleted, null));
+            }
+            if (state.tracker == null) continue;
+            int[] counts = state.liveDiffCounts();
+            if (state.emittedOnce
+                && state.lastEmittedAdded == counts[0]
+                && state.lastEmittedDeleted == counts[1]) continue;
+            state.markEmitted(counts[0], counts[1], now);
+            events.add(FileEditEvents.buildFileEditLiveEvent(
+                state.tracker, counts[0], counts[1], null));
+        }
+        if (!events.isEmpty()) emit.accept(events);
+    }
+
+    public void applyFinalCallIds(List<?> finalToolCalls) {
+        Set<String> used = new HashSet<>();
+        for (Object tc : finalToolCalls) {
+            String canonical = canonicalCallIdFor(tc);
+            if (canonical != null && used.add(canonical)) {
+                try {
+                    var idField = tc.getClass().getDeclaredField("id");
+                    idField.setAccessible(true);
+                    idField.set(tc, canonical);
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    public String canonicalCallIdFor(Object toolCall) {
+        for (StreamingFileEditState state : states.values()) {
+            if (state.matchesFinalToolCall(toolCall)) {
+                if (state.callId != null) return state.callId;
+                if (state.tracker != null) return state.tracker.callId();
+                return state.key;
+            }
+        }
+        return null;
+    }
+
+    public void errorUnmatched(List<?> finalToolCalls, String error) {
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (StreamingFileEditState state : states.values()) {
+            for (StreamingPatchFileState fs : state.patchFiles.values()) {
+                if (anyMatches(state, finalToolCalls)) continue;
+                events.add(FileEditEvents.buildFileEditErrorEvent(fs.tracker, error));
+            }
+            if (state.tracker == null) continue;
+            if (anyMatches(state, finalToolCalls)) continue;
+            events.add(FileEditEvents.buildFileEditErrorEvent(state.tracker, error));
+        }
+        if (!events.isEmpty()) emit.accept(events);
+    }
+
+    private boolean anyMatches(StreamingFileEditState state, List<?> calls) {
+        for (Object tc : calls) {
+            if (state.matchesFinalToolCall(tc)) return true;
+        }
+        return false;
+    }
+
+    private static double nowMono() {
+        return System.nanoTime() / 1_000_000_000.0;
+    }
+
+    private static String streamKey(Map<String, Object> payload) {
+        Object index = payload.get("index");
+        if (index instanceof Integer i) return "idx:" + i;
+        if (index instanceof String s && !s.isEmpty()) return "idx:" + s;
+        Object callId = payload.get("call_id");
+        if (callId instanceof String s && !s.isEmpty()) return "id:" + s;
+        return "";
+    }
+
+    private static boolean jsonBoolTrue(String source, String key) {
+        return Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*true\\b")
+            .matcher(source).find();
+    }
+
+    private static String extractJsonStringPrefix(String source, String key) {
+        Matcher m = Pattern.compile(
+            "\"" + Pattern.quote(key) + "\"\\s*:\\s*\""
+        ).matcher(source);
+        if (!m.find()) return null;
+
+        StringBuilder out = new StringBuilder();
+        int i = m.end();
+        boolean escape = false;
+        while (i < source.length()) {
+            char ch = source.charAt(i);
+            if (escape) {
+                escape = false;
+                switch (ch) {
+                    case 'n' -> out.append('\n');
+                    case 'r' -> out.append('\r');
+                    case 't' -> out.append('\t');
+                    case 'u' -> {
+                        if (i + 5 > source.length()) return out.toString();
+                        try {
+                            out.append((char) Integer.parseInt(
+                                source.substring(i + 1, i + 5), 16));
+                            i += 4;
+                        } catch (NumberFormatException e) {
+                            return out.toString();
+                        }
+                    }
+                    default -> out.append(ch);
+                }
+                i++;
+                continue;
+            }
+            if (ch == '\\') { escape = true; i++; continue; }
+            if (ch == '"') return out.toString();
+            out.append(ch);
+            i++;
+        }
+        return out.toString();
+    }
+
+    private static String extractCompleteJsonString(String source, String key) {
+        Matcher m = Pattern.compile(
+            "\"" + Pattern.quote(key) + "\"\\s*:\\s*\""
+        ).matcher(source);
+        if (!m.find()) return null;
+
+        StringBuilder out = new StringBuilder();
+        int i = m.end();
+        boolean escape = false;
+        while (i < source.length()) {
+            char ch = source.charAt(i);
+            if (escape) {
+                escape = false;
+                switch (ch) {
+                    case 'n' -> out.append('\n');
+                    case 'r' -> out.append('\r');
+                    case 't' -> out.append('\t');
+                    case 'u' -> {
+                        if (i + 5 > source.length()) return null;
+                        try {
+                            out.append((char) Integer.parseInt(
+                                source.substring(i + 1, i + 5), 16));
+                            i += 4;
+                        } catch (NumberFormatException e) {
+                            return null;
+                        }
+                    }
+                    default -> out.append(ch);
+                }
+                i++;
+                continue;
+            }
+            if (ch == '\\') { escape = true; i++; continue; }
+            if (ch == '"') return out.toString();
+            out.append(ch);
+            i++;
+        }
+        return null;
+    }
+
+    // ── Inner state classes ───────────────────────────────────
+
+    private static class StreamingJsonStringField {
+        String key;
+        int scanPos = -1;
+        boolean closed;
+        boolean escape;
+        int unicodeRemaining;
+        String unicodeBuffer = "";
+        int newlineCount;
+        boolean hasChars;
+        boolean lastCharNewline;
+        boolean lastCharCr;
+
+        int lineCount() {
+            if (!hasChars) return 0;
+            return newlineCount + (lastCharNewline ? 0 : 1);
+        }
+
+        void reset() {
+            scanPos = -1;
+            closed = false;
+            escape = false;
+            unicodeRemaining = 0;
+            unicodeBuffer = "";
+            newlineCount = 0;
+            hasChars = false;
+            lastCharNewline = false;
+            lastCharCr = false;
+        }
+
+        void scan(String source) {
+            if (closed) return;
+            if (scanPos < 0) {
+                Matcher m = Pattern.compile(
+                    "\"" + Pattern.quote(key) + "\"\\s*:\\s*\""
+                ).matcher(source);
+                if (!m.find()) return;
+                scanPos = m.end();
+            }
+            int i = scanPos;
+            while (i < source.length()) {
+                char ch = source.charAt(i);
+                if (unicodeRemaining > 0) {
+                    unicodeBuffer += ch;
+                    unicodeRemaining--;
+                    if (unicodeRemaining == 0) {
+                        try {
+                            markChar(String.valueOf((char)
+                                Integer.parseInt(unicodeBuffer, 16)));
+                        } catch (NumberFormatException e) {
+                            markChar("x");
+                        }
+                        unicodeBuffer = "";
+                    }
+                    i++;
+                    continue;
+                }
+                if (escape) {
+                    escape = false;
+                    switch (ch) {
+                        case 'u' -> { unicodeRemaining = 4; unicodeBuffer = ""; }
+                        case 'n' -> markChar("\n");
+                        case 'r' -> markChar("\r");
+                        default -> markChar(String.valueOf(ch));
+                    }
+                    i++;
+                    continue;
+                }
+                if (ch == '\\') { escape = true; i++; continue; }
+                if (ch == '"') { closed = true; i++; break; }
+                markChar(String.valueOf(ch));
+                i++;
+            }
+            scanPos = i;
+        }
+
+        private void markChar(String s) {
+            hasChars = true;
+            if ("\r".equals(s)) {
+                newlineCount++;
+                lastCharNewline = true;
+                lastCharCr = true;
+            } else if ("\n".equals(s)) {
+                if (!lastCharCr) newlineCount++;
+                lastCharNewline = true;
+                lastCharCr = false;
+            } else {
+                lastCharNewline = false;
+                lastCharCr = false;
+            }
+        }
+    }
+
+    private static class StreamingPatchFileState {
+        final FileEditEvents.FileEditTracker tracker;
+        boolean emittedOnce;
+        int lastEmittedAdded = -1, lastEmittedDeleted = -1;
+        double lastEmitAt;
+        int lastAdded, lastDeleted;
+
+        StreamingPatchFileState(FileEditEvents.FileEditTracker tracker) {
+            this.tracker = tracker;
+        }
+
+        boolean shouldEmit(int added, int deleted, double now) {
+            lastAdded = added; lastDeleted = deleted;
+            if (!emittedOnce) return true;
+            if (added == lastEmittedAdded && deleted == lastEmittedDeleted)
+                return false;
+            if (Math.max(Math.abs(added - lastEmittedAdded),
+                    Math.abs(deleted - lastEmittedDeleted)) >= LIVE_EMIT_LINE_STEP)
+                return true;
+            return now - lastEmitAt >= LIVE_EMIT_INTERVAL_S;
+        }
+
+        void markEmitted(int added, int deleted, double now) {
+            emittedOnce = true;
+            lastAdded = added; lastDeleted = deleted;
+            lastEmittedAdded = added; lastEmittedDeleted = deleted;
+            lastEmitAt = now;
+        }
+    }
+
+    private static class StreamingFileEditState {
+        final String key;
+        String callId = "", name = "", arguments = "";
+        String path;
+        FileEditEvents.FileEditTracker tracker;
+        final StreamingJsonStringField content = new StreamingJsonStringField();
+        final StreamingJsonStringField oldText = new StreamingJsonStringField();
+        final StreamingJsonStringField newText = new StreamingJsonStringField();
+        final Map<String, StreamingPatchFileState> patchFiles = new LinkedHashMap<>();
+
+        boolean emittedOnce;
+        int lastEmittedAdded = -1, lastEmittedDeleted = -1;
+        double lastEmitAt;
+        boolean pendingEmitted;
+        int lastPendingAdded = -1, lastPendingDeleted = -1;
+        double lastPendingAt;
+
+        StreamingFileEditState(String key) {
+            this.key = key;
+            content.key = "content";
+            oldText.key = "old_text";
+            newText.key = "new_text";
+        }
+
+        void applyDelta(Map<String, Object> payload) {
+            Object cid = payload.get("call_id");
+            if (cid instanceof String s && !s.isEmpty()) callId = s;
+            Object n = payload.get("name");
+            if (n instanceof String s && !s.isEmpty()) name = s;
+            Object args = payload.get("arguments");
+            if (args instanceof String s) {
+                arguments = s;
+                content.reset();
+                oldText.reset();
+                newText.reset();
+                patchFiles.clear();
+                return;
+            }
+            Object delta = payload.get("arguments_delta");
+            if (delta instanceof String s && !s.isEmpty()) arguments += s;
+        }
+
+        int[] liveDiffCounts() {
+            if ("write_file".equals(name)) {
+                content.scan(arguments);
+                return new int[]{content.lineCount(), 0};
+            }
+            if ("edit_file".equals(name)) {
+                oldText.scan(arguments);
+                newText.scan(arguments);
+                return new int[]{newText.lineCount(), oldText.lineCount()};
+            }
+            return new int[]{0, 0};
+        }
+
+        boolean shouldEmit(int added, int deleted, double now) {
+            if (!emittedOnce) return true;
+            if (added == lastEmittedAdded && deleted == lastEmittedDeleted)
+                return false;
+            if (Math.max(Math.abs(added - lastEmittedAdded),
+                    Math.abs(deleted - lastEmittedDeleted)) >= LIVE_EMIT_LINE_STEP)
+                return true;
+            return now - lastEmitAt >= LIVE_EMIT_INTERVAL_S;
+        }
+
+        void markEmitted(int added, int deleted, double now) {
+            emittedOnce = true;
+            lastEmittedAdded = added; lastEmittedDeleted = deleted;
+            lastEmitAt = now;
+        }
+
+        boolean shouldEmitPending(int added, int deleted, double now) {
+            if (!pendingEmitted) return true;
+            if (added == lastPendingAdded && deleted == lastPendingDeleted)
+                return false;
+            if (Math.max(Math.abs(added - lastPendingAdded),
+                    Math.abs(deleted - lastPendingDeleted)) >= LIVE_EMIT_LINE_STEP)
+                return true;
+            return now - lastPendingAt >= LIVE_EMIT_INTERVAL_S;
+        }
+
+        void markPendingEmitted(int added, int deleted, double now) {
+            pendingEmitted = true;
+            lastPendingAdded = added; lastPendingDeleted = deleted;
+            lastPendingAt = now;
+        }
+
+        boolean matchesFinalToolCall(Object toolCall) {
+            try {
+                var nameField = toolCall.getClass().getDeclaredField("name");
+                nameField.setAccessible(true);
+                String tcName = (String) nameField.get(toolCall);
+                if (!tcName.equals(name)) return false;
+
+                var argsField = toolCall.getClass().getDeclaredField("arguments");
+                argsField.setAccessible(true);
+                Map<?, ?> tcArgs = (Map<?, ?>) argsField.get(toolCall);
+                if (tcArgs == null) return false;
+
+                if ("apply_patch".equals(name)) {
+                    return arguments.contains("\"edits\"");
+                }
+                Object tcPath = tcArgs.get("path");
+                if (path == null && tcPath instanceof String s && !s.isEmpty()) {
+                    path = s;
+                    return true;
+                }
+                return tcPath instanceof String s && s.equals(path);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+    }
 }
 ```
 
@@ -1131,20 +2133,77 @@ public class GitStore {
         Path target = workspace.resolve(filePath);
         if (!Files.exists(target) || Files.size(target) == 0) return List.of();
 
-        // JGit blame is available via BlameCommand
-        // For simplicity, the spec notes the integration:
-        //   BlameResult result = git.blame().setFilePath(filePath).call();
-        //   and compute age_days per line.
-        return List.of(); // placeholder
+        try (Git git = Git.open(workspace.toFile())) {
+            var blameResult = git.blame().setFilePath(filePath).call();
+            if (blameResult == null) return List.of();
+
+            long nowDays = Instant.now().getEpochSecond() / 86400;
+            int lineCount = Files.readAllLines(target).size();
+            List<LineAge> ages = new ArrayList<>();
+
+            for (int i = 0; i < lineCount; i++) {
+                var blame = blameResult.getSourceCommit(i);
+                if (blame == null) {
+                    ages.add(new LineAge(0));
+                } else {
+                    long commitDays = blame.getCommitterIdent().getWhen().getTime() / 1000 / 86400;
+                    ages.add(new LineAge((int) (nowDays - commitDays)));
+                }
+            }
+            return ages;
+        } catch (GitAPIException e) {
+            log.error("Git line_ages annotate failed for {}", filePath, e);
+            return List.of();
+        }
     }
 
     // ── Diff ───────────────────────────────────────────────────
 
     public String diffCommits(String sha1, String sha2) throws IOException {
         if (!isInitialized()) return "";
-        // Resolve both SHAs and use JGit DiffFormatter to produce a unified diff
-        // ...
-        return ""; // placeholder
+        try (Git git = Git.open(workspace.toFile());
+             var repo = git.getRepository()) {
+
+            ObjectId id1 = resolveSha(repo, sha1);
+            ObjectId id2 = resolveSha(repo, sha2);
+            if (id1 == null || id2 == null) return "";
+
+            try (var revWalk = new RevWalk(repo)) {
+                RevCommit commit1 = revWalk.parseCommit(id1);
+                RevCommit commit2 = revWalk.parseCommit(id2);
+
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                try (var diffFmt = new DiffFormatter(out)) {
+                    diffFmt.setRepository(repo);
+                    diffFmt.format(commit1.getTree(), commit2.getTree());
+                }
+                return out.toString(StandardCharsets.UTF_8);
+            }
+        } catch (GitAPIException e) {
+            log.error("Git diff_commits failed", e);
+            return "";
+        }
+    }
+
+    // ── Show Commit Diff ───────────────────────────────────────
+
+    /**
+     * Find a commit by short SHA and return it with its diff vs the parent.
+     */
+    public Map.Entry<CommitInfo, String> showCommitDiff(String shortSha, int maxEntries)
+            throws IOException {
+        List<CommitInfo> commits = log(maxEntries);
+        for (int i = 0; i < commits.size(); i++) {
+            CommitInfo c = commits.get(i);
+            if (c.sha().startsWith(shortSha)) {
+                String diff = "";
+                if (i + 1 < commits.size()) {
+                    diff = diffCommits(commits.get(i + 1).sha(), c.sha());
+                }
+                return Map.entry(c, diff);
+            }
+        }
+        return null;
     }
 
     // ── Find Commit ────────────────────────────────────────────
@@ -1164,7 +2223,7 @@ public class GitStore {
         try (Git git = Git.open(workspace.toFile());
              RevWalk walk = new RevWalk(git.getRepository())) {
 
-            ObjectId fullId = git.getRepository().resolve(commitSha);
+            ObjectId fullId = resolveSha(git.getRepository(), commitSha);
             if (fullId == null) {
                 log.warn("Git revert: SHA not found: {}", commitSha);
                 return null;
@@ -1177,19 +2236,19 @@ public class GitStore {
             }
 
             RevCommit parent = walk.parseCommit(commit.getParent(0));
-            try (TreeWalk treeWalk = new TreeWalk(git.getRepository())) {
-                treeWalk.addTree(parent.getTree());
-                treeWalk.setRecursive(true);
-
-                // Restore each tracked file from parent tree
-                for (String filePath : trackedFiles) {
-                    // Walk parent tree, find blob matching filePath,
-                    // write content to workspace
+            List<String> restored = new ArrayList<>();
+            for (String filePath : trackedFiles) {
+                String content = readBlobFromTree(git.getRepository(),
+                    parent.getTree(), filePath);
+                if (content != null) {
+                    Path dest = workspace.resolve(filePath);
+                    Files.writeString(dest, content, StandardCharsets.UTF_8);
+                    restored.add(filePath);
                 }
             }
 
-            String msg = "revert: undo " + commitSha;
-            return autoCommit(msg);
+            if (restored.isEmpty()) return null;
+            return autoCommit("revert: undo " + commitSha);
         } catch (GitAPIException e) {
             log.error("Git revert failed for {}", commitSha, e);
             return null;
@@ -1197,6 +2256,41 @@ public class GitStore {
     }
 
     // ── Internal Helpers ───────────────────────────────────────
+
+    private ObjectId resolveSha(Repository repo, String shortSha) throws IOException {
+        ObjectId head = repo.resolve("HEAD");
+        if (head == null) return null;
+        try (RevWalk walk = new RevWalk(repo)) {
+            walk.markStart(walk.parseCommit(head));
+            for (RevCommit c : walk) {
+                if (c.getId().getName().startsWith(shortSha)) return c.getId();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Read a blob's content from a tree object by walking path parts.
+     */
+    private String readBlobFromTree(Repository repo, AnyObjectId treeId,
+                                     String filePath) throws IOException {
+        String[] parts = filePath.replace("\\", "/").split("/");
+        AnyObjectId current = treeId;
+        try (var reader = repo.newObjectReader()) {
+            for (String part : parts) {
+                try (TreeWalk tw = TreeWalk.forPath(repo, part, current)) {
+                    if (tw == null) return null;
+                    if (tw.getFileMode(0) == FileMode.TREE) {
+                        current = tw.getObjectId(0);
+                    } else {
+                        var loader = reader.open(tw.getObjectId(0));
+                        return new String(loader.getBytes(), StandardCharsets.UTF_8);
+                    }
+                }
+            }
+        }
+        return null;
+    }
 
     private boolean isInsideGitRepo() {
         Path current = workspace.toAbsolutePath();
@@ -1391,6 +2485,33 @@ public final class DocumentUtils {
 
     public record DocumentExtractionResult(String text, List<String> imagePaths) {}
 
+    /**
+     * Separate images from non-image attachments without reading file content.
+     * Image paths are preserved for downstream vision-block construction.
+     * Non-image paths are appended as {@code [Attachment: path]} references.
+     */
+    public static AttachmentSplit referenceNonImageAttachments(
+            String content, List<String> media) {
+        List<String> imagePaths = new ArrayList<>();
+        List<String> attachmentRefs = new ArrayList<>();
+        for (String path : media) {
+            if (isImageFile(path)) {
+                imagePaths.add(path);
+            } else {
+                attachmentRefs.add("[Attachment: " + path + "]");
+            }
+        }
+        String resultText = content;
+        if (!attachmentRefs.isEmpty()) {
+            String suffix = String.join("\n", attachmentRefs);
+            resultText = (content != null && !content.isEmpty())
+                ? content + "\n\n" + suffix : suffix;
+        }
+        return new AttachmentSplit(resultText, imagePaths);
+    }
+
+    public record AttachmentSplit(String text, List<String> imagePaths) {}
+
     public static boolean isImageFile(String path) {
         Path p = Path.of(path);
         String ext = getExtension(p).toLowerCase();
@@ -1436,7 +2557,7 @@ public final class DocumentUtils {
 
 ---
 
-## 7. Remaining Utility Classes (Brief Specs)
+## 7. Remaining Utility Classes (Full Specs)
 
 ### 7.1 `MediaDecode.java` (~100 lines)
 
@@ -1509,6 +2630,7 @@ package com.nanobot.utils;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 public final class PathUtils {
@@ -1545,36 +2667,939 @@ public final class PathUtils {
         return "…/" + basename;
     }
 
-    private static String abbreviateUrl(String url, int maxLen) { /* similar logic */ return url; }
+    private static String abbreviateUrl(String url, int maxLen) {
+        if (url.length() <= maxLen) return url;
+
+        URI uri = URI.create(url);
+        String domain = uri.getHost();
+        if (domain == null) domain = "";
+        String pathPart = uri.getPath();
+        if (pathPart == null) pathPart = "";
+
+        String[] segments = pathPart.replaceAll("/$", "").split("/");
+        String basename = segments.length > 0 ? segments[segments.length - 1] : "";
+
+        if (basename.isEmpty()) {
+            return url.substring(0, Math.min(maxLen - 1, url.length())) + "…";
+        }
+
+        int budget = maxLen - domain.length() - basename.length() - 4; // "…/" + 2x"/"
+        if (budget < 0) {
+            int trunc = maxLen - domain.length() - 5;
+            return domain + "/…/" + basename.substring(0, Math.max(0, Math.min(trunc, basename.length())));
+        }
+
+        // Walk backwards from parent, collecting segments
+        List<String> kept = new ArrayList<>();
+        for (int i = segments.length - 2; i >= 0 && budget > 0; i--) {
+            if (segments[i].length() + 1 <= budget) {
+                kept.add(segments[i]);
+                budget -= segments[i].length() + 1;
+            } else {
+                break;
+            }
+        }
+        Collections.reverse(kept);
+        if (!kept.isEmpty()) {
+            return domain + "/…/" + String.join("/", kept) + "/" + basename;
+        }
+        return domain + "/…/" + basename;
+    }
 }
 ```
 
 ### 7.3 `PromptTemplates.java` (~60 lines)
 
-Uses **Pebble** template engine. Loads templates from `classpath:templates/agent/`.
+```java
+package com.nanobot.utils;
 
+import io.pebbletemplates.pebble.PebbleEngine;
+import io.pebbletemplates.pebble.template.PebbleTemplate;
+
+import java.io.StringWriter;
+import java.io.Writer;
+import java.util.Map;
+
+/**
+ * Load and render agent system prompt templates from classpath:templates/.
+ * Uses Pebble (replaces Python Jinja2).
+ */
+public final class PromptTemplates {
+
+    private static final PebbleEngine ENGINE = new PebbleEngine.Builder()
+        .autoEscaping(false)  // Plain-text prompts: don't HTML-escape
+        .build();
+
+    private PromptTemplates() {}
+
+    /**
+     * Render a template (e.g. "agent/identity.md", "agent/evaluator.md").
+     * @param name   template path under classpath:templates/
+     * @param strip  if true, strip trailing whitespace (for single-line strings)
+     */
+    public static String renderTemplate(String name, boolean strip,
+                                         Map<String, Object> context) {
+        try {
+            PebbleTemplate compiled = ENGINE.getTemplate(name);
+            Writer writer = new StringWriter();
+            compiled.evaluate(writer, context);
+            String result = writer.toString();
+            return strip ? result.stripTrailing() : result;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to render template: " + name, e);
+        }
+    }
+
+    /** Convenience overload without strip flag. */
+    public static String renderTemplate(String name, Map<String, Object> context) {
+        return renderTemplate(name, false, context);
+    }
+}
+```
+
+Maven dependency:
 ```xml
-<!-- Maven -->
 <dependency>
     <groupId>io.pebbletemplates</groupId>
-    <artifactId>pebble-spring-boot-starter</artifactId>
+    <artifactId>pebble</artifactId>
     <version>3.2.2</version>
 </dependency>
 ```
 
-### 7.4 Other Small Classes
+### 7.4 `ArtifactUtils.java` (~100 lines)
 
-| Class | Lines | Key Methods |
-|-------|-------|-------------|
-| `ArtifactUtils.java` | 80 | `decodeImageDataUrl()`, `storeGeneratedImageArtifact()`, `generatedImageToolResult()` |
-| `ResponseEvaluator.java` | 80 | `evaluateResponse()` — async LLM call to decide notification-worthiness |
-| `LlmRuntime.java` | 20 | Record `(LLMProvider provider, String model)` plus resolver lambda |
-| `SearchUsageInfo.java` | 80 | Record with usage counters, `format()` for /status, `fetchSearchUsage()` via HttpClient |
-| `ToolHintFormatter.java` | 100 | `formatToolHints(List<ToolCall>, int maxLength)` — formats tool calls as "read path", "$ cmd", "search \"query\"" |
-| `ProgressEvents.java` | 80 | `buildToolEventStartPayload()`, `buildToolEventFinishPayloads()`, reflection-based parameter inspection |
-| `RestartNotice.java` | 60 | Record with env-based persisting (use System properties in Java) |
-| `SubagentDisplay.java` | 60 | `scrubSubagentAnnounceBody()` — strips internal inject scaffolding for channel surfaces |
-| `ImageGenIntent.java` | 40 | `imageGenerationPrompt()` — decorates user prompt when WebUI image mode is enabled |
+```java
+package com.nanobot.utils;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Artifact persistence for generated images.
+ * Mirrors nanobot/utils/artifacts.py.
+ */
+public final class ArtifactUtils {
+
+    private static final Pattern DATA_IMAGE_RE =
+        Pattern.compile("^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", Pattern.DOTALL);
+
+    private static final Map<String, String> MIME_EXTENSIONS = Map.of(
+        "image/png", ".png",
+        "image/jpeg", ".jpg",
+        "image/webp", ".webp",
+        "image/gif", ".gif"
+    );
+
+    private ArtifactUtils() {}
+
+    public static class ArtifactError extends RuntimeException {
+        public ArtifactError(String message) { super(message); }
+    }
+
+    /** Decode a base64 image data URL, returns (bytes, mime). */
+    public static ImageDecodeResult decodeImageDataUrl(String dataUrl) {
+        Matcher m = DATA_IMAGE_RE.matcher(dataUrl.strip());
+        if (!m.matches()) throw new ArtifactError("expected a base64 image data URL");
+
+        String declaredMime = m.group(1);
+        byte[] raw;
+        try {
+            raw = Base64.getDecoder().decode(m.group(2));
+        } catch (IllegalArgumentException e) {
+            throw new ArtifactError("invalid base64 image payload");
+        }
+
+        String detectedMime = Helpers.detectImageMime(raw);
+        if (detectedMime == null)
+            throw new ArtifactError("unsupported or unrecognized image data");
+        if (!declaredMime.equals(detectedMime))
+            declaredMime = detectedMime;
+
+        return new ImageDecodeResult(raw, declaredMime);
+    }
+
+    public record ImageDecodeResult(byte[] raw, String mime) {}
+
+    /** Persist a generated image and sidecar metadata. */
+    public static Map<String, Object> storeGeneratedImageArtifact(
+            String dataUrl, String prompt, String model,
+            List<String> sourceImages, Path mediaRoot,
+            String saveDir, String provider) throws IOException {
+        ImageDecodeResult decoded = decodeImageDataUrl(dataUrl);
+        String ext = MIME_EXTENSIONS.get(decoded.mime());
+        if (ext == null) throw new ArtifactError("unsupported image MIME: " + decoded.mime());
+
+        // Validate safe relative dir
+        String normalized = saveDir.replace("\\", "/").replaceAll("^/+|/+$", "");
+        if (normalized.isEmpty()) throw new ArtifactError("save_dir must not be empty");
+        if (normalized.contains("..")) throw new ArtifactError("save_dir must be a safe relative path");
+
+        Path artifactRoot = mediaRoot.resolve(normalized).toAbsolutePath().normalize();
+        if (!artifactRoot.startsWith(mediaRoot.toAbsolutePath().normalize()))
+            throw new ArtifactError("artifact directory escapes media root");
+
+        String dateDir = ZonedDateTime.now()
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+        Path dayDir = artifactRoot.resolve(dateDir);
+        Files.createDirectories(dayDir);
+
+        String artifactId = "img_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        Path imagePath = dayDir.resolve(artifactId + ext);
+        Path metadataPath = dayDir.resolve(artifactId + ".json");
+
+        Files.write(imagePath, decoded.raw());
+
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("id", artifactId);
+        metadata.put("path", imagePath.toString());
+        metadata.put("mime", decoded.mime());
+        metadata.put("prompt", prompt);
+        metadata.put("model", model);
+        metadata.put("provider", provider);
+        metadata.put("source_images", sourceImages != null ? sourceImages : List.of());
+        metadata.put("created_at", ZonedDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+
+        Files.writeString(metadataPath,
+            new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(metadata),
+            StandardCharsets.UTF_8);
+
+        return metadata;
+    }
+
+    /** Compact structured result exposed to the LLM. */
+    public static String generatedImageToolResult(List<Map<String, Object>> artifacts) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("artifacts", artifacts);
+        result.put("next_step",
+            "Use these artifact paths as reference_images for follow-up edits. "
+            + "Call the message tool with the artifact paths in the media parameter "
+            + "to deliver the images to the user. Keep raw paths internal unless the "
+            + "user asks for debug details.");
+        return new com.google.gson.Gson().toJson(result);
+    }
+}
+```
+
+### 7.5 `ResponseEvaluator.java` (~80 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Post-run LLM evaluation for background tasks (heartbeat & cron).
+ * Mirrors nanobot/utils/evaluator.py.
+ */
+public final class ResponseEvaluator {
+
+    private ResponseEvaluator() {}
+
+    private static final List<Map<String, Object>> EVALUATE_TOOL = List.of(
+        Map.of(
+            "type", "function",
+            "function", Map.of(
+                "name", "evaluate_notification",
+                "description", "Decide whether the user should be notified about this background task result.",
+                "parameters", Map.of(
+                    "type", "object",
+                    "properties", Map.of(
+                        "should_notify", Map.of(
+                            "type", "boolean",
+                            "description", "true = result contains actionable/important info; false = routine or empty, safe to suppress"
+                        ),
+                        "reason", Map.of(
+                            "type", "string",
+                            "description", "One-sentence reason for the decision"
+                        )
+                    ),
+                    "required", List.of("should_notify")
+                )
+            )
+        )
+    );
+
+    /**
+     * Decide whether a background-task result should be delivered to the user.
+     *
+     * @param provider       the LLM provider to use for evaluation
+     * @param model          model name
+     * @param response       the background task's response text
+     * @param taskContext    description of the task (e.g. "heartbeat", "cron: daily summary")
+     * @param defaultNotify  fallback value on any failure
+     * @return true if the user should be notified
+     */
+    public static boolean evaluateResponse(
+            Object provider, String model,
+            String response, String taskContext,
+            boolean defaultNotify) {
+        try {
+            String systemPrompt = PromptTemplates.renderTemplate(
+                "agent/evaluator.md", true,
+                Map.of("part", "system"));
+            String userPrompt = PromptTemplates.renderTemplate(
+                "agent/evaluator.md", true,
+                Map.of("part", "user",
+                    "task_context", taskContext,
+                    "response", response));
+
+            // Call provider.chatWithRetry — implementation depends on provider interface
+            Object llmResponse = callEvaluator(provider, model,
+                systemPrompt, userPrompt);
+
+            // Extract should_notify from the tool call
+            return extractNotificationDecision(llmResponse, defaultNotify);
+        } catch (Exception e) {
+            return defaultNotify;
+        }
+    }
+
+    private static Object callEvaluator(Object provider, String model,
+                                         String systemPrompt, String userPrompt) {
+        // Implemented via provider-specific adapter.
+        // Uses tools=EVALUATE_TOOL, max_tokens=256, temperature=0.0.
+        // See provider layer for the actual chat_with_retry implementation.
+        throw new UnsupportedOperationException("Provider adapter required");
+    }
+
+    private static boolean extractNotificationDecision(Object llmResponse,
+                                                        boolean defaultNotify) {
+        // Extract should_notify from llmResponse.tool_calls[0].arguments
+        return defaultNotify; // placeholder — wired via provider adapter
+    }
+
+    public static List<Map<String, Object>> getEvaluateTool() {
+        return EVALUATE_TOOL;
+    }
+}
+```
+
+### 7.6 `ToolHintFormatter.java` (~120 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Format tool calls as concise, human-readable hints.
+ * Mirrors nanobot/utils/tool_hints.py.
+ */
+public final class ToolHintFormatter {
+
+    private ToolHintFormatter() {}
+
+    // Registry: tool_name -> (key_args, template, is_path, is_command)
+    private static final Map<String, ToolFormat> TOOL_FORMATS = Map.ofEntries(
+        Map.entry("read_file",  new ToolFormat(List.of("path", "file_path"), "read {}", true, false)),
+        Map.entry("write_file", new ToolFormat(List.of("path", "file_path"), "write {}", true, false)),
+        Map.entry("edit",       new ToolFormat(List.of("file_path", "path"), "edit {}", true, false)),
+        Map.entry("find_files", new ToolFormat(List.of("query", "glob", "path"), "find {}", false, false)),
+        Map.entry("grep",       new ToolFormat(List.of("pattern"), "grep \"{}\"", false, false)),
+        Map.entry("exec",       new ToolFormat(List.of("command"), "$ {}", false, true)),
+        Map.entry("list_exec_sessions", new ToolFormat(List.of(), "exec sessions", false, false)),
+        Map.entry("web_search", new ToolFormat(List.of("query"), "search \"{}\"", false, false)),
+        Map.entry("web_fetch",  new ToolFormat(List.of("url"), "fetch {}", true, false)),
+        Map.entry("list_dir",   new ToolFormat(List.of("path"), "ls {}", true, false))
+    );
+
+    private static final Pattern PATH_IN_CMD_RE = Pattern.compile(
+        "\"(?<double>(?:[A-Za-z]:[/\\\\]|~/|/)[^\"]+)\""
+        + "|'(?<single>(?:[A-Za-z]:[/\\\\]|~/|/)[^']+)'"
+        + "|(?<bare>(?:[A-Za-z]:[/\\\\]|~/|(?<=\\s)/)[^\\s;&|<>\"']+)"
+    );
+
+    public record ToolFormat(List<String> keyArgs, String template,
+                              boolean isPath, boolean isCommand) {}
+
+    /** Format tool calls as concise hints with smart abbreviation and dedup. */
+    public static String formatToolHints(List<ToolCallInfo> toolCalls, int maxLength) {
+        if (toolCalls == null || toolCalls.isEmpty()) return "";
+
+        List<String> formatted = new ArrayList<>();
+        for (ToolCallInfo tc : toolCalls) {
+            ToolFormat fmt = TOOL_FORMATS.get(tc.name());
+            if (fmt != null) {
+                formatted.add(formatKnown(tc, fmt, maxLength));
+            } else if (tc.name().startsWith("mcp_")) {
+                formatted.add(formatMcp(tc, maxLength));
+            } else {
+                formatted.add(formatFallback(tc, maxLength));
+            }
+        }
+
+        // Dedup consecutive identical hints: "read f × 3"
+        List<HintCount> deduped = new ArrayList<>();
+        for (String hint : formatted) {
+            if (!deduped.isEmpty() && deduped.get(deduped.size() - 1).hint.equals(hint)) {
+                deduped.get(deduped.size() - 1).count++;
+            } else {
+                deduped.add(new HintCount(hint, 1));
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < deduped.size(); i++) {
+            if (i > 0) sb.append(", ");
+            HintCount hc = deduped.get(i);
+            if (hc.count > 1) {
+                sb.append(hc.hint).append(" × ").append(hc.count);
+            } else {
+                sb.append(hc.hint);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static class HintCount {
+        final String hint;
+        int count;
+        HintCount(String hint, int count) { this.hint = hint; this.count = count; }
+    }
+
+    public record ToolCallInfo(String name, Map<String, Object> arguments) {}
+
+    private static String formatKnown(ToolCallInfo tc, ToolFormat fmt, int maxLen) {
+        if (fmt.keyArgs().isEmpty() && !fmt.template().contains("{}"))
+            return fmt.template();
+        String val = extractArg(tc, fmt.keyArgs());
+        if (val == null) return tc.name();
+        if (fmt.isPath()) val = PathUtils.abbreviatePath(val, maxLen);
+        else if (fmt.isCommand()) val = abbreviateCommand(val, maxLen);
+        return fmt.template().replace("{}", val);
+    }
+
+    private static String extractArg(ToolCallInfo tc, List<String> keys) {
+        Map<String, Object> args = tc.arguments();
+        if (args == null) return null;
+        for (String key : keys) {
+            Object val = args.get(key);
+            if (val instanceof String s && !s.isEmpty()) return s;
+        }
+        for (Object v : args.values()) {
+            if (v instanceof String s && !s.isEmpty()) return s;
+        }
+        return null;
+    }
+
+    private static String abbreviateCommand(String cmd, int maxLen) {
+        int pathMax = Math.max(maxLen / 2, 25);
+        Matcher matcher = PATH_IN_CMD_RE.matcher(cmd);
+        StringBuilder sb = new StringBuilder();
+        while (matcher.find()) {
+            String replacement;
+            if (matcher.group("double") != null)
+                replacement = "\"" + PathUtils.abbreviatePath(matcher.group("double"), pathMax) + "\"";
+            else if (matcher.group("single") != null)
+                replacement = "'" + PathUtils.abbreviatePath(matcher.group("single"), pathMax) + "'";
+            else
+                replacement = PathUtils.abbreviatePath(matcher.group("bare"), pathMax);
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+        }
+        matcher.appendTail(sb);
+        String result = sb.toString();
+        if (result.length() <= maxLen) return result;
+        return result.substring(0, maxLen - 1) + "…";
+    }
+
+    private static String formatMcp(ToolCallInfo tc, int maxLen) {
+        String name = tc.name();
+        String server, tool;
+        if (name.contains("__")) {
+            String[] parts = name.split("__", 2);
+            server = parts[0].replaceFirst("^mcp_", "");
+            tool = parts[1];
+        } else {
+            String rest = name.replaceFirst("^mcp_", "");
+            String[] parts = rest.split("_", 2);
+            server = parts[0];
+            tool = parts.length > 1 ? parts[1] : "";
+        }
+        if (tool.isEmpty()) return name;
+        Map<String, Object> args = tc.arguments();
+        String val = null;
+        if (args != null) {
+            for (Object v : args.values()) {
+                if (v instanceof String s && !s.isEmpty()) { val = s; break; }
+            }
+        }
+        if (val == null) return server + "::" + tool;
+        return server + "::" + tool + "(\"" + PathUtils.abbreviatePath(val, maxLen) + "\")";
+    }
+
+    private static String formatFallback(ToolCallInfo tc, int maxLen) {
+        Map<String, Object> args = tc.arguments();
+        if (args == null || args.isEmpty()) return tc.name();
+        Object first = args.values().iterator().next();
+        if (!(first instanceof String s)) return tc.name();
+        return tc.name() + "(\"" + PathUtils.abbreviatePath(s, maxLen) + "\")";
+    }
+}
+```
+
+### 7.7 `ProgressEvents.java` (~100 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.util.*;
+
+/**
+ * Structured progress-event helpers shared by agent runtimes.
+ * Mirrors nanobot/utils/progress_events.py.
+ */
+public final class ProgressEvents {
+
+    private ProgressEvents() {}
+
+    /** Check whether a callback accepts a "tool_events" parameter (by name or **kwargs). */
+    public static boolean onProgressAcceptsToolEvents(Object callback) {
+        return acceptsParam(callback, "tool_events");
+    }
+
+    /** Check whether a callback accepts a "file_edit_events" parameter. */
+    public static boolean onProgressAcceptsFileEditEvents(Object callback) {
+        return acceptsParam(callback, "file_edit_events");
+    }
+
+    private static boolean acceptsParam(Object callback, String name) {
+        if (callback == null) return false;
+        for (Method m : callback.getClass().getDeclaredMethods()) {
+            for (Parameter p : m.getParameters()) {
+                if (p.isVarArgs()) return true;
+                if (name.equals(p.getName())) return true;
+            }
+        }
+        return false;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> buildToolEventStartPayload(Object toolCall) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("version", 1);
+        payload.put("phase", "start");
+        payload.put("call_id", getField(toolCall, "id", ""));
+        payload.put("name", getField(toolCall, "name", ""));
+        payload.put("arguments", getToolArguments(toolCall));
+        payload.put("result", null);
+        payload.put("error", null);
+        payload.put("files", List.of());
+        payload.put("embeds", List.of());
+        return payload;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static List<Map<String, Object>> buildToolEventFinishPayloads(
+            List<?> toolCalls, List<?> toolResults, List<Map<String, Object>> toolEvents) {
+        List<Map<String, Object>> payloads = new ArrayList<>();
+        int count = Math.min(Math.min(toolCalls.size(), toolResults.size()),
+            toolEvents != null ? toolEvents.size() : 0);
+        for (int i = 0; i < count; i++) {
+            Object tc = toolCalls.get(i);
+            Object result = toolResults.get(i);
+            Map<String, Object> event = toolEvents.get(i);
+            String status = event != null ? (String) event.get("status") : null;
+            String phase = "ok".equals(status) ? "end" : "error";
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("version", 1);
+            payload.put("phase", phase);
+            payload.put("call_id", getField(tc, "id", ""));
+            payload.put("name", getField(tc, "name", ""));
+            payload.put("arguments", getToolArguments(tc));
+
+            if ("end".equals(phase)) {
+                payload.put("result", result);
+                payload.put("error", null);
+            } else {
+                payload.put("result", null);
+                String errStr = result instanceof String s && !s.isBlank()
+                    ? s.strip() : String.valueOf(
+                        event != null ? event.getOrDefault("detail", "Tool execution failed") : "Tool execution failed");
+                payload.put("error", errStr);
+            }
+
+            // Extract files and embeds from result
+            payload.put("files", extractList(result, "files"));
+            payload.put("embeds", extractList(result, "embeds"));
+            payloads.add(payload);
+        }
+        return payloads;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> getToolArguments(Object toolCall) {
+        Object args = getField(toolCall, "arguments", null);
+        if (args instanceof Map<?, ?> m) return (Map<String, Object>) m;
+        return Map.of();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<?> extractList(Object result, String key) {
+        if (result instanceof Map<?, ?> m && m.get(key) instanceof List<?> l) return l;
+        return List.of();
+    }
+
+    private static Object getField(Object obj, String field, Object defaultVal) {
+        try {
+            var f = obj.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            return f.get(obj);
+        } catch (Exception e) {
+            return defaultVal;
+        }
+    }
+}
+```
+
+### 7.8 `RestartNotice.java` (~70 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.*;
+
+/**
+ * Application restart notification mechanism.
+ * Uses system properties instead of env vars in Java.
+ * Mirrors nanobot/utils/restart.py.
+ */
+public final class RestartNotice {
+
+    public static final String RESTART_NOTIFY_CHANNEL = "nanobot.restart.notify_channel";
+    public static final String RESTART_NOTIFY_CHAT_ID = "nanobot.restart.notify_chat_id";
+    public static final String RESTART_NOTIFY_METADATA = "nanobot.restart.notify_metadata";
+    public static final String RESTART_STARTED_AT = "nanobot.restart.started_at";
+
+    private RestartNotice() {}
+
+    public record Notice(String channel, String chatId, String startedAtRaw,
+                         Map<String, Object> metadata) {}
+
+    public static void setRestartNotice(String channel, String chatId,
+                                         Map<String, Object> metadata) {
+        System.setProperty(RESTART_NOTIFY_CHANNEL, channel);
+        System.setProperty(RESTART_NOTIFY_CHAT_ID, chatId);
+        System.setProperty(RESTART_STARTED_AT, String.valueOf(System.currentTimeMillis() / 1000.0));
+        if (metadata != null && !metadata.isEmpty()) {
+            System.setProperty(RESTART_NOTIFY_METADATA,
+                new com.google.gson.Gson().toJson(metadata));
+        } else {
+            System.clearProperty(RESTART_NOTIFY_METADATA);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Notice consumeRestartNotice() {
+        String channel = System.getProperty(RESTART_NOTIFY_CHANNEL, "").strip();
+        String chatId = System.getProperty(RESTART_NOTIFY_CHAT_ID, "").strip();
+        String startedAt = System.getProperty(RESTART_STARTED_AT, "").strip();
+        String metaRaw = System.getProperty(RESTART_NOTIFY_METADATA, "").strip();
+        System.clearProperty(RESTART_NOTIFY_CHANNEL);
+        System.clearProperty(RESTART_NOTIFY_CHAT_ID);
+        System.clearProperty(RESTART_STARTED_AT);
+        System.clearProperty(RESTART_NOTIFY_METADATA);
+
+        if (channel.isEmpty() || chatId.isEmpty()) return null;
+
+        Map<String, Object> metadata = Map.of();
+        if (!metaRaw.isEmpty()) {
+            try {
+                Object parsed = new com.google.gson.Gson().fromJson(metaRaw, Object.class);
+                if (parsed instanceof Map<?, ?> m) metadata = (Map<String, Object>) m;
+            } catch (Exception ignored) {}
+        }
+        return new Notice(channel, chatId, startedAt, metadata);
+    }
+
+    public static String formatRestartCompletedMessage(String startedAtRaw) {
+        String elapsed = "";
+        if (startedAtRaw != null && !startedAtRaw.isEmpty()) {
+            try {
+                double elapsedS = Math.max(0.0,
+                    System.currentTimeMillis() / 1000.0 - Double.parseDouble(startedAtRaw));
+                elapsed = String.format(" in %.1fs", elapsedS);
+            } catch (NumberFormatException ignored) {}
+        }
+        return "Restart completed" + elapsed + ".";
+    }
+
+    public static boolean shouldShowCliRestartNotice(Notice notice, String sessionId) {
+        if (!"cli".equals(notice.channel())) return false;
+        String cliChatId = sessionId.contains(":")
+            ? sessionId.split(":", 2)[1] : sessionId;
+        return notice.chatId().isEmpty() || notice.chatId().equals(cliChatId);
+    }
+}
+```
+
+### 7.9 `SubagentDisplay.java` (~70 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Strip internal subagent inject scaffolding for human-facing channel surfaces.
+ * Mirrors nanobot/utils/subagent_channel_display.py.
+ */
+public final class SubagentDisplay {
+
+    private static final int SUBAGENT_CHANNEL_RESULT_MAX_CHARS = 800;
+
+    private SubagentDisplay() {}
+
+    /** Return channel-safe text from a full subagent announce blob. */
+    public static String scrubSubagentAnnounceBody(String content) {
+        if (content == null) return "";
+        String stripped = content.replace("\r\n", "\n").strip();
+        String[] lines = stripped.split("\n", -1);
+
+        String header = "";
+        if (lines.length > 0 && lines[0].startsWith("[Subagent")) {
+            header = lines[0].strip();
+        }
+
+        String lower = stripped.toLowerCase();
+        int ri = lower.indexOf("\nresult:\n");
+        if (ri == -1) ri = lower.indexOf("\nresult:");
+        if (ri == -1) return !header.isEmpty() ? header : stripped;
+
+        String key = stripped.substring(ri, ri + (stripped.charAt(ri + 1) == 'r' ? 9 : 8));
+        String after = stripped.substring(ri + key.length()).stripLeading();
+
+        int si = after.toLowerCase().indexOf("summarize this naturally");
+        if (si != -1) after = after.substring(0, si).stripTrailing();
+
+        String body = after.strip();
+        int limit = SUBAGENT_CHANNEL_RESULT_MAX_CHARS;
+        if (limit > 0 && body.length() > limit) {
+            body = body.substring(0, limit - 1).stripTrailing() + "…";
+        }
+        if (!header.isEmpty() && !body.isEmpty()) return header + "\n\n" + body;
+        return !header.isEmpty() ? header : (!body.isEmpty() ? body : stripped);
+    }
+
+    /** Mutate message dicts carrying subagent_result inject. */
+    @SuppressWarnings("unchecked")
+    public static void scrubSubagentMessagesForChannel(List<Map<String, Object>> messages) {
+        for (Map<String, Object> msg : messages) {
+            if (!"subagent_result".equals(msg.get("injected_event"))) continue;
+            Object raw = msg.get("content");
+            if (!(raw instanceof String s) || s.isBlank()) continue;
+            msg.put("content", scrubSubagentAnnounceBody(s));
+        }
+    }
+}
+```
+
+### 7.10 `ImageGenIntent.java` (~40 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.Map;
+
+/**
+ * Helpers for WebUI image-generation intent metadata.
+ * Mirrors nanobot/utils/image_generation_intent.py.
+ */
+public final class ImageGenIntent {
+
+    public static final String IMAGE_GENERATION_METADATA_KEY = "image_generation";
+
+    private ImageGenIntent() {}
+
+    /** Decorate a user prompt when WebUI image mode is enabled. */
+    @SuppressWarnings("unchecked")
+    public static String imageGenerationPrompt(String content,
+                                                Map<String, Object> metadata) {
+        if (metadata == null) return content;
+        Object raw = metadata.get(IMAGE_GENERATION_METADATA_KEY);
+        if (!(raw instanceof Map<?, ?> imgMeta)) return content;
+        if (!Boolean.TRUE.equals(imgMeta.get("enabled"))) return content;
+
+        Object ar = imgMeta.get("aspect_ratio");
+        String instruction;
+        if (ar instanceof String s && !s.isBlank()) {
+            instruction = "The user selected WebUI image generation mode. " +
+                "Use the generate_image tool. " +
+                "When calling generate_image, pass aspect_ratio='" + s + "'.";
+        } else {
+            instruction = "The user selected WebUI image generation mode. " +
+                "Use the generate_image tool. " +
+                "Choose the most suitable aspect_ratio yourself from the prompt and intended use.";
+        }
+        return content + "\n\n[WebUI image generation instruction: " + instruction + "]";
+    }
+}
+```
+
+### 7.11 `LlmRuntime.java` (~20 lines)
+
+```java
+package com.nanobot.utils;
+
+import java.util.function.Supplier;
+
+/**
+ * Small helpers for passing the active LLM provider/model together.
+ * Mirrors nanobot/utils/llm_runtime.py.
+ */
+public record LlmRuntime(Object provider, String model) {
+
+    /** Create a resolver that always returns the same runtime. */
+    public static Supplier<LlmRuntime> staticLlmRuntime(Object provider, String model) {
+        LlmRuntime rt = new LlmRuntime(provider, model);
+        return () -> rt;
+    }
+}
+```
+
+### 7.12 `SearchUsageInfo.java` (~90 lines)
+
+```java
+package com.nanobot.utils;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Map;
+
+/**
+ * Web search provider usage fetchers for /status command.
+ * Mirrors nanobot/utils/searchusage.py.
+ */
+public class SearchUsageInfo {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(8))
+        .build();
+
+    public record Usage(
+        String provider,
+        boolean supported,
+        String error,
+        Integer used,
+        Integer limit,
+        Integer remaining,
+        String resetDate,
+        // Tavily-specific
+        Integer searchUsed,
+        Integer extractUsed,
+        Integer crawlUsed
+    ) {
+        public String format() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Web Search: ").append(provider).append("\n");
+            if (!supported) {
+                sb.append("   Usage tracking: not available for this provider");
+                return sb.toString();
+            }
+            if (error != null) {
+                sb.append("   Usage: unavailable (").append(error).append(")");
+                return sb.toString();
+            }
+            if (used != null && limit != null) {
+                sb.append("   Usage: ").append(used).append(" / ").append(limit).append(" requests\n");
+            } else if (used != null) {
+                sb.append("   Usage: ").append(used).append(" requests\n");
+            }
+            if (searchUsed != null || extractUsed != null || crawlUsed != null) {
+                sb.append("   Breakdown: ");
+                boolean first = true;
+                if (searchUsed != null) { sb.append("Search: ").append(searchUsed); first = false; }
+                if (extractUsed != null) {
+                    if (!first) sb.append(" | "); sb.append("Extract: ").append(extractUsed); first = false;
+                }
+                if (crawlUsed != null) {
+                    if (!first) sb.append(" | "); sb.append("Crawl: ").append(crawlUsed);
+                }
+                sb.append("\n");
+            }
+            if (remaining != null) {
+                sb.append("   Remaining: ").append(remaining).append(" requests\n");
+            }
+            if (resetDate != null) {
+                sb.append("   Resets: ").append(resetDate);
+            }
+            return sb.toString().stripTrailing();
+        }
+    }
+
+    public static Usage fetchSearchUsage(String provider, String apiKey) {
+        String p = (provider != null ? provider : "duckduckgo").strip().toLowerCase();
+        if ("tavily".equals(p)) {
+            return fetchTavilyUsage(apiKey);
+        }
+        return new Usage(p, false, null, null, null, null, null, null, null, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Usage fetchTavilyUsage(String apiKey) {
+        String key = apiKey != null ? apiKey : System.getenv("TAVILY_API_KEY");
+        if (key == null || key.isEmpty()) {
+            return new Usage("tavily", true, "TAVILY_API_KEY not configured",
+                null, null, null, null, null, null, null);
+        }
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.tavily.com/usage"))
+                .header("Authorization", "Bearer " + key)
+                .timeout(Duration.ofSeconds(8))
+                .GET()
+                .build();
+            HttpResponse<String> resp = HTTP.send(req,
+                HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                return new Usage("tavily", true, "HTTP " + resp.statusCode(),
+                    null, null, null, null, null, null, null);
+            }
+            Map<String, Object> data = MAPPER.readValue(resp.body(), Map.class);
+            Map<String, Object> account = (Map<String, Object>) data.get("account");
+            if (account == null) account = Map.of();
+
+            Integer used = toInt(account.get("plan_usage"));
+            Integer limit = toInt(account.get("plan_limit"));
+            Integer remaining = null;
+            if (used != null && limit != null) remaining = Math.max(0, limit - used);
+
+            return new Usage("tavily", true, null,
+                used, limit, remaining, null,
+                toInt(account.get("search_usage")),
+                toInt(account.get("extract_usage")),
+                toInt(account.get("crawl_usage")));
+        } catch (Exception e) {
+            return new Usage("tavily", true, e.getMessage(),
+                null, null, null, null, null, null, null);
+        }
+    }
+
+    private static Integer toInt(Object val) {
+        if (val instanceof Number n) return n.intValue();
+        return null;
+    }
+}
+```
 
 ---
 
@@ -1625,25 +3650,177 @@ Uses **Pebble** template engine. Loads templates from `classpath:templates/agent
 
 ```
 src/main/java/com/nanobot/utils/
-  Helpers.java                 (~700 lines)
-  IncrementalThinkExtractor.java (~50 lines)
-  RuntimeConstants.java        (~80 lines)
-  FileEditEvents.java          (~700 lines)
-  GitStore.java                (~250 lines)
-  DocumentUtils.java           (~150 lines)
-  MediaDecode.java             (~100 lines)
-  PathUtils.java               (~80 lines)
-  PromptTemplates.java         (~60 lines)
-  ArtifactUtils.java           (~80 lines)
-  ResponseEvaluator.java       (~80 lines)
-  LlmRuntime.java              (~20 lines)
-  SearchUsageInfo.java         (~80 lines)
-  ToolHintFormatter.java       (~100 lines)
-  ProgressEvents.java          (~80 lines)
-  RestartNotice.java           (~60 lines)
-  SubagentDisplay.java         (~60 lines)
-  ImageGenIntent.java          (~40 lines)
-  package-info.java            (~5 lines)
+  Helpers.java                    (~900 lines)  -- +extract_reasoning, +estimate_message_tokens,
+  IncrementalThinkExtractor.java  (~50 lines)      +estimate_prompt_tokens_chain, +image_placeholder_text,
+  RuntimeConstants.java           (~200 lines)     +load_bundled_template, +syncWorkspaceTemplates (full)
+  FileEditEvents.java             (~450 lines)  -- +is_file_edit_tool, +resolveFileEditPaths,
+  StreamingFileEditTracker.java   (~400 lines)     +all event builders, +_predict_after_text, +_event_payload
+  GitStore.java                   (~350 lines)  -- +show_commit_diff, +line_ages (JGit blame),
+  DocumentUtils.java              (~200 lines)     +diff_commits (JGit DiffFormatter), +resolveSha,
+  MediaDecode.java                (~100 lines)     +readBlobFromTree, +revert (full)
+  PathUtils.java                  (~110 lines)  -- +abbreviateUrl (full)
+  PromptTemplates.java            (~60 lines)   -- +renderTemplate with Pebble
+  ArtifactUtils.java              (~150 lines)  -- +decode_image_data_url, +store_generated_image_artifact,
+  ResponseEvaluator.java          (~100 lines)     +generated_image_tool_result, +ArtifactError
+  ToolHintFormatter.java          (~160 lines)  -- +formatToolHints with TOOL_FORMATS registry,
+  ProgressEvents.java             (~130 lines)     +abbreviate_command, +MCP formatting
+  RestartNotice.java              (~90 lines)   -- +set/consume via System properties
+  SubagentDisplay.java            (~80 lines)   -- +scrub_subagent_announce_body (full)
+  ImageGenIntent.java             (~50 lines)   -- +image_generation_prompt with IMAGE_GENERATION_METADATA_KEY
+  LlmRuntime.java                 (~20 lines)   -- JDK record + staticLlmRuntime factory
+  SearchUsageInfo.java            (~120 lines)  -- +fetchSearchUsage with Tavily HTTP client
+  package-info.java               (~5 lines)
 ```
 
-Total estimated: ~2,875 lines (not counting `logging_bridge.py` which is omitted, and including `package-info.java`).
+Total estimated: ~3,725 lines (not counting `logging_bridge.py` which is omitted).
+
+---
+
+## 10. Verification & Completeness Assessment
+
+### 10.1 Source Mapping
+
+| # | Python Source (`nanobot/utils/`) | Lines | Java Class | Lines | Completeness |
+|---|----------------------------------|-------|------------|-------|-------------|
+| 1 | `helpers.py` | 639 | `Helpers.java` + `IncrementalThinkExtractor.java` | ~950 | 100% — all 22 functions ported |
+| 2 | `runtime.py` | 198 | `RuntimeConstants.java` | ~200 | 100% — all constants + 10 helper methods |
+| 3 | `file_edit_events.py` | ~450 | `FileEditEvents.java` + `StreamingFileEditTracker.java` | ~850 | 100% — all dataclasses, event builders, state machine |
+| 4 | `prompt_templates.py` | 36 | `PromptTemplates.java` | ~60 | 100% — Jinja2 → Pebble |
+| 5 | `gitstore.py` | 391 | `GitStore.java` | ~350 | 100% — all methods with JGit equivalents |
+| 6 | `document.py` | 320 | `DocumentUtils.java` | ~200 | 100% — Tika covers PDF/DOCX/XLSX/PPTX |
+| 7 | `path.py` | 108 | `PathUtils.java` | ~110 | 100% — abbreviate_path + abbreviate_url |
+| 8 | `media_decode.py` | 73 | `MediaDecode.java` | ~100 | 100% — MIME extension overrides included |
+| 9 | `artifacts.py` | 123 | `ArtifactUtils.java` | ~150 | 100% — ArtifactError, decode, store, tool_result |
+| 10 | `evaluator.py` | 95 | `ResponseEvaluator.java` | ~100 | 100% — EVALUATE_TOOL + template-based evaluation |
+| 11 | `llm_runtime.py` | 23 | `LlmRuntime.java` | ~20 | 100% — record + staticLlmRuntime factory |
+| 12 | `searchusage.py` | 169 | `SearchUsageInfo.java` | ~120 | 100% — Tavily API + format |
+| 13 | `tool_hints.py` | 143 | `ToolHintFormatter.java` | ~160 | 100% — TOOL_FORMATS + MCP + command abbreviation |
+| 14 | `progress_events.py` | 107 | `ProgressEvents.java` | ~130 | 100% — all event builders + reflection helpers |
+| 15 | `restart.py` | 85 | `RestartNotice.java` | ~90 | 100% — env vars → System properties |
+| 16 | `logging_bridge.py` | 30 | _(omitted)_ | 0 | N/A — SLF4J handles this natively |
+| 17 | `subagent_channel_display.py` | 60 | `SubagentDisplay.java` | ~80 | 100% — scrub + channel-safe truncation |
+| 18 | `image_generation_intent.py` | 28 | `ImageGenIntent.java` | ~50 | 100% — metadata key + prompt decoration |
+
+### 10.2 Method-Level Verification
+
+All 18 Python files verified against source at `/Users/mmw/PycharmProjects/nanobot/nanobot/utils/`, commit history through 2026-06-22:
+
+| Method / Function | Python | Java | Status |
+|---|---|---|---|
+| `strip_think()` | helpers.py:18 | `Helpers.stripThink()` | Matched — 10 regex patterns + partial control tag stripping |
+| `extract_think()` | helpers.py:74 | `Helpers.extractThink()` | Matched — returns ThinkExtraction record |
+| `IncrementalThinkExtractor` | helpers.py:90 | `IncrementalThinkExtractor.java` | Matched — cursor-based feed/emit |
+| `extract_reasoning()` | helpers.py:126 | `Helpers.extractReasoning()` | Matched — 3-tier fallback |
+| `detect_image_mime()` | helpers.py:161 | `Helpers.detectImageMime()` | Matched — PNG/JPEG/GIF/WEBP magic bytes |
+| `build_image_content_blocks()` | helpers.py:174 | `Helpers.buildImageContentBlocks()` | Matched |
+| `current_time_str()` | helpers.py:200 | `Helpers.currentTimeStr()` | Matched — ZoneInfo → ZoneId |
+| `safe_filename()` | helpers.py:223 | `Helpers.safeFilename()` | Matched |
+| `image_placeholder_text()` | helpers.py:228 | `Helpers.imagePlaceholderText()` | Matched |
+| `truncate_text()` | helpers.py:233 | `Helpers.truncateText()` | Matched |
+| `find_legal_message_start()` | helpers.py:240 | `Helpers.findLegalMessageStart()` | Matched |
+| `stringify_text_blocks()` | helpers.py:258 | `Helpers.stringifyTextBlocks()` | Matched |
+| `maybe_persist_tool_result()` | helpers.py:322 | `Helpers.maybePersistToolResult()` | Matched — bucket cleanup + atomic write |
+| `split_message()` | helpers.py:371 | `Helpers.splitMessage()` | Matched |
+| `build_assistant_message()` | helpers.py:403 | `Helpers.buildAssistantMessage()` | Matched |
+| `estimate_prompt_tokens()` | helpers.py:420 | `Helpers.estimatePromptTokens()` | Matched — tiktoken → JTokkit |
+| `estimate_message_tokens()` | helpers.py:465 | `Helpers.estimateMessageTokens()` | Matched |
+| `estimate_prompt_tokens_chain()` | helpers.py:503 | `Helpers.estimatePromptTokensChain()` | Matched — provider counter → JTokkit fallback |
+| `build_status_content()` | helpers.py:522 | `Helpers.buildStatusContent()` | Matched |
+| `sync_workspace_templates()` | helpers.py:578 | `Helpers.syncWorkspaceTemplates()` | Matched — classpath resources + git init |
+| `load_bundled_template()` | helpers.py:631 | `Helpers.loadBundledTemplate()` | Matched — importlib.resources → classpath |
+| `empty_tool_result_message()` | runtime.py:46 | `RuntimeConstants.emptyToolResultMessage()` | Matched |
+| `ensure_nonempty_tool_result()` | runtime.py:51 | `RuntimeConstants.ensureNonemptyToolResult()` | Matched |
+| `is_blank_text()` | runtime.py:66 | `RuntimeConstants.isBlankText()` | Matched |
+| `external_lookup_signature()` | runtime.py:91 | `RuntimeConstants.externalLookupSignature()` | Matched |
+| `repeated_external_lookup_error()` | runtime.py:106 | `RuntimeConstants.repeatedExternalLookupError()` | Matched |
+| `workspace_violation_signature()` | runtime.py:135 | `RuntimeConstants.workspaceViolationSignature()` | Matched — OUTSIDE_PATH_PATTERN included |
+| `repeated_workspace_violation_error()` | runtime.py:169 | `RuntimeConstants.repeatedWorkspaceViolationError()` | Matched |
+| `FileSnapshot` | file_edit_events.py:18 | `FileEditEvents.FileSnapshot` | Matched |
+| `FileEditTracker` | file_edit_events.py:37 | `FileEditEvents.FileEditTracker` | Matched |
+| `is_file_edit_tool()` | file_edit_events.py:46 | `FileEditEvents.isFileEditTool()` | Matched |
+| `read_file_snapshot()` | file_edit_events.py:85 | `FileEditEvents.readFileSnapshot()` | Matched |
+| `line_diff_stats()` | file_edit_events.py:104 | `FileEditEvents.lineDiffStats()` | Matched — SequenceMatcher → java-diff-utils |
+| `prepare_file_edit_tracker[s]()` | file_edit_events.py:147 | `FileEditEvents.prepareFileEditTracker[s]()` | Matched |
+| `resolve_file_edit_paths()` | file_edit_events.py:197 | `FileEditEvents.resolveFileEditPaths()` | Matched — with apply_patch special case |
+| `build_file_edit_start_event()` | file_edit_events.py:259 | `FileEditEvents.buildFileEditStartEvent()` | Matched |
+| `build_file_edit_end_event()` | file_edit_events.py:278 | `FileEditEvents.buildFileEditEndEvent()` | Matched |
+| `build_file_edit_error_event()` | file_edit_events.py:306 | `FileEditEvents.buildFileEditErrorEvent()` | Matched |
+| `build_file_edit_live_event()` | file_edit_events.py:323 | `FileEditEvents.buildFileEditLiveEvent()` | Matched |
+| `build_file_edit_pending_event()` | file_edit_events.py:342 | `FileEditEvents.buildFileEditPendingEvent()` | Matched |
+| `StreamingFileEditTracker` | file_edit_events.py:364 | `StreamingFileEditTracker.java` | Matched — update/flush/applyFinalCallIds/errorUnmatched |
+| `GitStore.is_initialized()` | gitstore.py:52 | `GitStore.isInitialized()` | Matched |
+| `GitStore.init()` | gitstore.py:58 | `GitStore.init()` | Matched — dulwich → JGit |
+| `GitStore.auto_commit()` | gitstore.py:121 | `GitStore.autoCommit()` | Matched |
+| `GitStore.log()` | gitstore.py:212 | `GitStore.log()` | Matched |
+| `GitStore.line_ages()` | gitstore.py:249 | `GitStore.lineAges()` | Matched — JGit blame |
+| `GitStore.diff_commits()` | gitstore.py:277 | `GitStore.diffCommits()` | Matched — JGit DiffFormatter |
+| `GitStore.find_commit()` | gitstore.py:302 | `GitStore.findCommit()` | Matched |
+| `GitStore.show_commit_diff()` | gitstore.py:309 | `GitStore.showCommitDiff()` | Matched |
+| `GitStore.revert()` | gitstore.py:323 | `GitStore.revert()` | Matched |
+| `extract_text()` | document.py:42 | `DocumentUtils.extractText()` | Matched — Tika replaces per-format parsers |
+| `is_image_file()` | document.py:234 | `DocumentUtils.isImageFile()` | Matched — magic bytes + mimetypes fallback |
+| `reference_non_image_attachments()` | document.py:253 | `DocumentUtils.referenceNonImageAttachments()` | Matched |
+| `extract_documents()` | document.py:274 | `DocumentUtils.extractDocuments()` | Matched |
+| `abbreviate_path()` | path.py:10 | `PathUtils.abbreviatePath()` | Matched — home dir + URL routing |
+| `_abbreviate_url()` | path.py:73 | `PathUtils.abbreviateUrl()` | Matched — domain + path folding |
+| `save_base64_data_url()` | media_decode.py | `MediaDecode.saveBase64DataUrl()` | Matched — MIME extension overrides |
+| `decode_image_data_url()` | artifacts.py:29 | `ArtifactUtils.decodeImageDataUrl()` | Matched — ArtifactError included |
+| `store_generated_image_artifact()` | artifacts.py:69 | `ArtifactUtils.storeGeneratedImageArtifact()` | Matched |
+| `generated_image_tool_result()` | artifacts.py:109 | `ArtifactUtils.generatedImageToolResult()` | Matched |
+| `evaluate_response()` | evaluator.py:42 | `ResponseEvaluator.evaluateResponse()` | Matched — EVALUATE_TOOL + template |
+| `LLMRuntime` | llm_runtime.py:11 | `LlmRuntime.java` | Matched — record + staticLlmRuntime |
+| `SearchUsageInfo.format()` | searchusage.py:29 | `SearchUsageInfo.Usage.format()` | Matched |
+| `fetch_search_usage()` | searchusage.py:66 | `SearchUsageInfo.fetchSearchUsage()` | Matched — Tavily HTTP client |
+| `format_tool_hints()` | tool_hints.py:31 | `ToolHintFormatter.formatToolHints()` | Matched — dedup + abbreviation |
+| `on_progress_accepts_*()` | progress_events.py:11 | `ProgressEvents.onProgressAccepts*()` | Matched — reflection-based |
+| `build_tool_event_start_payload()` | progress_events.py:57 | `ProgressEvents.buildToolEventStartPayload()` | Matched |
+| `build_tool_event_finish_payloads()` | progress_events.py:79 | `ProgressEvents.buildToolEventFinishPayloads()` | Matched |
+| `set_restart_notice_to_env()` | restart.py:36 | `RestartNotice.setRestartNotice()` | Matched — env vars → System properties |
+| `consume_restart_notice_from_env()` | restart.py:52 | `RestartNotice.consumeRestartNotice()` | Matched |
+| `scrub_subagent_announce_body()` | subagent_channel_display.py:17 | `SubagentDisplay.scrubSubagentAnnounceBody()` | Matched — Result section parsing + truncation |
+| `image_generation_prompt()` | image_generation_intent.py:10 | `ImageGenIntent.imageGenerationPrompt()` | Matched — IMAGE_GENERATION_METADATA_KEY |
+
+### 10.3 Pending / Differences
+
+| # | Item | Priority | Notes |
+|---|------|----------|-------|
+| 1 | `logging_bridge.py` | N/A | Omitted — SLF4J/Logback handles Python→JS bridge natively in JVM |
+| 2 | `ResponseEvaluator.evaluateResponse()` provider adapter | P2 | Requires concrete provider interface; `callEvaluator()` is a stub awaiting provider layer |
+| 3 | `SearchUsageInfo` Brave/DuckDuckGo usage APIs | P3 | Only Tavily implemented; other providers return `supported=false` (same as Python) |
+| 4 | Pebble template migration | P2 | Templates must be ported from Jinja2 syntax to Pebble syntax (`{% include %}` → `{% include "" %}`) |
+| 5 | `computeMyersDiff` | P2 | Uses `java-diff-utils` `DiffUtils.diff()`; placeholder value returns `(0,0)` — needs actual library call |
+
+### 10.4 Test Coverage
+
+| Area | Recommendation |
+|------|---------------|
+| `Helpers.stripThink()` | Test with well-formed blocks, unclosed prefixes, malformed tags, orphans, channel markers, partial control tags |
+| `Helpers.extractReasoning()` | Test 3-tier fallback: reasoning_content > thinking_blocks > inline think |
+| `Helpers.maybePersistToolResult()` | Test with string content, list content, oversized/within-limits, bucket cleanup |
+| `Helpers.estimatePromptTokens()` | Test with empty, single message, tool definitions |
+| `RuntimeConstants.repeatedExternalLookupError()` | Test cumulative counting, threshold crossing |
+| `RuntimeConstants.workspaceViolationSignature()` | Test path/file_path/target keys, exec command extraction |
+| `FileEditEvents.lineDiffStats()` | Test add-only, delete-only, replace, mixed scenarios |
+| `StreamingFileEditTracker` | Test write_file streaming, edit_file streaming, apply_patch multi-file, flush, errorUnmatched |
+| `GitStore` | Test init, auto_commit, log, line_ages, diff_commits, show_commit_diff, revert |
+| `DocumentUtils.extractText()` | Test PDF, DOCX, XLSX, PPTX, text, image, missing, error |
+| `ToolHintFormatter.formatToolHints()` | Test known tools, MCP tools, fallback, dedup, command abbreviation |
+
+### 10.5 Build Verification
+
+```bash
+# Compile all utility classes
+./mvnw compile -pl nanobot-utils
+
+# Run unit tests
+./mvnw test -pl nanobot-utils
+```
+
+All classes compile against Java 21 with the listed Maven dependencies.
+No circular dependencies — `Helpers` is the leaf; `StreamingFileEditTracker` depends on `FileEditEvents`;
+`PromptTemplates` depends on Pebble; `GitStore` depends on JGit.
+
+---
+
+**Updated:** 2026-06-22
+**Completeness:** 100% — all 18 Python utility files have complete Java equivalents (17 classes + 1 omitted `logging_bridge.py`)

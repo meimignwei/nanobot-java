@@ -6,6 +6,15 @@
   <component name="ChangeListManager">
     <list default="true" id="5610b32b-70ed-4b99-b96d-70407299bfe1" name="Changes" comment="mvp版本重构-构建技术方案">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/10-session.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/10-session.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/11-channels-core.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/11-channels-core.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/12-channels-impl.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/12-channels-impl.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/13-webui.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/13-webui.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/14-cli-command.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/14-cli-command.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/15-utils.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/15-utils.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/16-security.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/16-security.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/17-skills-templates.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/17-skills-templates.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/port-to-java/packages/18-remaining.md" beforeDir="false" afterPath="$PROJECT_DIR$/port-to-java/packages/18-remaining.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -148,7 +157,15 @@
       <option name="project" value="LOCAL" />
       <updated>1782061689471</updated>
     </task>
-    <option name="localTasksCounter" value="11" />
+    <task id="LOCAL-00011" summary="mvp版本重构-构建技术方案">
+      <option name="closed" value="true" />
+      <created>1782062309234</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1782062309234</updated>
+    </task>
+    <option name="localTasksCounter" value="12" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
