@@ -1,0 +1,3 @@
+com/nanobot/bus/MessageBusTest.class
+com/nanobot/bus/RuntimeEventBusTest.class
+com/nanobot/bus/BusProgressCallbackTest.class
